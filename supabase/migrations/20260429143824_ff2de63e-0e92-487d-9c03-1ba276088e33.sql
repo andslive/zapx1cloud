@@ -1,0 +1,1 @@
+ALTER TABLE public.webchat_conversations ALTER COLUMN widget_id DROP NOT NULL;

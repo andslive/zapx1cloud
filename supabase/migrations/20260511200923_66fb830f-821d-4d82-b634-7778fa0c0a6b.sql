@@ -1,0 +1,1 @@
+UPDATE public.product_agents SET can_add_notes = false WHERE id = '7ffe660c-c766-4061-ad45-0370c6bb0e89';

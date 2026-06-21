@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>Z1Xap</title>
+    <meta name="description" content="Plataforma de vendas com X1 com IA">
+    <meta name="author" content="Uazapix" />
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/png" href="/favicon.png">
+    
+    <!-- PWA Meta Tags -->
+    <meta name="theme-color" content="#84CC16" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Uazapix" />
+    
+    <!-- Apple Touch Icons - múltiplos tamanhos para compatibilidade -->
+    <link rel="apple-touch-icon" href="/icons/icon-192x192.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180x180.png" />
+    <link rel="apple-touch-icon" sizes="152x152" href="/icons/icon-152x152.png" />
+    <link rel="apple-touch-icon" sizes="144x144" href="/icons/icon-144x144.png" />
+    <link rel="apple-touch-icon" sizes="120x120" href="/icons/icon-128x128.png" />
+    
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="/manifest.json" />
+
+    <!-- Open Graph -->
+    
+    
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://storage.googleapis.com/gpt-engineer-file-uploads/attachments/og-images/3c7428cd-6427-4c57-a426-b90074939789">
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="" />
+    <meta name="twitter:image" content="https://storage.googleapis.com/gpt-engineer-file-uploads/attachments/og-images/3c7428cd-6427-4c57-a426-b90074939789">
+
+    <!-- Boot styles: prevent white flash before React mounts -->
+    <style>
+      html, body {
+        background: #0a0d14;
+        color: #e5e7eb;
+        margin: 0;
+        min-height: 100vh;
+        -webkit-font-smoothing: antialiased;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      #root { min-height: 100vh; }
+      #boot-loader {
+        position: fixed; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: #0a0d14;
+        z-index: 9999;
+      }
+      #boot-loader .spinner {
+        width: 36px; height: 36px;
+        border: 3px solid rgba(132, 204, 22, 0.18);
+        border-top-color: #84CC16;
+        border-radius: 50%;
+        animation: boot-spin 0.8s linear infinite;
+      }
+      @keyframes boot-spin { to { transform: rotate(360deg); } }
+      .app-mounted #boot-loader { display: none; }
+    </style>
+    
+  
+  
+  
+  
+  
+  
+  
+  <meta property="og:title" content="Z1Xap">
+  <meta name="twitter:title" content="Z1Xap">
+  <meta property="og:description" content="Plataforma de vendas com X1 com IA">
+  <meta name="twitter:description" content="Plataforma de vendas com X1 com IA">
+</head>
+
+  <body>
+    <div id="root">
+      <div id="boot-loader"><div class="spinner"></div></div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,18 @@
+ALTER TABLE public.platform_settings
+  ADD COLUMN IF NOT EXISTS accent_color text DEFAULT '#84CC16',
+  ADD COLUMN IF NOT EXISTS gradient_style text DEFAULT 'vendus',
+  ADD COLUMN IF NOT EXISTS gradient_custom jsonb,
+  ADD COLUMN IF NOT EXISTS border_radius integer DEFAULT 12,
+  ADD COLUMN IF NOT EXISTS default_theme text DEFAULT 'dark',
+  ADD COLUMN IF NOT EXISTS font_family text DEFAULT 'Inter',
+  ADD COLUMN IF NOT EXISTS font_url text,
+  ADD COLUMN IF NOT EXISTS base_font_size integer DEFAULT 16,
+  ADD COLUMN IF NOT EXISTS login_bg_image_url text,
+  ADD COLUMN IF NOT EXISTS login_logo_position text DEFAULT 'left',
+  ADD COLUMN IF NOT EXISTS hide_widget_branding boolean DEFAULT false,
+  ADD COLUMN IF NOT EXISTS widget_accent_color text,
+  ADD COLUMN IF NOT EXISTS browser_title text,
+  ADD COLUMN IF NOT EXISTS meta_description text,
+  ADD COLUMN IF NOT EXISTS og_image_url text,
+  ADD COLUMN IF NOT EXISTS twitter_handle text,
+  ADD COLUMN IF NOT EXISTS default_language text DEFAULT 'pt-BR';

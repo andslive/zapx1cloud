@@ -1,0 +1,1 @@
+ALTER FUNCTION public.increment_form_submissions_count(uuid) SET search_path = public;

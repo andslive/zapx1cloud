@@ -1,0 +1,1 @@
+ALTER TABLE public.post_sale_event_actions ADD COLUMN IF NOT EXISTS evolution_instance_id uuid NULL;

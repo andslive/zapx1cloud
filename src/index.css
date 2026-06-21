@@ -1,0 +1,438 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* TEMA LIGHT - Elegante e Premium */
+  :root {
+    --background: 0 0% 99%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 83 81% 44%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 8% 46%;
+
+    --accent: 83 81% 44%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 71% 40%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 222 47% 11%;
+
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 83 81% 44%;
+
+    --radius: 0.75rem;
+
+    /* Sidebar Light */
+    --sidebar-background: 220 14% 98%;
+    --sidebar-foreground: 222 47% 20%;
+    --sidebar-primary: 83 81% 44%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 14% 94%;
+    --sidebar-accent-foreground: 222 47% 11%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 83 81% 44%;
+
+    /* Platform Gradients - Verde escuro → Lime → Verde claro */
+    --gradient-primary: linear-gradient(135deg, hsl(83 90% 25%), hsl(83 81% 44%), hsl(83 90% 70%));
+    --gradient-card: linear-gradient(180deg, hsl(0 0% 100%), hsl(220 14% 98%));
+    --gradient-hero: linear-gradient(135deg, hsl(83 90% 70% / 0.08), hsl(83 81% 44% / 0.04));
+    --gradient-accent: linear-gradient(135deg, hsl(83 81% 44% / 0.10), hsl(83 90% 70% / 0.04));
+
+    /* Sombras Light - Suaves e naturais */
+    --shadow-sm: 0 1px 2px 0 hsl(222 47% 11% / 0.04);
+    --shadow-md: 0 4px 6px -1px hsl(222 47% 11% / 0.06), 0 2px 4px -2px hsl(222 47% 11% / 0.04);
+    --shadow-lg: 0 10px 15px -3px hsl(222 47% 11% / 0.08), 0 4px 6px -4px hsl(222 47% 11% / 0.04);
+    --shadow-glow: 0 0 20px hsl(83 81% 44% / 0.20);
+  }
+
+  /* TEMA DARK - Premium */
+  .dark {
+    --background: 222 47% 6%;
+    --foreground: 210 40% 98%;
+
+    --card: 222 47% 8%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 222 47% 10%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 83 75% 50%;
+    --primary-foreground: 222 47% 6%;
+
+    --secondary: 222 30% 14%;
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 222 30% 12%;
+    --muted-foreground: 215 20% 55%;
+
+    --accent: 83 75% 50%;
+    --accent-foreground: 222 47% 6%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+
+    --success: 142 71% 45%;
+    --success-foreground: 222 47% 6%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 222 47% 6%;
+
+    --border: 222 30% 18%;
+    --input: 222 30% 14%;
+    --ring: 83 75% 50%;
+
+    /* Sidebar Dark */
+    --sidebar-background: 222 47% 5%;
+    --sidebar-foreground: 210 40% 85%;
+    --sidebar-primary: 83 75% 50%;
+    --sidebar-primary-foreground: 222 47% 6%;
+    --sidebar-accent: 222 30% 12%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 222 30% 15%;
+    --sidebar-ring: 83 75% 50%;
+
+    /* Platform Gradients - Dark */
+    --gradient-primary: linear-gradient(135deg, hsl(83 90% 25%), hsl(83 75% 50%), hsl(83 90% 70%));
+    --gradient-card: linear-gradient(180deg, hsl(222 47% 10%), hsl(222 47% 8%));
+    --gradient-hero: linear-gradient(135deg, hsl(222 47% 8%), hsl(222 47% 4%));
+    --gradient-accent: linear-gradient(135deg, hsl(83 75% 50% / 0.18), hsl(83 90% 70% / 0.06));
+
+    /* Shadows - Dark */
+    --shadow-sm: 0 1px 2px 0 hsl(222 47% 4% / 0.3);
+    --shadow-md: 0 4px 6px -1px hsl(222 47% 4% / 0.4), 0 2px 4px -2px hsl(222 47% 4% / 0.3);
+    --shadow-lg: 0 10px 15px -3px hsl(222 47% 4% / 0.5), 0 4px 6px -4px hsl(222 47% 4% / 0.4);
+    --shadow-glow: 0 0 20px hsl(83 75% 50% / 0.35);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    overscroll-behavior: none;
+  }
+
+  /* Prevent zoom on inputs in iOS */
+  input, select, textarea {
+    font-size: 16px !important;
+  }
+
+  /* Custom scrollbar - adapts to theme */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-foreground/10 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-foreground/20;
+  }
+
+  /* Safe areas for mobile */
+  .safe-area-top {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  /* Touch targets */
+  .touch-target {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Hide scrollbar on mobile */
+  .hide-scrollbar {
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .hide-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@layer utilities {
+  .gradient-primary {
+    background: var(--gradient-primary);
+  }
+
+  .gradient-card {
+    background: var(--gradient-card);
+  }
+
+  .gradient-hero {
+    background: var(--gradient-hero);
+  }
+
+  .gradient-accent {
+    background: var(--gradient-accent);
+  }
+
+  .shadow-glow {
+    box-shadow: var(--shadow-glow);
+  }
+
+  .text-gradient {
+    @apply bg-clip-text text-transparent;
+    background: var(--gradient-primary);
+  }
+
+  /* Press effect for touch interactions */
+  .pressable {
+    @apply transition-transform duration-100 active:scale-[0.97];
+  }
+
+  .pressable-sm {
+    @apply transition-transform duration-100 active:scale-[0.98];
+  }
+
+  /* Basic animations */
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease-out;
+  }
+
+  .animate-fade-out {
+    animation: fadeOut 0.3s ease-out;
+  }
+
+  .animate-slide-up {
+    animation: slideUp 0.4s ease-out;
+  }
+
+  .animate-slide-down {
+    animation: slideDown 0.4s ease-out;
+  }
+
+  .animate-scale-in {
+    animation: scaleIn 0.2s ease-out;
+  }
+
+  .animate-bounce-in {
+    animation: bounceIn 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+  }
+
+  .animate-shake {
+    animation: shake 0.5s cubic-bezier(0.36, 0.07, 0.19, 0.97);
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  @keyframes fadeOut {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
+
+  @keyframes slideUp {
+    from { 
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to { 
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes slideDown {
+    from { 
+      opacity: 0;
+      transform: translateY(-10px);
+    }
+    to { 
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes scaleIn {
+    from { 
+      opacity: 0;
+      transform: scale(0.95);
+    }
+    to { 
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes bounceIn {
+    0% { 
+      opacity: 0;
+      transform: scale(0.3);
+    }
+    50% {
+      transform: scale(1.05);
+    }
+    70% {
+      transform: scale(0.9);
+    }
+    100% { 
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    10%, 30%, 50%, 70%, 90% { transform: translateX(-4px); }
+    20%, 40%, 60%, 80% { transform: translateX(4px); }
+  }
+
+  @keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+
+  @keyframes pulse-glow {
+    0%, 100% {
+      box-shadow: var(--shadow-glow);
+    }
+    50% {
+      box-shadow: 0 0 30px hsl(83 75% 50% / 0.45);
+    }
+  }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-6px); }
+  }
+
+  @keyframes spin-slow {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .animate-pulse-glow {
+    animation: pulse-glow 2s ease-in-out infinite;
+  }
+
+  .animate-float {
+    animation: float 3s ease-in-out infinite;
+  }
+
+  .animate-spin-slow {
+    animation: spin-slow 3s linear infinite;
+  }
+
+  .animate-shimmer {
+    animation: shimmer 2s infinite;
+  }
+
+  /* Staggered animation delays */
+  .stagger-1 { animation-delay: 0.05s; }
+  .stagger-2 { animation-delay: 0.1s; }
+  .stagger-3 { animation-delay: 0.15s; }
+  .stagger-4 { animation-delay: 0.2s; }
+  .stagger-5 { animation-delay: 0.25s; }
+
+  /* Temperature-based gradients for leads - adapts to theme */
+  .temperature-hot {
+    background: linear-gradient(135deg, hsl(0 72% 51% / 0.1), transparent);
+    border-left: 3px solid hsl(0 72% 51%);
+  }
+
+  .temperature-warm {
+    background: linear-gradient(135deg, hsl(38 92% 50% / 0.1), transparent);
+    border-left: 3px solid hsl(38 92% 50%);
+  }
+
+  .temperature-cold {
+    background: linear-gradient(135deg, hsl(210 80% 50% / 0.1), transparent);
+    border-left: 3px solid hsl(210 80% 50%);
+  }
+
+  /* Glass effect - adapts to theme */
+  .glass {
+    @apply bg-background/80 backdrop-blur-md;
+  }
+
+  .glass-card {
+    @apply bg-card/90 backdrop-blur-sm border-border/50;
+  }
+
+  /* CRM Compact Styles - Pedido pelo usuário para alinhar com os blocos do funil */
+  .crm-compact label,
+  .crm-compact .text-muted-foreground,
+  .crm-compact .text-sm {
+    font-size: 0.75rem !important; /* 12px - text-xs */
+  }
+
+  .crm-compact h1,
+  .crm-compact h2,
+  .crm-compact h3,
+  .crm-compact .card-title {
+    font-size: 0.875rem !important; /* 14px - text-sm */
+    font-weight: 600 !important;
+  }
+
+  .crm-compact input, 
+  .crm-compact select, 
+  .crm-compact textarea,
+  .crm-compact button:not(.h-10):not(.h-12) {
+    font-size: 0.75rem !important; /* 12px - text-xs */
+    background-color: hsl(var(--muted) / 0.2) !important;
+  }
+
+  .crm-compact input:focus, 
+  .crm-compact select:focus, 
+  .crm-compact textarea:focus {
+    background-color: hsl(var(--muted) / 0.5) !important;
+    border-color: hsl(var(--primary)) !important;
+  }
+
+  .crm-compact .p-6 {
+    padding: 1rem !important;
+  }
+
+  .crm-compact .space-y-6 {
+    @apply space-y-4;
+  }
+
+  .crm-compact .gap-6 {
+    @apply gap-4;
+  }
+}

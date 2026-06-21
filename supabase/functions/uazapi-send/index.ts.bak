@@ -1,0 +1,442 @@
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+};
+
+interface SendBody {
+  organization_id?: string;
+  instance_id?: string; // our DB id
+  type:
+    | "text"
+    | "media"
+    | "audio"
+    | "sticker"
+    | "location"
+    | "contact"
+    | "link"
+    | "poll"
+    | "reaction"
+    | "edit"
+    | "delete"
+    | "markRead"
+    | "presence"
+    | "pix_button";
+  to: string; // phone digits only
+  payload: Record<string, any> & {
+    delay?: number;
+    presence?: string;
+    skip_warmup?: boolean;
+  };
+}
+
+async function uazFetch(url: string, token: string, path: string, body: any, method = "POST") {
+  const fullUrl = `${url}${path}`;
+  console.log(`[uazapi-send] ${method} ${path} body=${JSON.stringify(body).slice(0, 300)}`);
+  
+  const res = await fetch(fullUrl, {
+    method: method,
+    headers: { "Content-Type": "application/json", "token": token },
+    body: body && method !== "GET" ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let parsed: any;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = text;
+  }
+  return { ok: res.ok, status: res.status, body: parsed };
+}
+
+/**
+ * Requirement #5: FORCE MESSAGE STATE REFRESH
+ * Queries the provider for the actual status of a message after a delay.
+ */
+async function forceMessageRefresh(supabase: any, url: string, token: string, messageId: string, remoteJid: string, instanceId: string) {
+    // Wait for the message to propagate in the provider (3-5 seconds)
+    await new Promise(r => setTimeout(r, 5000));
+    
+    console.log(`[uazapi-send] [REFRESH] checking status for ${messageId}`);
+    try {
+        // Most UazAPI versions have /message/status or /chat/messages?id=...
+        const res = await uazFetch(url, token, `/message/status?id=${messageId}&number=${remoteJid}`, null, "GET");
+        
+        if (res.ok && res.body) {
+            const rawStatus = res.body.status || res.body.data?.status;
+            // 3=delivered, 4=read
+            if (rawStatus === 3 || rawStatus === 4 || rawStatus === "delivered" || rawStatus === "read") {
+                const status = (rawStatus === 4 || rawStatus === "read") ? "read" : "delivered";
+                console.log(`[uazapi-send] [REFRESH] confirmed ${status} for ${messageId}`);
+                
+                // Update DB immediately
+                await supabase.from("webchat_messages")
+                    .update({ status })
+                    .or(`metadata->>evolution_message_id.eq."${messageId}",metadata->>external_id.eq."${messageId}"`);
+                
+                // Clear retry queue
+                await supabase.from("whatsapp_message_retries").delete().eq("message_id", messageId);
+            }
+        }
+    } catch (e) {
+        console.warn(`[uazapi-send] [REFRESH] failed for ${messageId}:`, e.message);
+    }
+}
+
+/**
+ * SESSION WARMUP: Ensures the session is "hot" and ready for MD delivery.
+ * Implements requirements #1, #2, #4, #5, #7.
+ */
+async function warmupSession(supabase: any, url: string, token: string, jid: string, instance: any) {
+    // Optimization: Skip if warmed up recently (Requirement #7 - high delivery optimization)
+    const lastWarmup = instance.health_data?.last_warmup_at ? new Date(instance.health_data.last_warmup_at).getTime() : 0;
+    if (Date.now() - lastWarmup < 60000 && instance.is_stable) {
+        console.log(`[uazapi-send] [WARMUP] session already hot for ${instance.name}, skipping full sequence.`);
+        // Just a quick presence refresh
+        uazFetch(url, token, "/chat/presence", { presence: "available" }).catch(() => {});
+        return true;
+    }
+
+    console.log(`[uazapi-send] [WARMUP] starting HIGH DELIVERY warmup for ${instance.name} (to: ${jid})`);
+    
+    // 1. Validate websocket real & status
+    const statusRes = await fetch(`${url}/instance/status`, { headers: { "token": token } });
+    const statusData = await statusRes.json().catch(() => ({}));
+    const isConnected = statusRes.ok && (statusData.status === "connected" || statusData.state === "open");
+    
+    // Requirement #2: EVITAR ENVIO FRIO
+    // If just reconnected within last 2 minutes, wait longer or ensure stability
+    const lastReconnect = instance.last_reconnect_at ? new Date(instance.last_reconnect_at).getTime() : 0;
+    const timeSinceReconnect = Date.now() - lastReconnect;
+    
+    if (!isConnected) {
+        console.warn(`[uazapi-send] [WARMUP] session offline, triggering reconnect...`);
+        await uazFetch(url, token, "/instance/connect", {});
+        await supabase.from("evolution_instances").update({ 
+            last_reconnect_at: new Date().toISOString(),
+            is_stable: false 
+        }).eq("id", instance.id);
+        
+        console.log(`[uazapi-send] [WARMUP] cooling down after reconnect (10s)...`);
+        await new Promise(r => setTimeout(r, 10000)); // Human delay after reconnect
+    } else if (timeSinceReconnect < 60000) { // Less than 1 minute since reconnect
+        console.log(`[uazapi-send] [WARMUP] session is fresh (reconnected ${Math.round(timeSinceReconnect/1000)}s ago), adding stabilization delay...`);
+        await new Promise(r => setTimeout(r, 5000));
+    }
+
+    // 2. Validate Multi-Device Sync
+    const isSyncing = statusData.data?.isSyncing || statusData.isSyncing;
+    if (isSyncing) {
+        console.log(`[uazapi-send] [WARMUP] session is currently syncing, waiting for sync stability...`);
+        await new Promise(r => setTimeout(r, 4000));
+    }
+
+    // 3. Requirement #4: PRESENCE ENGINE - available
+    console.log(`[uazapi-send] [WARMUP] sending presence: available`);
+    await uazFetch(url, token, "/chat/presence", { presence: "available" });
+    await new Promise(r => setTimeout(r, 500)); // Small gap
+
+    // 4. Requirement #1 & #4: Presence composing (typing simulator)
+    // Composing for 2-4 seconds as requested
+    const typingDuration = Math.floor(Math.random() * 2000) + 2000; 
+    console.log(`[uazapi-send] [WARMUP] simulating typing for ${typingDuration}ms`);
+    await uazFetch(url, token, "/chat/presence", { number: jid, presence: "composing" });
+    
+    await new Promise(r => setTimeout(r, typingDuration));
+
+    // 5. Requirement #1: DELAY HUMANO AFTER COMPOSING
+    const humanGap = Math.floor(Math.random() * 1000) + 500;
+    console.log(`[uazapi-send] [WARMUP] final human gap: ${humanGap}ms`);
+    await new Promise(r => setTimeout(r, humanGap));
+
+    // Persist warmup state
+    await supabase.from("evolution_instances").update({
+        is_stable: true,
+        health_data: { 
+            ...instance.health_data, 
+            last_warmup_at: new Date().toISOString() 
+        }
+    }).eq("id", instance.id);
+
+    return true;
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    );
+
+    const body = (await req.json()) as SendBody;
+    let { organization_id, instance_id, type, to, payload } = body;
+
+    if (!type || !to || !payload) {
+      return new Response(JSON.stringify({ error: "Missing type/to/payload" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Resolve Org
+    if (!organization_id) {
+      const auth = req.headers.get("Authorization");
+      if (auth) {
+        const { data: { user } } = await supabase.auth.getUser(auth.replace("Bearer ", ""));
+        if (user) {
+          const { data: profile } = await supabase
+            .from("profiles").select("organization_id").eq("id", user.id).single();
+          organization_id = profile?.organization_id || undefined;
+        }
+      }
+    }
+
+    if (!organization_id) {
+      return new Response(JSON.stringify({ error: "organization_id required" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Resolve instance
+    let instance: any;
+    if (instance_id) {
+      const { data } = await supabase
+        .from("evolution_instances").select("*")
+        .eq("id", instance_id).eq("organization_id", organization_id).single();
+      instance = data;
+    } else {
+      const { data } = await supabase
+        .from("evolution_instances").select("*")
+        .eq("organization_id", organization_id)
+        .eq("status", "connected")
+        .order("is_default", { ascending: false })
+        .order("created_at", { ascending: false })
+        .limit(1).maybeSingle();
+      instance = data;
+    }
+
+    if (!instance) {
+      return new Response(JSON.stringify({ error: "No WhatsApp instance found" }), {
+        status: 404,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Platform settings
+    const { data: platformCfg } = await supabase
+      .from("platform_settings")
+      .select("uazapi_url, uazapi_admin_token")
+      .maybeSingle();
+
+    const url = String(platformCfg?.uazapi_url || "").replace(/\/$/, "");
+    const apiKey = instance.instance_token || String(platformCfg?.uazapi_admin_token || "");
+
+    if (!url || !apiKey) {
+      return new Response(JSON.stringify({ error: "UazAPI not configured" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const phone = to.replace(/\D/g, "");
+    const jid = phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
+
+    // 1. Session Warmup (Requirement #11 & #1)
+    if (!payload.skip_warmup && type !== "presence" && type !== "markRead") {
+        await warmupSession(supabase, url, apiKey, jid, instance);
+    }
+
+    // 2. Mark Read automatically (Force ✓✓ blue)
+    if (type !== "markRead" && type !== "presence") {
+      try {
+        await uazFetch(url, apiKey, "/chat/read", { number: jid, read: true });
+      } catch (e) {
+        console.warn("[uazapi-send] markRead auto-trigger failed:", e);
+      }
+    }
+
+    let res;
+    switch (type) {
+      case "text":
+        res = await uazFetch(url, apiKey, "/send/text", {
+          number: phone,
+          text: String(payload.text || ""),
+          delay: 0, 
+          quotedMsgId: payload.quotedMsgId,
+        });
+        break;
+      case "media":
+        res = await uazFetch(url, apiKey, "/send/media", {
+          number: phone,
+          type: payload.type || payload.mediatype || "image",
+          file: payload.url ?? payload.media,
+          text: payload.caption || payload.text,
+          docName: payload.fileName || payload.name,
+          quotedMsgId: payload.quotedMsgId,
+        });
+        break;
+      case "audio":
+        res = await uazFetch(url, apiKey, "/send/media", {
+          number: phone,
+          type: payload.ptt !== false ? "ptt" : "audio",
+          file: payload.audio || payload.url,
+          mimetype: payload.mimetype || "audio/ogg",
+          quotedMsgId: payload.quotedMsgId,
+        });
+        break;
+      case "sticker":
+        res = await uazFetch(url, apiKey, "/send/sticker", {
+          number: phone,
+          file: payload.sticker,
+        });
+        break;
+      case "location":
+        res = await uazFetch(url, apiKey, "/send/location", {
+          number: phone,
+          latitude: payload.latitude,
+          longitude: payload.longitude,
+          name: payload.name,
+          address: payload.address,
+        });
+        break;
+      case "contact":
+        res = await uazFetch(url, apiKey, "/send/contact", {
+          number: phone,
+          vcard: payload.contacts || payload.contact,
+        });
+        break;
+      case "link":
+        res = await uazFetch(url, apiKey, "/send/text", {
+          number: phone,
+          text: payload.text || payload.link,
+          linkPreview: true,
+        });
+        break;
+      case "poll":
+        res = await uazFetch(url, apiKey, "/send/menu", {
+          number: phone,
+          name: payload.name,
+          selectableCount: payload.selectableCount || 1,
+          values: payload.values,
+          type: "poll",
+        });
+        break;
+      case "reaction":
+        res = await uazFetch(url, apiKey, "/send/reaction", {
+          key: payload.key,
+          reaction: payload.reaction,
+          number: phone,
+        });
+        break;
+      case "edit":
+        res = await uazFetch(url, apiKey, "/chat/updateMessage", {
+          number: phone,
+          key: payload.key,
+          text: payload.text,
+        });
+        break;
+      case "delete":
+        res = await uazFetch(url, apiKey, "/message/revoke", {
+          id: payload.id || payload.messageId,
+          remoteJid: payload.remoteJid,
+          fromMe: payload.fromMe ?? true,
+          participant: payload.participant,
+        });
+        break;
+      case "markRead":
+        res = await uazFetch(url, apiKey, "/chat/read", {
+          number: jid,
+          read: true,
+        });
+        break;
+      case "presence":
+        res = await uazFetch(url, apiKey, "/chat/presence", {
+          number: phone,
+          presence: payload.state || payload.presence || "composing",
+        });
+        break;
+      case "pix_button":
+        res = await uazFetch(url, apiKey, "/send/pix-button", {
+          number: phone,
+          pixType: payload.pixType,
+          pixKey: payload.pixKey,
+          pixName: payload.pixName,
+          delay: payload.delay,
+        });
+        break;
+      default:
+        return new Response(JSON.stringify({ error: `Unknown type: ${type}` }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+    }
+
+    // 3. Track for ACK 2 (Delivered) - Retry Queue
+    if (res.ok && res.body?.id && type !== "presence" && type !== "markRead") {
+        const messageId = res.body.id;
+        await supabase.from("whatsapp_message_retries").insert({
+            organization_id: organization_id,
+            instance_id: instance.id,
+            message_id: messageId,
+            remote_jid: jid,
+            content: type === "text" ? payload.text : `[${type}]`,
+            next_retry_at: new Date(Date.now() + 60000).toISOString(), // Check in 60s
+            ack_status: 0
+        });
+
+        // Update last message sent metric
+        await supabase.from("evolution_instances").update({
+            last_health_at: new Date().toISOString(),
+            health_data: { 
+                ...instance.health_data, 
+                last_msg_id: messageId, 
+                last_msg_at: new Date().toISOString() 
+            }
+        }).eq("id", instance.id);
+
+        // Requirement #1 & #5 & #6: Active Session Flush & Force Refresh
+        forceMessageRefresh(supabase, url, apiKey, messageId, jid, instance.id).catch(() => {});
+        
+        // Trigger reconciliation immediately after send to catch any pending ACKs
+        fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/uazapi-heartbeat`, {
+            method: "POST",
+            headers: { 
+                "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ action: "reconcile", instance: instance.id })
+        }).catch(() => {});
+
+        uazFetch(url, apiKey, "/chat/presence", { presence: "available" }).catch(() => {});
+    }
+
+    // 4. Reset Presence after send
+    if (res.ok && type !== "presence" && type !== "markRead") {
+      try {
+        uazFetch(url, apiKey, "/chat/presence", {
+          number: jid,
+          presence: "paused",
+        }).catch(() => {});
+      } catch (_) {}
+    }
+
+    return new Response(JSON.stringify(res), {
+      status: res.ok ? 200 : res.status >= 400 ? res.status : 502,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+
+  } catch (err: any) {
+    console.error("[uazapi-send] exception:", err);
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+});

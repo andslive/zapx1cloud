@@ -1,0 +1,1 @@
+UPDATE webchat_conversations SET current_block_id='block_1781571001264_yaum4n6a2', flow_variables = flow_variables - '__waiting_input' - 'waiting_for_input', bot_locked_until=NULL WHERE id='ad96707d-8671-4148-8548-d6b9f9eeb66f';

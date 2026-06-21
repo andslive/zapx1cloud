@@ -1,0 +1,1 @@
+UPDATE platform_settings SET whatsapp_provider = 'uazapi' WHERE whatsapp_provider = 'evolution' OR whatsapp_provider IS NULL;

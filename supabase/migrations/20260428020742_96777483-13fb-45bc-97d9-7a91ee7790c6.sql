@@ -1,0 +1,1 @@
+ALTER TABLE public.product_agents DROP COLUMN IF EXISTS ai_model;
