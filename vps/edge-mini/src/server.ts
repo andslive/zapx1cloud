@@ -6,7 +6,7 @@ import { uazapiWebhookRoute } from "./routes/webhook-uazapi.js";
 import { waSendRoute } from "./routes/wa-send.js";
 
 const app = Fastify({
-  loggerInstance: logger,
+  logger,
   bodyLimit: 10 * 1024 * 1024,
   trustProxy: true,
 });
