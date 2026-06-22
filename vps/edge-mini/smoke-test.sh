@@ -2,11 +2,11 @@
 # ============================================================================
 # Smoke test — Fase A (DRY_RUN). Não escreve em produção. Não chama UazAPI.
 # Uso: bash smoke-test.sh [BASE_URL]
-#   default BASE_URL: http://127.0.0.1:8787
+#   default BASE_URL: http://127.0.0.1:3002
 # ============================================================================
 set -euo pipefail
 
-BASE="${1:-http://127.0.0.1:8787}"
+BASE="${1:-http://127.0.0.1:3002}"
 ENV_FILE="${ENV_FILE:-/opt/x1zap/edge-mini/.env}"
 TOKEN=""
 if [ -f "$ENV_FILE" ]; then
