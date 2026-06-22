@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { waOutboundQueue } from "../queues.js";
 import { env } from "../env.js";
@@ -12,7 +12,7 @@ const bodySchema = z.object({
   payload: z.record(z.any()).default({}),
 });
 
-export async function registerWaSendRoute(app: FastifyInstance) {
+export const waSendRoute: FastifyPluginAsync = async (app) => {
   app.post("/wa/send", async (req, reply) => {
     const token = req.headers["x-internal-token"];
     if (token !== env.X1ZAP_INTERNAL_TOKEN) {
@@ -38,4 +38,4 @@ export async function registerWaSendRoute(app: FastifyInstance) {
     );
     return reply.code(202).send({ queued: true, jobId: job.id });
   });
-}
+};

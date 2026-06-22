@@ -2,18 +2,18 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { env, corsOrigins } from "./env.js";
 import { logger } from "./logger.js";
-import { registerUazapiWebhookRoute } from "./routes/webhook-uazapi.js";
-import { registerWaSendRoute } from "./routes/wa-send.js";
+import { uazapiWebhookRoute } from "./routes/webhook-uazapi.js";
+import { waSendRoute } from "./routes/wa-send.js";
 
 const app = Fastify({
-  logger,
-  bodyLimit: 10 * 1024 * 1024, // 10 MB (mídia base64 ocasional)
+  loggerInstance: logger,
+  bodyLimit: 10 * 1024 * 1024,
   trustProxy: true,
 });
 
 await app.register(cors, {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // health, server-to-server
+    if (!origin) return cb(null, true);
     if (corsOrigins.length === 0 || corsOrigins.includes(origin)) {
       return cb(null, true);
     }
@@ -30,8 +30,8 @@ app.get("/health", async () => ({
   ts: new Date().toISOString(),
 }));
 
-await registerUazapiWebhookRoute(app);
-await registerWaSendRoute(app);
+await app.register(uazapiWebhookRoute);
+await app.register(waSendRoute);
 
 const port = env.PORT;
 const host = env.HOST;
