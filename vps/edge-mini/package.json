@@ -1,0 +1,35 @@
+{
+  "name": "@x1zap/edge-mini",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fase A — Migração mínima de uazapi-webhook e uazapi-send para VPS 2 (DRY_RUN).",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start:api": "node dist/server.js",
+    "start:worker:inbound": "node dist/workers/wa-inbound.js",
+    "start:worker:outbound": "node dist/workers/wa-outbound.js",
+    "dev:api": "tsx watch src/server.ts",
+    "dev:worker:inbound": "tsx watch src/workers/wa-inbound.ts",
+    "dev:worker:outbound": "tsx watch src/workers/wa-outbound.ts",
+    "smoke": "bash smoke-test.sh"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "@supabase/supabase-js": "^2.45.0",
+    "bullmq": "^5.12.0",
+    "fastify": "^4.28.1",
+    "ioredis": "^5.4.1",
+    "pino": "^9.3.2",
+    "undici": "^6.19.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
