@@ -2,9 +2,10 @@ import { Worker } from "bullmq";
 import { connection } from "../redis.js";
 import { env } from "../env.js";
 import { logger } from "../logger.js";
+import { WA_INBOUND_QUEUE, QUEUE_PREFIX } from "../queues.js";
 
 const worker = new Worker(
-  "wa:inbound",
+  WA_INBOUND_QUEUE,
   async (job) => {
     if (env.DRY_RUN) {
       logger.info(
@@ -25,7 +26,7 @@ const worker = new Worker(
       "DRY_RUN está desativado mas a lógica real ainda não foi habilitada nesta fase.",
     );
   },
-  { connection, concurrency: 8 },
+  { connection, prefix: QUEUE_PREFIX, concurrency: 8 },
 );
 
 worker.on("failed", (job, err) => {
