@@ -6,6 +6,9 @@ export const uazapiWebhookRoute: FastifyPluginAsync = async (app) => {
   app.post("/webhooks/uazapi", async (req, reply) => {
     const payload = (req.body ?? {}) as Record<string, unknown>;
 
+    const safeJobId = (value: string): string =>
+      value.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 200);
+
     const extractId = (p: Record<string, unknown>): string | undefined => {
       const message = p?.message as Record<string, unknown> | undefined;
       const key = (message?.key ?? p?.key) as Record<string, unknown> | undefined;
