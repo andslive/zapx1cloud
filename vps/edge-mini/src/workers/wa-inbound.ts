@@ -26,7 +26,7 @@ const worker = new Worker(
       "DRY_RUN está desativado mas a lógica real ainda não foi habilitada nesta fase.",
     );
   },
-  { connection, concurrency: 8 },
+  { connection, prefix: QUEUE_PREFIX, concurrency: 8 },
 );
 
 worker.on("failed", (job, err) => {
