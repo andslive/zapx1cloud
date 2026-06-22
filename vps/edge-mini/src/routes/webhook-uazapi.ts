@@ -21,7 +21,7 @@ export const uazapiWebhookRoute: FastifyPluginAsync = async (app) => {
       );
     };
     const providerId = extractId(payload);
-    const jobId = providerId ? `uazapi:${providerId}` : undefined;
+    const jobId = providerId ? safeJobId(`uazapi-${providerId}`) : undefined;
 
     const job = await waInboundQueue.add(
       "uazapi",
