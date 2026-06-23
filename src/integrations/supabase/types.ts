@@ -10673,6 +10673,63 @@ export type Database = {
           },
         ]
       }
+      vps_shadow_webhook_logs: {
+        Row: {
+          chat_id: string | null
+          created_at: string
+          event: string | null
+          from_me: boolean | null
+          id: string
+          instance_id: string | null
+          instance_name: string | null
+          message_id: string | null
+          message_type: string | null
+          origin: string | null
+          payload_hash: string | null
+          payload_summary: Json | null
+          raw_file_path: string | null
+          received_at: string
+          remote_jid: string | null
+          source: string | null
+        }
+        Insert: {
+          chat_id?: string | null
+          created_at?: string
+          event?: string | null
+          from_me?: boolean | null
+          id?: string
+          instance_id?: string | null
+          instance_name?: string | null
+          message_id?: string | null
+          message_type?: string | null
+          origin?: string | null
+          payload_hash?: string | null
+          payload_summary?: Json | null
+          raw_file_path?: string | null
+          received_at?: string
+          remote_jid?: string | null
+          source?: string | null
+        }
+        Update: {
+          chat_id?: string | null
+          created_at?: string
+          event?: string | null
+          from_me?: boolean | null
+          id?: string
+          instance_id?: string | null
+          instance_name?: string | null
+          message_id?: string | null
+          message_type?: string | null
+          origin?: string | null
+          payload_hash?: string | null
+          payload_summary?: Json | null
+          raw_file_path?: string | null
+          received_at?: string
+          remote_jid?: string | null
+          source?: string | null
+        }
+        Relationships: []
+      }
       webchat_agent_configs: {
         Row: {
           agent_avatar_url: string | null
