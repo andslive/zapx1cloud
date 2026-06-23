@@ -32,6 +32,15 @@ echo "    $R"
 echo "$R" | grep -q '"queued":true' || fail "webhook não enfileirou"
 pass "webhook enfileirou"
 
+echo "[2b] POST /webhooks/uazapi-shadow (payload sintético)"
+R="$(curl -fsS -X POST "$BASE/webhooks/uazapi-shadow" \
+  -H 'content-type: application/json' \
+  -d '{"event":"smoke_shadow","message":{"id":"smoke-shadow-'"$(date +%s)"'"},"text":"hello-shadow"}')"
+echo "    $R"
+echo "$R" | grep -q '"queued":true' || fail "shadow não enfileirou"
+echo "$R" | grep -q '"shadow":true' || fail "shadow flag ausente"
+pass "shadow webhook enfileirou"
+
 echo "[3] POST /wa/send (auth interno, payload sintético)"
 [ -n "$TOKEN" ] || fail "X1ZAP_INTERNAL_TOKEN não encontrado em $ENV_FILE"
 R="$(curl -fsS -X POST "$BASE/wa/send" \

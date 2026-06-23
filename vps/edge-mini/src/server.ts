@@ -3,6 +3,7 @@ import cors from "@fastify/cors";
 import { env, corsOrigins } from "./env.js";
 import { logger } from "./logger.js";
 import { uazapiWebhookRoute } from "./routes/webhook-uazapi.js";
+import { uazapiShadowWebhookRoute } from "./routes/webhook-uazapi-shadow.js";
 import { waSendRoute } from "./routes/wa-send.js";
 
 const app = Fastify({
@@ -31,6 +32,7 @@ app.get("/health", async () => ({
 }));
 
 await app.register(uazapiWebhookRoute);
+await app.register(uazapiShadowWebhookRoute);
 await app.register(waSendRoute);
 
 const port = env.PORT;
