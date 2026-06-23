@@ -32,14 +32,29 @@ echo "    $R"
 echo "$R" | grep -q '"queued":true' || fail "webhook não enfileirou"
 pass "webhook enfileirou"
 
-echo "[2b] POST /webhooks/uazapi-shadow (payload sintético)"
+echo "[2b] POST /webhooks/uazapi-shadow (payload sintético com origin marcador)"
+SHADOW_ID="smoke-shadow-$(date +%s)"
 R="$(curl -fsS -X POST "$BASE/webhooks/uazapi-shadow" \
   -H 'content-type: application/json' \
-  -d '{"event":"smoke_shadow","message":{"id":"smoke-shadow-'"$(date +%s)"'"},"text":"hello-shadow"}')"
+  -d '{"event":"smoke_shadow","origin":"lovable-uazapi-webhook-shadow","message":{"id":"'"$SHADOW_ID"'"},"text":"hello-shadow"}')"
 echo "    $R"
 echo "$R" | grep -q '"queued":true' || fail "shadow não enfileirou"
 echo "$R" | grep -q '"shadow":true' || fail "shadow flag ausente"
 pass "shadow webhook enfileirou"
+
+echo "[2c] GET /stats/raw-storage (após shadow)"
+sleep 2
+S="$(curl -fsS "$BASE/stats/raw-storage")"
+echo "    $S"
+echo "$S" | grep -q '"todayFiles"' || fail "stats sem todayFiles"
+echo "$S" | grep -q '"totalFiles"' || fail "stats sem totalFiles"
+echo "$S" | grep -q '"diskUsageMb"' || fail "stats sem diskUsageMb"
+TODAY_DIR="/opt/x1zap/edge-mini/storage/raw-payloads/$(date -u +%F)"
+if ls "$TODAY_DIR"/*"$SHADOW_ID"*.json >/dev/null 2>&1; then
+  pass "arquivo raw criado em $TODAY_DIR"
+else
+  echo "    (aviso) arquivo não localizado em $TODAY_DIR — verifique permissões/worker"
+fi
 
 echo "[3] POST /wa/send (auth interno, payload sintético)"
 [ -n "$TOKEN" ] || fail "X1ZAP_INTERNAL_TOKEN não encontrado em $ENV_FILE"
