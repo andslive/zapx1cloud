@@ -1,4 +1,27 @@
 import { z } from "zod";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+
+// Carrega .env explicitamente para não depender de PM2 --update-env.
+// .env é a fonte de verdade. Variáveis já presentes em process.env têm precedência.
+const candidates = [
+  process.env.EDGE_MINI_ENV_FILE,
+  resolve(process.cwd(), ".env"),
+  "/opt/x1zap/edge-mini/.env",
+].filter(Boolean) as string[];
+
+for (const file of candidates) {
+  if (existsSync(file)) {
+    try {
+      // Node >=20.6 / >=22: loadEnvFile não sobrescreve process.env existente.
+      (process as unknown as { loadEnvFile: (p: string) => void }).loadEnvFile(file);
+    } catch {
+      // ignore — segue com process.env corrente
+    }
+    break;
+  }
+}
+
 
 const schema = z.object({
   NODE_ENV: z.string().default("production"),
