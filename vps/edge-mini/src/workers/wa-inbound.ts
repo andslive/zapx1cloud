@@ -3,18 +3,56 @@ import { connection } from "../redis.js";
 import { env } from "../env.js";
 import { logger } from "../logger.js";
 import { WA_INBOUND_QUEUE, QUEUE_PREFIX } from "../queues.js";
+import {
+  saveRawPayload,
+  shouldStore,
+  startRotationTimer,
+} from "../lib/raw-storage.js";
+
+startRotationTimer();
 
 const worker = new Worker(
   WA_INBOUND_QUEUE,
   async (job) => {
+    const data = (job.data ?? {}) as {
+      receivedAt?: string;
+      source?: string;
+      shadow?: boolean;
+      payload?: unknown;
+    };
+    const source = data.source ?? "unknown";
+    const payload = data.payload ?? {};
+
+    // Fase C.2 — armazenar apenas shadow + origin marcador, sem tocar produção.
+    if (source === "uazapi-shadow" && shouldStore(payload)) {
+      try {
+        const r = await saveRawPayload({
+          receivedAt: data.receivedAt ?? new Date().toISOString(),
+          source,
+          jobId: String(job.id ?? ""),
+          payload,
+        });
+        logger.info(
+          { jobId: job.id, saved: r.saved, reason: r.reason },
+          "[wa:inbound] raw-storage",
+        );
+      } catch (err) {
+        logger.error(
+          { jobId: job.id, err: (err as Error).message },
+          "[wa:inbound] raw-storage falhou",
+        );
+      }
+    }
+
     if (env.DRY_RUN) {
       logger.info(
         {
           jobId: job.id,
           attempts: job.attemptsMade,
-          keys: Object.keys((job.data?.payload ?? {}) as object),
+          source,
+          keys: Object.keys(payload as object),
         },
-        "[wa:inbound] DRY_RUN — payload descartado (sem escrita)",
+        "[wa:inbound] DRY_RUN — payload descartado (sem escrita produção)",
       );
       return { ok: true, dry_run: true };
     }
