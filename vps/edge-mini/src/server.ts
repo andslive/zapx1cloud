@@ -40,6 +40,7 @@ await app.register(uazapiShadowWebhookRoute);
 await app.register(waSendRoute);
 await app.register(statsRawStorageRoute);
 await app.register(statsEventsRoute);
+await app.register(statsSupabaseWriteRoute);
 
 startRotationTimer();
 
