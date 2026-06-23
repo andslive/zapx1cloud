@@ -26,6 +26,12 @@ const schema = z.object({
     .string()
     .default("false")
     .transform((v) => v.toLowerCase() === "true"),
+  ENABLE_SHADOW_INGEST: z
+    .string()
+    .default("true")
+    .transform((v) => v.toLowerCase() === "true"),
+  SHADOW_INGEST_URL: z.string().optional().default(""),
+  SHADOW_INGEST_TOKEN: z.string().optional().default(""),
 });
 
 export const env = schema.parse(process.env);
