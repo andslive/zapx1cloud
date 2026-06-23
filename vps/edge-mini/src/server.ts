@@ -8,6 +8,7 @@ import { waSendRoute } from "./routes/wa-send.js";
 import { statsRawStorageRoute } from "./routes/stats-raw-storage.js";
 import { statsEventsRoute } from "./routes/stats-events.js";
 import { statsSupabaseWriteRoute } from "./routes/stats-supabase-write.js";
+import { statsShadowIngestRoute } from "./routes/stats-shadow-ingest.js";
 import { startRotationTimer } from "./lib/raw-storage.js";
 
 const app = Fastify({
