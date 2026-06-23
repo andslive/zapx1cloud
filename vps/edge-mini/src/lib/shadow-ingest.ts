@@ -104,27 +104,35 @@ export const sendShadowIngest = async (
   args: IngestArgs,
 ): Promise<{ outcome: IngestOutcome; error?: string }> => {
   const now = new Date().toISOString();
-  counters.lastAt = now;
 
   const summary = buildSummary(args.source, args.payload);
 
   if (summary.origin !== "lovable-uazapi-webhook-shadow") {
-    counters.skipped_origin++;
-    counters.lastOutcome = "SKIPPED_ORIGIN";
+    bump((c) => {
+      c.skipped_origin++;
+      c.lastOutcome = "SKIPPED_ORIGIN";
+      c.lastAt = now;
+    });
     return { outcome: "SKIPPED_ORIGIN" };
   }
 
   if (!env.ENABLE_SHADOW_INGEST) {
-    counters.disabled++;
-    counters.lastOutcome = "DISABLED";
+    bump((c) => {
+      c.disabled++;
+      c.lastOutcome = "DISABLED";
+      c.lastAt = now;
+    });
     logger.info({ source: args.source }, "[shadow-ingest] DISABLED");
     return { outcome: "DISABLED" };
   }
 
   if (!env.SHADOW_INGEST_URL || !env.SHADOW_INGEST_TOKEN) {
-    counters.misconfigured++;
-    counters.lastOutcome = "MISCONFIGURED";
-    counters.lastError = "missing_url_or_token";
+    bump((c) => {
+      c.misconfigured++;
+      c.lastOutcome = "MISCONFIGURED";
+      c.lastError = "missing_url_or_token";
+      c.lastAt = now;
+    });
     logger.error("[shadow-ingest] MISCONFIGURED missing url/token");
     return { outcome: "MISCONFIGURED", error: "missing_url_or_token" };
   }
@@ -167,35 +175,49 @@ export const sendShadowIngest = async (
     }
 
     if (!res.ok) {
-      counters.failed++;
-      counters.lastOutcome = "FAILED";
-      counters.lastError = `http_${res.status}: ${text.slice(0, 200)}`;
+      const errMsg = `http_${res.status}: ${text.slice(0, 200)}`;
+      bump((c) => {
+        c.failed++;
+        c.lastOutcome = "FAILED";
+        c.lastError = errMsg;
+        c.lastAt = now;
+      });
       logger.error(
         { status: res.status, body: text.slice(0, 200) },
         "[shadow-ingest] FAILED",
       );
-      return { outcome: "FAILED", error: counters.lastError };
+      return { outcome: "FAILED", error: errMsg };
     }
 
     if (json.duplicate === true) {
-      counters.duplicate++;
-      counters.lastOutcome = "DUPLICATE";
-      counters.lastError = null;
+      bump((c) => {
+        c.duplicate++;
+        c.lastOutcome = "DUPLICATE";
+        c.lastError = null;
+        c.lastAt = now;
+      });
       logger.info({ payload_hash }, "[shadow-ingest] DUPLICATE");
       return { outcome: "DUPLICATE" };
     }
 
-    counters.ok++;
-    counters.lastOutcome = "OK";
-    counters.lastError = null;
+    bump((c) => {
+      c.ok++;
+      c.lastOutcome = "OK";
+      c.lastError = null;
+      c.lastAt = now;
+    });
     logger.info({ payload_hash }, "[shadow-ingest] OK");
     return { outcome: "OK" };
   } catch (err) {
     const msg = (err as Error).message;
-    counters.failed++;
-    counters.lastOutcome = "FAILED";
-    counters.lastError = msg;
+    bump((c) => {
+      c.failed++;
+      c.lastOutcome = "FAILED";
+      c.lastError = msg;
+      c.lastAt = now;
+    });
     logger.error({ err: msg }, "[shadow-ingest] FAILED network");
     return { outcome: "FAILED", error: msg };
   }
+
 };
