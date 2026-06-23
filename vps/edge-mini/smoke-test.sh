@@ -65,6 +65,17 @@ echo "$E" | grep -q '"bySource"' || fail "stats/events sem bySource"
 echo "$E" | grep -q '"byHour"' || fail "stats/events sem byHour"
 pass "/stats/events OK"
 
+echo "[2e] GET /stats/supabase-write (default disabled)"
+SW="$(curl -fsS "$BASE/stats/supabase-write")"
+echo "    $SW"
+echo "$SW" | grep -q '"enabled"' || fail "stats/supabase-write sem enabled"
+echo "$SW" | grep -q '"counters"' || fail "stats/supabase-write sem counters"
+if echo "$SW" | grep -q '"enabled":false'; then
+  pass "/stats/supabase-write OK (ENABLE_SUPABASE_WRITE=false por padrão)"
+else
+  echo "    (aviso) ENABLE_SUPABASE_WRITE != false — confirme intencional"
+fi
+
 echo "[3] POST /wa/send (auth interno, payload sintético)"
 [ -n "$TOKEN" ] || fail "X1ZAP_INTERNAL_TOKEN não encontrado em $ENV_FILE"
 R="$(curl -fsS -X POST "$BASE/wa/send" \

@@ -8,6 +8,7 @@ import {
   shouldStore,
   startRotationTimer,
 } from "../lib/raw-storage.js";
+import { writeShadowLog } from "../lib/supabase-writer.js";
 
 startRotationTimer();
 
@@ -24,6 +25,7 @@ const worker = new Worker(
     const payload = data.payload ?? {};
 
     // Fase C.2 — armazenar apenas shadow + origin marcador, sem tocar produção.
+    let rawFilePath: string | null = null;
     if (source === "uazapi-shadow" && shouldStore(payload)) {
       try {
         const r = await saveRawPayload({
@@ -32,6 +34,7 @@ const worker = new Worker(
           jobId: String(job.id ?? ""),
           payload,
         });
+        rawFilePath = r.file ?? null;
         logger.info(
           { jobId: job.id, saved: r.saved, reason: r.reason },
           "[wa:inbound] raw-storage",
@@ -40,6 +43,21 @@ const worker = new Worker(
         logger.error(
           { jobId: job.id, err: (err as Error).message },
           "[wa:inbound] raw-storage falhou",
+        );
+      }
+
+      // Fase D.1 — cópia controlada em vps_shadow_webhook_logs (tabela isolada).
+      try {
+        await writeShadowLog({
+          receivedAt: data.receivedAt ?? new Date().toISOString(),
+          source,
+          rawFilePath,
+          payload,
+        });
+      } catch (err) {
+        logger.error(
+          { jobId: job.id, err: (err as Error).message },
+          "[wa:inbound] supabase-writer falhou",
         );
       }
     }

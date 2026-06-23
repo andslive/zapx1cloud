@@ -22,6 +22,10 @@ const schema = z.object({
     .default("/opt/x1zap/edge-mini/storage/raw-payloads"),
   RAW_STORAGE_MAX_PER_DAY: z.coerce.number().default(10000),
   RAW_STORAGE_RETENTION_DAYS: z.coerce.number().default(7),
+  ENABLE_SUPABASE_WRITE: z
+    .string()
+    .default("false")
+    .transform((v) => v.toLowerCase() === "true"),
 });
 
 export const env = schema.parse(process.env);
