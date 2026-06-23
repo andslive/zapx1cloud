@@ -76,6 +76,31 @@ else
   echo "    (aviso) ENABLE_SUPABASE_WRITE != false — confirme intencional"
 fi
 
+echo "[2f] GET /stats/shadow-ingest"
+SI="$(curl -fsS "$BASE/stats/shadow-ingest")"
+echo "    $SI"
+echo "$SI" | grep -q '"enabled"' || fail "stats/shadow-ingest sem enabled"
+echo "$SI" | grep -q '"urlConfigured"' || fail "stats/shadow-ingest sem urlConfigured"
+echo "$SI" | grep -q '"tokenConfigured"' || fail "stats/shadow-ingest sem tokenConfigured"
+pass "/stats/shadow-ingest OK"
+
+if echo "$SI" | grep -q '"enabled":true' && echo "$SI" | grep -q '"urlConfigured":true' && echo "$SI" | grep -q '"tokenConfigured":true'; then
+  echo "[2g] Validar ingest na Edge Function (duas chamadas idênticas)"
+  DUP_ID="smoke-dup-$(date +%s)"
+  PAYLOAD='{"event":"smoke_dup","origin":"lovable-uazapi-webhook-shadow","message":{"id":"'"$DUP_ID"'"},"text":"dup"}'
+  curl -fsS -X POST "$BASE/webhooks/uazapi-shadow" -H 'content-type: application/json' -d "$PAYLOAD" >/dev/null
+  sleep 2
+  curl -fsS -X POST "$BASE/webhooks/uazapi-shadow" -H 'content-type: application/json' -d "$PAYLOAD" >/dev/null
+  sleep 2
+  SI2="$(curl -fsS "$BASE/stats/shadow-ingest")"
+  echo "    $SI2"
+  echo "$SI2" | grep -qE '"ok":[1-9]' || echo "    (aviso) nenhum ok>=1 — verificar Edge Function"
+  echo "$SI2" | grep -qE '"duplicate":[1-9]' || echo "    (aviso) nenhum duplicate>=1 — pode estar OK na primeira execução"
+else
+  echo "    (aviso) ENABLE_SHADOW_INGEST/URL/TOKEN não configurados — pulando teste de ingest"
+fi
+
+
 echo "[3] POST /wa/send (auth interno, payload sintético)"
 [ -n "$TOKEN" ] || fail "X1ZAP_INTERNAL_TOKEN não encontrado em $ENV_FILE"
 R="$(curl -fsS -X POST "$BASE/wa/send" \
