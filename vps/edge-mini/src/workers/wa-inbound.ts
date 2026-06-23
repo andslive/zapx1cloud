@@ -8,6 +8,7 @@ import {
   shouldStore,
   startRotationTimer,
 } from "../lib/raw-storage.js";
+import { writeShadowLog } from "../lib/supabase-writer.js";
 
 startRotationTimer();
 
