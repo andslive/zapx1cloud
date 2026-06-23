@@ -56,6 +56,15 @@ else
   echo "    (aviso) arquivo não localizado em $TODAY_DIR — verifique permissões/worker"
 fi
 
+echo "[2d] GET /stats/events"
+E="$(curl -fsS "$BASE/stats/events")"
+echo "    $E"
+echo "$E" | grep -q '"totalFiles"' || fail "stats/events sem totalFiles"
+echo "$E" | grep -q '"byEvent"' || fail "stats/events sem byEvent"
+echo "$E" | grep -q '"bySource"' || fail "stats/events sem bySource"
+echo "$E" | grep -q '"byHour"' || fail "stats/events sem byHour"
+pass "/stats/events OK"
+
 echo "[3] POST /wa/send (auth interno, payload sintético)"
 [ -n "$TOKEN" ] || fail "X1ZAP_INTERNAL_TOKEN não encontrado em $ENV_FILE"
 R="$(curl -fsS -X POST "$BASE/wa/send" \
