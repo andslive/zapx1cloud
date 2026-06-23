@@ -1,4 +1,11 @@
 import { createHash } from "node:crypto";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
 import { env } from "../env.js";
 import { logger } from "../logger.js";
 import { buildSummary } from "./supabase-writer.js";
@@ -26,7 +33,7 @@ interface Counters {
   lastError: string | null;
 }
 
-const counters: Counters = {
+const emptyCounters = (): Counters => ({
   ok: 0,
   duplicate: 0,
   failed: 0,
@@ -36,9 +43,55 @@ const counters: Counters = {
   lastOutcome: null,
   lastAt: null,
   lastError: null,
+});
+
+// Contadores são compartilhados entre processos (edge-api lê, wa-inbound escreve)
+// via arquivo JSON em disco. Caminho mora ao lado do raw-storage.
+const COUNTERS_FILE = resolve(
+  env.RAW_STORAGE_DIR,
+  "..",
+  "shadow-ingest-counters.json",
+);
+
+const ensureDir = () => {
+  const dir = dirname(COUNTERS_FILE);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
 };
 
-export const getIngestCounters = (): Counters => ({ ...counters });
+const readCounters = (): Counters => {
+  try {
+    if (!existsSync(COUNTERS_FILE)) return emptyCounters();
+    const raw = readFileSync(COUNTERS_FILE, "utf8");
+    if (!raw.trim()) return emptyCounters();
+    return { ...emptyCounters(), ...(JSON.parse(raw) as Partial<Counters>) };
+  } catch {
+    return emptyCounters();
+  }
+};
+
+const writeCounters = (c: Counters): void => {
+  try {
+    ensureDir();
+    writeFileSync(COUNTERS_FILE, JSON.stringify(c), "utf8");
+  } catch (err) {
+    logger.error(
+      { err: (err as Error).message, file: COUNTERS_FILE },
+      "[shadow-ingest] failed to persist counters",
+    );
+  }
+};
+
+const bump = (mutate: (c: Counters) => void): Counters => {
+  const c = readCounters();
+  mutate(c);
+  writeCounters(c);
+  return c;
+};
+
+export const getIngestCounters = (): Counters => readCounters();
+
 
 export interface IngestArgs {
   receivedAt: string;
