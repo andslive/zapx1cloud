@@ -9,6 +9,7 @@ import {
   startRotationTimer,
 } from "../lib/raw-storage.js";
 import { writeShadowLog } from "../lib/supabase-writer.js";
+import { sendShadowIngest } from "../lib/shadow-ingest.js";
 
 startRotationTimer();
 
