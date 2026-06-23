@@ -17,6 +17,11 @@ const schema = z.object({
   REDIS_URL: z.string().default("redis://127.0.0.1:6379/0"),
   X1ZAP_INTERNAL_TOKEN: z.string().min(8, "X1ZAP_INTERNAL_TOKEN obrigatório"),
   CORS_ALLOWED_ORIGINS: z.string().default(""),
+  RAW_STORAGE_DIR: z
+    .string()
+    .default("/opt/x1zap/edge-mini/storage/raw-payloads"),
+  RAW_STORAGE_MAX_PER_DAY: z.coerce.number().default(10000),
+  RAW_STORAGE_RETENTION_DAYS: z.coerce.number().default(7),
 });
 
 export const env = schema.parse(process.env);

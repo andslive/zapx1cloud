@@ -5,6 +5,8 @@ import { logger } from "./logger.js";
 import { uazapiWebhookRoute } from "./routes/webhook-uazapi.js";
 import { uazapiShadowWebhookRoute } from "./routes/webhook-uazapi-shadow.js";
 import { waSendRoute } from "./routes/wa-send.js";
+import { statsRawStorageRoute } from "./routes/stats-raw-storage.js";
+import { startRotationTimer } from "./lib/raw-storage.js";
 
 const app = Fastify({
   logger,
@@ -34,6 +36,9 @@ app.get("/health", async () => ({
 await app.register(uazapiWebhookRoute);
 await app.register(uazapiShadowWebhookRoute);
 await app.register(waSendRoute);
+await app.register(statsRawStorageRoute);
+
+startRotationTimer();
 
 const port = env.PORT;
 const host = env.HOST;
