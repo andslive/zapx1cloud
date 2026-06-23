@@ -9,6 +9,7 @@ import {
   startRotationTimer,
 } from "../lib/raw-storage.js";
 import { writeShadowLog } from "../lib/supabase-writer.js";
+import { sendShadowIngest } from "../lib/shadow-ingest.js";
 
 startRotationTimer();
 
@@ -46,7 +47,7 @@ const worker = new Worker(
         );
       }
 
-      // Fase D.1 — cópia controlada em vps_shadow_webhook_logs (tabela isolada).
+      // Fase D.1 — cópia controlada em vps_shadow_webhook_logs (legacy, default OFF).
       try {
         await writeShadowLog({
           receivedAt: data.receivedAt ?? new Date().toISOString(),
@@ -58,6 +59,21 @@ const worker = new Worker(
         logger.error(
           { jobId: job.id, err: (err as Error).message },
           "[wa:inbound] supabase-writer falhou",
+        );
+      }
+
+      // Fase D.1.1 — envio via HTTP ingest proxy (Edge Function), sem service role key.
+      try {
+        await sendShadowIngest({
+          receivedAt: data.receivedAt ?? new Date().toISOString(),
+          source,
+          rawFilePath,
+          payload,
+        });
+      } catch (err) {
+        logger.error(
+          { jobId: job.id, err: (err as Error).message },
+          "[wa:inbound] shadow-ingest falhou",
         );
       }
     }
