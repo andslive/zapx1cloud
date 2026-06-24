@@ -117,6 +117,8 @@ interface MediaInfo {
   mime: string | null;
   messageId: string | null;
   instance: string | null;
+  instanceToken: string | null;
+  chatId: string | null;
   messageType: string | null;
   mediaType: string | null;
   type: string | null;
@@ -144,8 +146,6 @@ const asObj = (v: unknown): Record<string, unknown> =>
 
 const extractMedia = (payload: unknown): MediaInfo => {
   const outer = asObj(payload);
-  // UazAPI real: raw.payload.payload.message — o job já recebe raw.payload,
-  // então aqui pode vir { payload: { message } } ou direto { message }.
   const inner = asObj(outer.payload);
   const p = Object.keys(inner).length ? inner : outer;
   const message = asObj(p.message ?? outer.message);
@@ -170,6 +170,14 @@ const extractMedia = (payload: unknown): MediaInfo => {
       pickStr(p, "instanceName", "instance_name", "instanceId") ??
       pickStr(instance, "name", "id") ??
       pickStr(outer, "instanceName", "instance_name"),
+    instanceToken:
+      pickStr(instance, "token") ??
+      pickStr(p, "token", "instanceToken", "instance_token") ??
+      pickStr(outer, "token"),
+    chatId:
+      pickStr(message, "chatid", "chatId", "remoteJid") ??
+      pickStr(key, "remoteJid") ??
+      pickStr(p, "chatid", "chatId"),
     messageType: pickStr(message, "messageType"),
     mediaType: pickStr(message, "mediaType"),
     type: pickStr(message, "type"),
@@ -180,6 +188,7 @@ const extractMedia = (payload: unknown): MediaInfo => {
     fileSHA256: pickStr(content, "fileSHA256", "fileSha256"),
   };
 };
+
 
 // Detecta mídia criptografada do WhatsApp (.enc) — não pode ir direto pro tesseract.
 const isEncryptedWaMedia = (media: MediaInfo): boolean => {
