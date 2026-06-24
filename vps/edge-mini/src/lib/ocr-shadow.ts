@@ -84,10 +84,20 @@ export const getOcrCounters = (): Counters => readCounters();
 const IMAGE_RE = /^image\//i;
 const PDF_RE = /^application\/pdf$/i;
 
-const isOcrCandidate = (mime: string | null, url: string | null): boolean => {
+const isOcrCandidate = (
+  mime: string | null,
+  url: string | null,
+  hints?: { messageType?: string | null; mediaType?: string | null; type?: string | null },
+): boolean => {
   if (!url) return false;
   if (mime && (IMAGE_RE.test(mime) || PDF_RE.test(mime))) return true;
-  // fallback por extensão
+  if (hints) {
+    const mt = (hints.messageType ?? "").toLowerCase();
+    if (mt.includes("imagemessage") || mt.includes("documentmessage")) return true;
+    const md = (hints.mediaType ?? "").toLowerCase();
+    if (md === "image" || md === "document") return true;
+    if ((hints.type ?? "").toLowerCase() === "media") return true;
+  }
   if (!mime && /\.(png|jpe?g|webp|gif|bmp|tiff?|pdf)(\?|$)/i.test(url))
     return true;
   return false;
@@ -98,6 +108,10 @@ interface MediaInfo {
   mime: string | null;
   messageId: string | null;
   instance: string | null;
+  messageType: string | null;
+  mediaType: string | null;
+  type: string | null;
+  fileName: string | null;
 }
 
 const pickStr = (
@@ -112,26 +126,41 @@ const pickStr = (
   return null;
 };
 
+const asObj = (v: unknown): Record<string, unknown> =>
+  (v && typeof v === "object" ? (v as Record<string, unknown>) : {});
+
 const extractMedia = (payload: unknown): MediaInfo => {
-  const p = (payload ?? {}) as Record<string, unknown>;
-  const message = (p.message ?? {}) as Record<string, unknown>;
-  const key = (message.key ?? p.key ?? {}) as Record<string, unknown>;
-  const instance = (p.instance ?? {}) as Record<string, unknown>;
+  const outer = asObj(payload);
+  // UazAPI real: raw.payload.payload.message — o job já recebe raw.payload,
+  // então aqui pode vir { payload: { message } } ou direto { message }.
+  const inner = asObj(outer.payload);
+  const p = Object.keys(inner).length ? inner : outer;
+  const message = asObj(p.message ?? outer.message);
+  const content = asObj(message.content);
+  const key = asObj(message.key ?? p.key);
+  const instance = asObj(p.instance ?? outer.instance);
+
   return {
     url:
+      pickStr(content, "URL", "url", "fileUrl", "mediaUrl") ??
       pickStr(message, "mediaUrl", "url", "fileUrl") ??
       pickStr(p, "mediaUrl", "url"),
     mime:
-      pickStr(message, "mimetype", "mediaType", "mime") ??
-      pickStr(p, "mimetype", "mediaType"),
+      pickStr(content, "mimetype", "mime", "mimeType") ??
+      pickStr(message, "mimetype", "mime") ??
+      pickStr(p, "mimetype"),
     messageId:
-      pickStr(message, "id") ??
+      pickStr(message, "messageid", "id") ??
       pickStr(key, "id") ??
       pickStr(p, "messageId", "id"),
     instance:
-      pickStr(instance, "name") ??
-      pickStr(instance, "id") ??
-      pickStr(p, "instance_name", "instanceId"),
+      pickStr(p, "instanceName", "instance_name", "instanceId") ??
+      pickStr(instance, "name", "id") ??
+      pickStr(outer, "instanceName", "instance_name"),
+    messageType: pickStr(message, "messageType"),
+    mediaType: pickStr(message, "mediaType"),
+    type: pickStr(message, "type"),
+    fileName: pickStr(content, "fileName", "filename", "name"),
   };
 };
 
@@ -251,7 +280,11 @@ export const processOcrShadow = async (
   }
 
   const media = extractMedia(job.payload);
-  if (!isOcrCandidate(media.mime, media.url)) {
+  if (!isOcrCandidate(media.mime, media.url, {
+    messageType: media.messageType,
+    mediaType: media.mediaType,
+    type: media.type,
+  })) {
     bump((c) => {
       c.skipped++;
       c.lastOutcome = "SKIPPED_NO_MEDIA";
