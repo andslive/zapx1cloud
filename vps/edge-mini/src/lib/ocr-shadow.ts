@@ -242,9 +242,14 @@ const runOcr = async (
 
   if (provider === "local") {
     const { runLocalOcr } = await import("./ocr-local.js");
-    const text = await runLocalOcr({ url: media.url, mime: media.mime });
+    const text = await runLocalOcr({
+      url: media.url,
+      mime: media.mime,
+      localPath: (media as MediaInfo & { localPath?: string }).localPath ?? null,
+    });
     return { text, provider };
   }
+
 
   throw new Error(`unknown_provider:${provider}`);
 };
