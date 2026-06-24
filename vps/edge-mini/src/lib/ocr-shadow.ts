@@ -21,6 +21,9 @@ interface Counters {
   failed: number;
   skipped: number;
   encrypted: number;
+  downloaded: number;
+  downloadFailed: number;
+  decryptUnsupported: number;
   totalDurationMs: number;
   lastAt: string | null;
   lastOutcome: string | null;
@@ -33,11 +36,15 @@ const emptyCounters = (): Counters => ({
   failed: 0,
   skipped: 0,
   encrypted: 0,
+  downloaded: 0,
+  downloadFailed: 0,
+  decryptUnsupported: 0,
   totalDurationMs: 0,
   lastAt: null,
   lastOutcome: null,
   lastError: null,
 });
+
 
 const COUNTERS_FILE = resolve(
   env.RAW_STORAGE_DIR,
