@@ -14,6 +14,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { env } from "../env.js";
 import { logger } from "../logger.js";
+import { writeReceiptShadow } from "./receipt-shadow-writer.js";
 
 // --------------------------- contadores ----------------------------------
 interface Counters {
