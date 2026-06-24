@@ -121,11 +121,19 @@ const safeUnlink = async (file: string) => {
   }
 };
 
+export interface LocalOcrResult {
+  text: string;
+  originalPageCount: number | null;
+  truncatedPages: boolean;
+  tooLarge: boolean;
+  fileBytes: number | null;
+}
+
 export const runLocalOcr = async (media: {
   url: string | null;
   mime: string | null;
   localPath?: string | null;
-}): Promise<string> => {
+}): Promise<LocalOcrResult> => {
   const mime = media.mime ?? "";
   const hasLocal = !!media.localPath;
   if (!media.url && !hasLocal) throw new Error("missing_media_url");
@@ -145,22 +153,57 @@ export const runLocalOcr = async (media: {
   const ownsFile = !hasLocal;
 
   try {
+    const maxMb = Number(env.OCR_LOCAL_MAX_FILE_MB) || 0;
+    let fileBytes: number | null = null;
+    try {
+      const st = await fsp.stat(downloaded);
+      fileBytes = st.size;
+      if (maxMb > 0 && st.size > maxMb * 1024 * 1024) {
+        return {
+          text: "",
+          originalPageCount: null,
+          truncatedPages: false,
+          tooLarge: true,
+          fileBytes,
+        };
+      }
+    } catch {
+      // se stat falhar, segue
+    }
+
     if (isPdf) {
-      const pages = await pdfToImages(downloaded);
+      const allPages = await pdfToImages(downloaded);
+      const maxPages = Number(env.OCR_LOCAL_MAX_PDF_PAGES) || allPages.length;
+      const pages = allPages.slice(0, Math.max(1, maxPages));
+      const extras = allPages.slice(pages.length);
       try {
         const parts: string[] = [];
         for (let i = 0; i < pages.length; i++) {
           const txt = await tesseractOcr(pages[i]);
           parts.push(`--- page ${i + 1} ---\n${txt}`);
         }
-        return parts.join("\n\n");
+        return {
+          text: parts.join("\n\n"),
+          originalPageCount: allPages.length,
+          truncatedPages: extras.length > 0,
+          tooLarge: false,
+          fileBytes,
+        };
       } finally {
-        await Promise.all(pages.map(safeUnlink));
+        await Promise.all([...pages, ...extras].map(safeUnlink));
       }
     }
-    return await tesseractOcr(downloaded);
+    const text = await tesseractOcr(downloaded);
+    return {
+      text,
+      originalPageCount: 1,
+      truncatedPages: false,
+      tooLarge: false,
+      fileBytes,
+    };
   } finally {
     if (ownsFile) await safeUnlink(downloaded);
   }
 };
+
 
