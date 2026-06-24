@@ -20,6 +20,7 @@ interface Counters {
   success: number;
   failed: number;
   skipped: number;
+  encrypted: number;
   totalDurationMs: number;
   lastAt: string | null;
   lastOutcome: string | null;
@@ -31,6 +32,7 @@ const emptyCounters = (): Counters => ({
   success: 0,
   failed: 0,
   skipped: 0,
+  encrypted: 0,
   totalDurationMs: 0,
   lastAt: null,
   lastOutcome: null,
@@ -112,6 +114,10 @@ interface MediaInfo {
   mediaType: string | null;
   type: string | null;
   fileName: string | null;
+  mediaKey: string | null;
+  directPath: string | null;
+  fileEncSHA256: string | null;
+  fileSHA256: string | null;
 }
 
 const pickStr = (
@@ -161,7 +167,21 @@ const extractMedia = (payload: unknown): MediaInfo => {
     mediaType: pickStr(message, "mediaType"),
     type: pickStr(message, "type"),
     fileName: pickStr(content, "fileName", "filename", "name"),
+    mediaKey: pickStr(content, "mediaKey", "mediakey"),
+    directPath: pickStr(content, "directPath", "directpath"),
+    fileEncSHA256: pickStr(content, "fileEncSHA256", "fileEncSha256"),
+    fileSHA256: pickStr(content, "fileSHA256", "fileSha256"),
   };
+};
+
+// Detecta mídia criptografada do WhatsApp (.enc) — não pode ir direto pro tesseract.
+const isEncryptedWaMedia = (media: MediaInfo): boolean => {
+  if (media.mediaKey) return true;
+  const url = media.url ?? "";
+  if (/\.enc(\?|$)/i.test(url)) return true;
+  if (/mmg\.whatsapp\.net/i.test(url) && !/\.(png|jpe?g|webp|pdf|gif|bmp|tiff?)(\?|$)/i.test(url))
+    return true;
+  return false;
 };
 
 // --------------------------- provider ------------------------------------
@@ -264,6 +284,7 @@ export type OcrOutcome =
   | "DISABLED"
   | "SKIPPED_SOURCE"
   | "SKIPPED_NO_MEDIA"
+  | "MEDIA_ENCRYPTED_UNSUPPORTED"
   | "OK"
   | "FAILED";
 
@@ -280,6 +301,15 @@ export const processOcrShadow = async (
   }
 
   const media = extractMedia(job.payload);
+  const encrypted = isEncryptedWaMedia(media);
+  const logCtx = {
+    mediaUrl: media.url,
+    mimetype: media.mime,
+    messageType: media.messageType,
+    mediaType: media.mediaType,
+    encrypted,
+  };
+
   if (!isOcrCandidate(media.mime, media.url, {
     messageType: media.messageType,
     mediaType: media.mediaType,
@@ -290,7 +320,23 @@ export const processOcrShadow = async (
       c.lastOutcome = "SKIPPED_NO_MEDIA";
       c.lastAt = now;
     });
+    logger.info({ ...logCtx, outcome: "SKIPPED_NO_MEDIA" }, "[ocr-shadow] skip");
     return { outcome: "SKIPPED_NO_MEDIA" };
+  }
+
+  if (encrypted) {
+    bump((c) => {
+      c.encrypted++;
+      c.skipped++;
+      c.lastOutcome = "MEDIA_ENCRYPTED_UNSUPPORTED";
+      c.lastAt = now;
+      c.lastError = null;
+    });
+    logger.warn(
+      { ...logCtx, outcome: "MEDIA_ENCRYPTED_UNSUPPORTED" },
+      "[ocr-shadow] mídia WhatsApp criptografada (.enc) — decrypt não implementado",
+    );
+    return { outcome: "MEDIA_ENCRYPTED_UNSUPPORTED" };
   }
 
   const t0 = Date.now();
@@ -314,7 +360,7 @@ export const processOcrShadow = async (
       c.lastAt = now;
     });
     logger.info(
-      { provider, duration_ms: duration, message_id: media.messageId },
+      { ...logCtx, provider, duration_ms: duration, message_id: media.messageId, outcome: "OK" },
       "[ocr-shadow] OK",
     );
     return { outcome: "OK", file };
@@ -329,7 +375,7 @@ export const processOcrShadow = async (
       c.lastError = msg;
       c.lastAt = now;
     });
-    logger.error({ err: msg }, "[ocr-shadow] FAILED");
+    logger.error({ ...logCtx, err: msg, outcome: "FAILED" }, "[ocr-shadow] FAILED");
     return { outcome: "FAILED", error: msg };
   }
 };
