@@ -55,7 +55,18 @@ const schema = z.object({
     .transform((v) => v.toLowerCase() === "true"),
   SHADOW_INGEST_URL: z.string().optional().default(""),
   SHADOW_INGEST_TOKEN: z.string().optional().default(""),
+  ENABLE_OCR_SHADOW: z
+    .string()
+    .default("false")
+    .transform((v) => v.toLowerCase() === "true"),
+  OCR_SHADOW_DIR: z
+    .string()
+    .default("/opt/x1zap/edge-mini/storage/ocr-shadow"),
+  OCR_PROVIDER: z.string().default("none"),
+  OCR_SHADOW_URL: z.string().optional().default(""),
+  OCR_SHADOW_TOKEN: z.string().optional().default(""),
 });
+
 
 export const env = schema.parse(process.env);
 
