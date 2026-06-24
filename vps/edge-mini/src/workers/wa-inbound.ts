@@ -10,6 +10,7 @@ import {
 } from "../lib/raw-storage.js";
 import { writeShadowLog } from "../lib/supabase-writer.js";
 import { sendShadowIngest } from "../lib/shadow-ingest.js";
+import { processOcrShadow } from "../lib/ocr-shadow.js";
 
 startRotationTimer();
 
