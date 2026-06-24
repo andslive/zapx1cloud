@@ -77,6 +77,12 @@ const schema = z.object({
     .string()
     .default("false")
     .transform((v) => v.toLowerCase() === "true"),
+  ENABLE_RECEIPT_SHADOW_INGEST: z
+    .string()
+    .default("false")
+    .transform((v) => v.toLowerCase() === "true"),
+  RECEIPT_SHADOW_INGEST_URL: z.string().optional().default(""),
+  RECEIPT_SHADOW_INGEST_TOKEN: z.string().optional().default(""),
 
 });
 

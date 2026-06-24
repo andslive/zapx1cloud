@@ -15,6 +15,7 @@ import { dirname, join, resolve } from "node:path";
 import { env } from "../env.js";
 import { logger } from "../logger.js";
 import { writeReceiptShadow } from "./receipt-shadow-writer.js";
+import { sendReceiptShadowIngest } from "./receipt-shadow-ingest.js";
 
 // --------------------------- contadores ----------------------------------
 interface Counters {
@@ -248,6 +249,28 @@ export const processReceiptShadowFile = async (
         "[receipt-shadow] supabase write threw",
       );
     }
+
+    // Fase D.3 — envio via HTTP ingest proxy (Edge Function), sem service_role na VPS2.
+    try {
+      await sendReceiptShadowIngest({
+        received_at: input.received_at ?? now,
+        instance: input.instance ?? null,
+        message_id: input.message_id ?? null,
+        amount: classification.amount,
+        payer_name: classification.payer_name,
+        pix_id: classification.pix_id,
+        is_receipt: classification.is_receipt,
+        confidence: classification.confidence,
+        ocr_text: input.ocr_text ?? null,
+        provider: "shadow",
+      });
+    } catch (err) {
+      logger.error(
+        { err: (err as Error).message },
+        "[receipt-shadow] ingest threw",
+      );
+    }
+
     logger.info(
       {
         message_id: input.message_id,

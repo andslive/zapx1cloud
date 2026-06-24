@@ -12,6 +12,7 @@ import { statsShadowIngestRoute } from "./routes/stats-shadow-ingest.js";
 import { statsOcrShadowRoute } from "./routes/stats-ocr-shadow.js";
 import { statsReceiptShadowRoute } from "./routes/stats-receipt-shadow.js";
 import { statsReceiptShadowWriteRoute } from "./routes/stats-receipt-shadow-write.js";
+import { statsReceiptShadowIngestRoute } from "./routes/stats-receipt-shadow-ingest.js";
 import { startRotationTimer } from "./lib/raw-storage.js";
 
 const app = Fastify({
@@ -49,6 +50,7 @@ await app.register(statsShadowIngestRoute);
 await app.register(statsOcrShadowRoute);
 await app.register(statsReceiptShadowRoute);
 await app.register(statsReceiptShadowWriteRoute);
+await app.register(statsReceiptShadowIngestRoute);
 
 startRotationTimer();
 
