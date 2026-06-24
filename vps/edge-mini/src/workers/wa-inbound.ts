@@ -77,7 +77,22 @@ const worker = new Worker(
           "[wa:inbound] shadow-ingest falhou",
         );
       }
+
+      // Fase D.2 — OCR shadow (default OFF). Apenas mídia imagem/PDF.
+      try {
+        await processOcrShadow({
+          receivedAt: data.receivedAt ?? new Date().toISOString(),
+          source,
+          payload,
+        });
+      } catch (err) {
+        logger.error(
+          { jobId: job.id, err: (err as Error).message },
+          "[wa:inbound] ocr-shadow falhou",
+        );
+      }
     }
+
 
     if (env.DRY_RUN) {
       logger.info(

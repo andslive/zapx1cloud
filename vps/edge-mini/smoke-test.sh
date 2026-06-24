@@ -84,6 +84,20 @@ echo "$SI" | grep -q '"urlConfigured"' || fail "stats/shadow-ingest sem urlConfi
 echo "$SI" | grep -q '"tokenConfigured"' || fail "stats/shadow-ingest sem tokenConfigured"
 pass "/stats/shadow-ingest OK"
 
+echo "[2h] GET /stats/ocr-shadow (default disabled)"
+OC="$(curl -fsS "$BASE/stats/ocr-shadow")"
+echo "    $OC"
+echo "$OC" | grep -q '"processed"' || fail "stats/ocr-shadow sem processed"
+echo "$OC" | grep -q '"success"' || fail "stats/ocr-shadow sem success"
+echo "$OC" | grep -q '"failed"' || fail "stats/ocr-shadow sem failed"
+echo "$OC" | grep -q '"avgDurationMs"' || fail "stats/ocr-shadow sem avgDurationMs"
+echo "$OC" | grep -q '"todayFiles"' || fail "stats/ocr-shadow sem todayFiles"
+if echo "$OC" | grep -q '"enabled":false'; then
+  pass "/stats/ocr-shadow OK (ENABLE_OCR_SHADOW=false por padrão)"
+else
+  echo "    (aviso) ENABLE_OCR_SHADOW != false — confirme intencional"
+fi
+
 if echo "$SI" | grep -q '"enabled":true' && echo "$SI" | grep -q '"urlConfigured":true' && echo "$SI" | grep -q '"tokenConfigured":true'; then
   echo "[2g] Validar ingest na Edge Function (duas chamadas idênticas)"
   DUP_ID="smoke-dup-$(date +%s)"
