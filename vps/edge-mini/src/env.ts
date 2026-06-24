@@ -73,6 +73,10 @@ const schema = z.object({
   OCR_LOCAL_MAX_FILE_MB: z.coerce.number().default(5),
   OCR_MEDIA_DOWNLOAD_PROVIDER: z.string().default("none"),
   UAZAPI_BASE_URL: z.string().optional().default(""),
+  ENABLE_RECEIPT_SHADOW_WRITE: z
+    .string()
+    .default("false")
+    .transform((v) => v.toLowerCase() === "true"),
 
 });
 
