@@ -25,8 +25,6 @@ export const statsOcrShadowRoute: FastifyPluginAsync = async (app) => {
       lastAt: c.lastAt,
       lastError: c.lastError,
 
-      lastAt: c.lastAt,
-      lastError: c.lastError,
     };
   });
 };
