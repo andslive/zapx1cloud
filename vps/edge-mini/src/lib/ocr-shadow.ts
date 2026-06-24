@@ -20,6 +20,7 @@ interface Counters {
   success: number;
   failed: number;
   skipped: number;
+  tooLarge: number;
   encrypted: number;
   downloaded: number;
   downloadFailed: number;
@@ -35,6 +36,7 @@ const emptyCounters = (): Counters => ({
   success: 0,
   failed: 0,
   skipped: 0,
+  tooLarge: 0,
   encrypted: 0,
   downloaded: 0,
   downloadFailed: 0,
@@ -203,9 +205,16 @@ const isEncryptedWaMedia = (media: MediaInfo): boolean => {
 // --------------------------- provider ------------------------------------
 // Provider HTTP genérico: POST { url, mime } com bearer token; espera { text }.
 // Default OCR_PROVIDER="none" => apenas conta skipped, não chama nada.
-const runOcr = async (
-  media: MediaInfo,
-): Promise<{ text: string; provider: string }> => {
+interface OcrRunResult {
+  text: string;
+  provider: string;
+  originalPageCount: number | null;
+  truncatedPages: boolean;
+  tooLarge: boolean;
+  fileBytes: number | null;
+}
+
+const runOcr = async (media: MediaInfo): Promise<OcrRunResult> => {
   const provider = (env.OCR_PROVIDER || "none").toLowerCase();
 
   if (provider === "none") {
@@ -230,29 +239,49 @@ const runOcr = async (
     try {
       json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
     } catch {
-      // fallback: raw
-      return { text: text.slice(0, 50000), provider };
+      return {
+        text: text.slice(0, 50000),
+        provider,
+        originalPageCount: null,
+        truncatedPages: false,
+        tooLarge: false,
+        fileBytes: null,
+      };
     }
     const ocrText =
       (typeof json.text === "string" && json.text) ||
       (typeof json.ocr_text === "string" && json.ocr_text) ||
       "";
-    return { text: String(ocrText), provider };
+    return {
+      text: String(ocrText),
+      provider,
+      originalPageCount: null,
+      truncatedPages: false,
+      tooLarge: false,
+      fileBytes: null,
+    };
   }
 
   if (provider === "local") {
     const { runLocalOcr } = await import("./ocr-local.js");
-    const text = await runLocalOcr({
+    const r = await runLocalOcr({
       url: media.url,
       mime: media.mime,
       localPath: (media as MediaInfo & { localPath?: string }).localPath ?? null,
     });
-    return { text, provider };
+    return {
+      text: r.text,
+      provider,
+      originalPageCount: r.originalPageCount,
+      truncatedPages: r.truncatedPages,
+      tooLarge: r.tooLarge,
+      fileBytes: r.fileBytes,
+    };
   }
-
 
   throw new Error(`unknown_provider:${provider}`);
 };
+
 
 
 // --------------------------- armazenamento -------------------------------
@@ -273,6 +302,10 @@ const saveResult = async (record: {
   ocr_text: string;
   provider: string;
   duration_ms: number;
+  original_page_count?: number | null;
+  truncated_pages?: boolean;
+  file_bytes?: number | null;
+  outcome?: string;
 }) => {
   const dir = join(OCR_DIR, today());
   await fsp.mkdir(dir, { recursive: true });
@@ -283,6 +316,7 @@ const saveResult = async (record: {
   await fsp.writeFile(file, JSON.stringify(record, null, 2), "utf8");
   return file;
 };
+
 
 export const getTodayFiles = async (): Promise<number> => {
   try {
@@ -307,6 +341,7 @@ export type OcrOutcome =
   | "SKIPPED_NO_MEDIA"
   | "MEDIA_ENCRYPTED_UNSUPPORTED"
   | "MEDIA_DOWNLOAD_UNSUPPORTED"
+  | "SKIPPED_TOO_LARGE"
   | "OK"
   | "FAILED";
 
@@ -414,16 +449,53 @@ export const processOcrShadow = async (
     const mediaForOcr = { ...media, localPath } as MediaInfo & {
       localPath: string | null;
     };
-    const { text, provider } = await runOcr(mediaForOcr);
-
+    const result = await runOcr(mediaForOcr);
     const duration = Date.now() - t0;
+
+    if (result.tooLarge) {
+      const file = await saveResult({
+        received_at: job.receivedAt,
+        instance: media.instance,
+        message_id: media.messageId,
+        ocr_text: "",
+        provider: result.provider,
+        duration_ms: duration,
+        original_page_count: result.originalPageCount,
+        truncated_pages: result.truncatedPages,
+        file_bytes: result.fileBytes,
+        outcome: "SKIPPED_TOO_LARGE",
+      });
+      bump((c) => {
+        c.tooLarge++;
+        c.skipped++;
+        c.lastOutcome = "SKIPPED_TOO_LARGE";
+        c.lastError = null;
+        c.lastAt = now;
+      });
+      logger.warn(
+        {
+          ...logCtx,
+          provider: result.provider,
+          fileBytes: result.fileBytes,
+          maxMb: env.OCR_LOCAL_MAX_FILE_MB,
+          outcome: "SKIPPED_TOO_LARGE",
+        },
+        "[ocr-shadow] arquivo acima do limite — pulado",
+      );
+      return { outcome: "SKIPPED_TOO_LARGE", file };
+    }
+
     const file = await saveResult({
       received_at: job.receivedAt,
       instance: media.instance,
       message_id: media.messageId,
-      ocr_text: text,
-      provider,
+      ocr_text: result.text,
+      provider: result.provider,
       duration_ms: duration,
+      original_page_count: result.originalPageCount,
+      truncated_pages: result.truncatedPages,
+      file_bytes: result.fileBytes,
+      outcome: "OK",
     });
     bump((c) => {
       c.processed++;
@@ -434,7 +506,16 @@ export const processOcrShadow = async (
       c.lastAt = now;
     });
     logger.info(
-      { ...logCtx, provider, duration_ms: duration, message_id: media.messageId, outcome: "OK" },
+      {
+        ...logCtx,
+        provider: result.provider,
+        duration_ms: duration,
+        message_id: media.messageId,
+        originalPageCount: result.originalPageCount,
+        truncatedPages: result.truncatedPages,
+        fileBytes: result.fileBytes,
+        outcome: "OK",
+      },
       "[ocr-shadow] OK",
     );
     return { outcome: "OK", file };
