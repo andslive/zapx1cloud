@@ -46,6 +46,7 @@ await app.register(statsEventsRoute);
 await app.register(statsSupabaseWriteRoute);
 await app.register(statsShadowIngestRoute);
 await app.register(statsOcrShadowRoute);
+await app.register(statsReceiptShadowRoute);
 
 startRotationTimer();
 
