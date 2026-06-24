@@ -16,9 +16,15 @@ export const statsOcrShadowRoute: FastifyPluginAsync = async (app) => {
       failed: c.failed,
       skipped: c.skipped,
       encrypted: c.encrypted,
+      downloaded: c.downloaded,
+      downloadFailed: c.downloadFailed,
+      decryptUnsupported: c.decryptUnsupported,
       avgDurationMs,
       todayFiles,
       lastOutcome: c.lastOutcome,
+      lastAt: c.lastAt,
+      lastError: c.lastError,
+
       lastAt: c.lastAt,
       lastError: c.lastError,
     };
