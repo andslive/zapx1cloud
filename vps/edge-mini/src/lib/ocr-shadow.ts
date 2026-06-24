@@ -280,7 +280,11 @@ export const processOcrShadow = async (
   }
 
   const media = extractMedia(job.payload);
-  if (!isOcrCandidate(media.mime, media.url)) {
+  if (!isOcrCandidate(media.mime, media.url, {
+    messageType: media.messageType,
+    mediaType: media.mediaType,
+    type: media.type,
+  })) {
     bump((c) => {
       c.skipped++;
       c.lastOutcome = "SKIPPED_NO_MEDIA";
