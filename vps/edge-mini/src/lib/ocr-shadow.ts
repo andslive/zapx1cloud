@@ -114,6 +114,10 @@ interface MediaInfo {
   mediaType: string | null;
   type: string | null;
   fileName: string | null;
+  mediaKey: string | null;
+  directPath: string | null;
+  fileEncSHA256: string | null;
+  fileSHA256: string | null;
 }
 
 const pickStr = (
