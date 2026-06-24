@@ -20,6 +20,7 @@ interface Counters {
   success: number;
   failed: number;
   skipped: number;
+  tooLarge: number;
   encrypted: number;
   downloaded: number;
   downloadFailed: number;
