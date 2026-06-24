@@ -175,8 +175,15 @@ const runOcr = async (
     return { text: String(ocrText), provider };
   }
 
+  if (provider === "local") {
+    const { runLocalOcr } = await import("./ocr-local.js");
+    const text = await runLocalOcr({ url: media.url, mime: media.mime });
+    return { text, provider };
+  }
+
   throw new Error(`unknown_provider:${provider}`);
 };
+
 
 // --------------------------- armazenamento -------------------------------
 const today = (): string => {
