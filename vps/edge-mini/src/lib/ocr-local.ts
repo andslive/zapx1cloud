@@ -142,6 +142,16 @@ export const runLocalOcr = async (media: {
   const hasLocal = !!media.localPath;
   if (!media.url && !hasLocal) throw new Error("missing_media_url");
 
+  if (process.env.OCR_LOCAL_DEBUG === "1") {
+    // eslint-disable-next-line no-console
+    console.log("[ocr-local] config", {
+      timeout_ms: getTimeoutMs(),
+      max_pdf_pages: Number(env.OCR_LOCAL_MAX_PDF_PAGES) || null,
+      max_file_mb: Number(env.OCR_LOCAL_MAX_FILE_MB) || null,
+      mime: media.mime,
+    });
+  }
+
   const refForExt = media.localPath ?? media.url ?? "";
   const isPdf = PDF_RE.test(mime) || /\.pdf(\?|$)/i.test(refForExt);
   const isImage =
