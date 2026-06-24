@@ -306,6 +306,7 @@ export type OcrOutcome =
   | "SKIPPED_SOURCE"
   | "SKIPPED_NO_MEDIA"
   | "MEDIA_ENCRYPTED_UNSUPPORTED"
+  | "MEDIA_DOWNLOAD_UNSUPPORTED"
   | "OK"
   | "FAILED";
 
@@ -323,12 +324,17 @@ export const processOcrShadow = async (
 
   const media = extractMedia(job.payload);
   const encrypted = isEncryptedWaMedia(media);
+  const downloadProvider = (env.OCR_MEDIA_DOWNLOAD_PROVIDER || "none").toLowerCase();
   const logCtx = {
+    instanceName: media.instance,
+    chatid: media.chatId,
+    messageid: media.messageId,
     mediaUrl: media.url,
     mimetype: media.mime,
     messageType: media.messageType,
     mediaType: media.mediaType,
     encrypted,
+    downloadProvider,
   };
 
   if (!isOcrCandidate(media.mime, media.url, {
@@ -345,24 +351,71 @@ export const processOcrShadow = async (
     return { outcome: "SKIPPED_NO_MEDIA" };
   }
 
+  // Mídia criptografada (WhatsApp .enc) — tenta baixar descriptografada via provider.
+  let localPath: string | null = null;
   if (encrypted) {
     bump((c) => {
       c.encrypted++;
-      c.skipped++;
-      c.lastOutcome = "MEDIA_ENCRYPTED_UNSUPPORTED";
       c.lastAt = now;
-      c.lastError = null;
     });
-    logger.warn(
-      { ...logCtx, outcome: "MEDIA_ENCRYPTED_UNSUPPORTED" },
-      "[ocr-shadow] mídia WhatsApp criptografada (.enc) — decrypt não implementado",
-    );
-    return { outcome: "MEDIA_ENCRYPTED_UNSUPPORTED" };
+
+    if (downloadProvider !== "uazapi" || !media.messageId) {
+      bump((c) => {
+        c.decryptUnsupported++;
+        c.skipped++;
+        c.lastOutcome = "MEDIA_DOWNLOAD_UNSUPPORTED";
+        c.lastAt = now;
+        c.lastError = null;
+      });
+      logger.warn(
+        { ...logCtx, downloadOutcome: "UNSUPPORTED", outcome: "MEDIA_DOWNLOAD_UNSUPPORTED" },
+        "[ocr-shadow] mídia criptografada sem provider de download",
+      );
+      return { outcome: "MEDIA_DOWNLOAD_UNSUPPORTED" };
+    }
+
+    try {
+      const { downloadUazapiMedia } = await import("./uazapi-media-download.js");
+      const dl = await downloadUazapiMedia({
+        messageId: media.messageId,
+        instanceToken: media.instanceToken,
+        mime: media.mime,
+      });
+      localPath = dl.filePath;
+      if (dl.mime && !media.mime) media.mime = dl.mime;
+      bump((c) => {
+        c.downloaded++;
+        c.lastAt = now;
+      });
+      logger.info(
+        { ...logCtx, downloadOutcome: "OK" },
+        "[ocr-shadow] download uazapi OK",
+      );
+    } catch (err) {
+      const msg = (err as Error).message;
+      bump((c) => {
+        c.downloadFailed++;
+        c.failed++;
+        c.processed++;
+        c.lastOutcome = "FAILED";
+        c.lastError = msg;
+        c.lastAt = now;
+      });
+      logger.error(
+        { ...logCtx, downloadOutcome: "FAILED", err: msg, outcome: "FAILED" },
+        "[ocr-shadow] download uazapi falhou",
+      );
+      return { outcome: "FAILED", error: msg };
+    }
   }
 
   const t0 = Date.now();
   try {
-    const { text, provider } = await runOcr(media);
+    const mediaForOcr = { ...media, localPath } as MediaInfo & {
+      localPath: string | null;
+    };
+    const { text, provider } = await runOcr(mediaForOcr);
+
     const duration = Date.now() - t0;
     const file = await saveResult({
       received_at: job.receivedAt,
