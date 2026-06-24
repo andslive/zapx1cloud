@@ -36,6 +36,7 @@ const emptyCounters = (): Counters => ({
   success: 0,
   failed: 0,
   skipped: 0,
+  tooLarge: 0,
   encrypted: 0,
   downloaded: 0,
   downloadFailed: 0,
