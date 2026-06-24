@@ -167,7 +167,21 @@ const extractMedia = (payload: unknown): MediaInfo => {
     mediaType: pickStr(message, "mediaType"),
     type: pickStr(message, "type"),
     fileName: pickStr(content, "fileName", "filename", "name"),
+    mediaKey: pickStr(content, "mediaKey", "mediakey"),
+    directPath: pickStr(content, "directPath", "directpath"),
+    fileEncSHA256: pickStr(content, "fileEncSHA256", "fileEncSha256"),
+    fileSHA256: pickStr(content, "fileSHA256", "fileSha256"),
   };
+};
+
+// Detecta mídia criptografada do WhatsApp (.enc) — não pode ir direto pro tesseract.
+const isEncryptedWaMedia = (media: MediaInfo): boolean => {
+  if (media.mediaKey) return true;
+  const url = media.url ?? "";
+  if (/\.enc(\?|$)/i.test(url)) return true;
+  if (/mmg\.whatsapp\.net/i.test(url) && !/\.(png|jpe?g|webp|pdf|gif|bmp|tiff?)(\?|$)/i.test(url))
+    return true;
+  return false;
 };
 
 // --------------------------- provider ------------------------------------
