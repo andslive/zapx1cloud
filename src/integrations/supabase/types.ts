@@ -9341,6 +9341,51 @@ export type Database = {
           },
         ]
       }
+      receipt_shadow_results: {
+        Row: {
+          amount: number | null
+          confidence: number | null
+          created_at: string
+          id: string
+          instance: string | null
+          is_receipt: boolean | null
+          message_id: string | null
+          ocr_text: string | null
+          payer_name: string | null
+          pix_id: string | null
+          provider: string | null
+          received_at: string | null
+        }
+        Insert: {
+          amount?: number | null
+          confidence?: number | null
+          created_at?: string
+          id?: string
+          instance?: string | null
+          is_receipt?: boolean | null
+          message_id?: string | null
+          ocr_text?: string | null
+          payer_name?: string | null
+          pix_id?: string | null
+          provider?: string | null
+          received_at?: string | null
+        }
+        Update: {
+          amount?: number | null
+          confidence?: number | null
+          created_at?: string
+          id?: string
+          instance?: string | null
+          is_receipt?: boolean | null
+          message_id?: string | null
+          ocr_text?: string | null
+          payer_name?: string | null
+          pix_id?: string | null
+          provider?: string | null
+          received_at?: string | null
+        }
+        Relationships: []
+      }
       sales_goals: {
         Row: {
           achieved_deals: number | null
