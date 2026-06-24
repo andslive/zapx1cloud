@@ -11,6 +11,7 @@ import { statsSupabaseWriteRoute } from "./routes/stats-supabase-write.js";
 import { statsShadowIngestRoute } from "./routes/stats-shadow-ingest.js";
 import { statsOcrShadowRoute } from "./routes/stats-ocr-shadow.js";
 import { statsReceiptShadowRoute } from "./routes/stats-receipt-shadow.js";
+import { statsReceiptShadowWriteRoute } from "./routes/stats-receipt-shadow-write.js";
 import { startRotationTimer } from "./lib/raw-storage.js";
 
 const app = Fastify({
