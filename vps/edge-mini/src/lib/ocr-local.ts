@@ -96,10 +96,11 @@ const tesseractOcr = async (file: string): Promise<string> => {
 const pdfToImages = async (pdfFile: string): Promise<string[]> => {
   const bin = env.OCR_LOCAL_PDFTOPPM_BIN || "pdftoppm";
   const outBase = join(tmpdir(), `ocr-${randomUUID()}`);
+  const timeoutMs = getTimeoutMs();
   const r = await exec(
     bin,
     ["-r", "200", "-png", pdfFile, outBase],
-    Number(env.OCR_LOCAL_TIMEOUT_MS) || 60_000,
+    timeoutMs,
   );
   if (r.code !== 0) {
     throw new Error(
