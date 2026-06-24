@@ -449,16 +449,53 @@ export const processOcrShadow = async (
     const mediaForOcr = { ...media, localPath } as MediaInfo & {
       localPath: string | null;
     };
-    const { text, provider } = await runOcr(mediaForOcr);
-
+    const result = await runOcr(mediaForOcr);
     const duration = Date.now() - t0;
+
+    if (result.tooLarge) {
+      const file = await saveResult({
+        received_at: job.receivedAt,
+        instance: media.instance,
+        message_id: media.messageId,
+        ocr_text: "",
+        provider: result.provider,
+        duration_ms: duration,
+        original_page_count: result.originalPageCount,
+        truncated_pages: result.truncatedPages,
+        file_bytes: result.fileBytes,
+        outcome: "SKIPPED_TOO_LARGE",
+      });
+      bump((c) => {
+        c.tooLarge++;
+        c.skipped++;
+        c.lastOutcome = "SKIPPED_TOO_LARGE";
+        c.lastError = null;
+        c.lastAt = now;
+      });
+      logger.warn(
+        {
+          ...logCtx,
+          provider: result.provider,
+          fileBytes: result.fileBytes,
+          maxMb: env.OCR_LOCAL_MAX_FILE_MB,
+          outcome: "SKIPPED_TOO_LARGE",
+        },
+        "[ocr-shadow] arquivo acima do limite — pulado",
+      );
+      return { outcome: "SKIPPED_TOO_LARGE", file };
+    }
+
     const file = await saveResult({
       received_at: job.receivedAt,
       instance: media.instance,
       message_id: media.messageId,
-      ocr_text: text,
-      provider,
+      ocr_text: result.text,
+      provider: result.provider,
       duration_ms: duration,
+      original_page_count: result.originalPageCount,
+      truncated_pages: result.truncatedPages,
+      file_bytes: result.fileBytes,
+      outcome: "OK",
     });
     bump((c) => {
       c.processed++;
@@ -469,7 +506,16 @@ export const processOcrShadow = async (
       c.lastAt = now;
     });
     logger.info(
-      { ...logCtx, provider, duration_ms: duration, message_id: media.messageId, outcome: "OK" },
+      {
+        ...logCtx,
+        provider: result.provider,
+        duration_ms: duration,
+        message_id: media.messageId,
+        originalPageCount: result.originalPageCount,
+        truncatedPages: result.truncatedPages,
+        fileBytes: result.fileBytes,
+        outcome: "OK",
+      },
       "[ocr-shadow] OK",
     );
     return { outcome: "OK", file };
