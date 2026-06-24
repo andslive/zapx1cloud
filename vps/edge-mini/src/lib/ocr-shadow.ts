@@ -302,6 +302,10 @@ const saveResult = async (record: {
   ocr_text: string;
   provider: string;
   duration_ms: number;
+  original_page_count?: number | null;
+  truncated_pages?: boolean;
+  file_bytes?: number | null;
+  outcome?: string;
 }) => {
   const dir = join(OCR_DIR, today());
   await fsp.mkdir(dir, { recursive: true });
@@ -312,6 +316,7 @@ const saveResult = async (record: {
   await fsp.writeFile(file, JSON.stringify(record, null, 2), "utf8");
   return file;
 };
+
 
 export const getTodayFiles = async (): Promise<number> => {
   try {
