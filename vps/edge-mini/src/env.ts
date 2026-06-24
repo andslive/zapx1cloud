@@ -69,8 +69,11 @@ const schema = z.object({
   OCR_LOCAL_PDFTOPPM_BIN: z.string().default("pdftoppm"),
   OCR_LOCAL_LANGS: z.string().default("por+eng"),
   OCR_LOCAL_TIMEOUT_MS: z.coerce.number().default(60000),
+  OCR_MEDIA_DOWNLOAD_PROVIDER: z.string().default("none"),
+  UAZAPI_BASE_URL: z.string().optional().default(""),
 
 });
+
 
 
 export const env = schema.parse(process.env);
