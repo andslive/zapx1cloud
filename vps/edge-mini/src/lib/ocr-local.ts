@@ -124,19 +124,25 @@ const safeUnlink = async (file: string) => {
 export const runLocalOcr = async (media: {
   url: string | null;
   mime: string | null;
+  localPath?: string | null;
 }): Promise<string> => {
-  if (!media.url) throw new Error("missing_media_url");
-
   const mime = media.mime ?? "";
-  const isPdf = PDF_RE.test(mime) || /\.pdf(\?|$)/i.test(media.url);
+  const hasLocal = !!media.localPath;
+  if (!media.url && !hasLocal) throw new Error("missing_media_url");
+
+  const refForExt = media.localPath ?? media.url ?? "";
+  const isPdf = PDF_RE.test(mime) || /\.pdf(\?|$)/i.test(refForExt);
   const isImage =
     IMAGE_RE.test(mime) ||
-    /\.(png|jpe?g|webp|bmp|tiff?|gif)(\?|$)/i.test(media.url);
+    /\.(png|jpe?g|webp|bmp|tiff?|gif)(\?|$)/i.test(refForExt);
 
   if (!isPdf && !isImage) throw new Error("unsupported_mime");
 
-  const ext = extFromMime(mime, media.url);
-  const downloaded = await downloadToTmp(media.url, ext);
+  const ext = extFromMime(mime, refForExt);
+  const downloaded = hasLocal
+    ? (media.localPath as string)
+    : await downloadToTmp(media.url as string, ext);
+  const ownsFile = !hasLocal;
 
   try {
     if (isPdf) {
@@ -154,6 +160,7 @@ export const runLocalOcr = async (media: {
     }
     return await tesseractOcr(downloaded);
   } finally {
-    await safeUnlink(downloaded);
+    if (ownsFile) await safeUnlink(downloaded);
   }
 };
+
