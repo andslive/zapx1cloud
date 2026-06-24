@@ -80,11 +80,35 @@ const worker = new Worker(
 
       // Fase D.2 — OCR shadow (default OFF). Apenas mídia imagem/PDF.
       try {
-        await processOcrShadow({
+        const ocrRes = await processOcrShadow({
           receivedAt: data.receivedAt ?? new Date().toISOString(),
           source,
           payload,
         });
+
+        // Fase D.3 — Receipt shadow: classifica o JSON gerado pelo OCR shadow.
+        // Não toca produção, Supabase, Pixel, Purchase Audit, Inbox, Leads.
+        if (ocrRes?.outcome === "OK" && ocrRes.file) {
+          try {
+            const fs = await import("node:fs/promises");
+            const raw = await fs.readFile(ocrRes.file, "utf8");
+            const parsed = JSON.parse(raw) as {
+              received_at?: string;
+              instance?: string | null;
+              message_id?: string | null;
+              ocr_text?: string;
+            };
+            const { processReceiptShadowFile } = await import(
+              "../lib/receipt-ai-shadow.js"
+            );
+            await processReceiptShadowFile(parsed);
+          } catch (err) {
+            logger.error(
+              { jobId: job.id, err: (err as Error).message },
+              "[wa:inbound] receipt-shadow falhou",
+            );
+          }
+        }
       } catch (err) {
         logger.error(
           { jobId: job.id, err: (err as Error).message },
