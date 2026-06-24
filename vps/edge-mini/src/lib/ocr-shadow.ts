@@ -203,9 +203,16 @@ const isEncryptedWaMedia = (media: MediaInfo): boolean => {
 // --------------------------- provider ------------------------------------
 // Provider HTTP genérico: POST { url, mime } com bearer token; espera { text }.
 // Default OCR_PROVIDER="none" => apenas conta skipped, não chama nada.
-const runOcr = async (
-  media: MediaInfo,
-): Promise<{ text: string; provider: string }> => {
+interface OcrRunResult {
+  text: string;
+  provider: string;
+  originalPageCount: number | null;
+  truncatedPages: boolean;
+  tooLarge: boolean;
+  fileBytes: number | null;
+}
+
+const runOcr = async (media: MediaInfo): Promise<OcrRunResult> => {
   const provider = (env.OCR_PROVIDER || "none").toLowerCase();
 
   if (provider === "none") {
@@ -230,29 +237,49 @@ const runOcr = async (
     try {
       json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
     } catch {
-      // fallback: raw
-      return { text: text.slice(0, 50000), provider };
+      return {
+        text: text.slice(0, 50000),
+        provider,
+        originalPageCount: null,
+        truncatedPages: false,
+        tooLarge: false,
+        fileBytes: null,
+      };
     }
     const ocrText =
       (typeof json.text === "string" && json.text) ||
       (typeof json.ocr_text === "string" && json.ocr_text) ||
       "";
-    return { text: String(ocrText), provider };
+    return {
+      text: String(ocrText),
+      provider,
+      originalPageCount: null,
+      truncatedPages: false,
+      tooLarge: false,
+      fileBytes: null,
+    };
   }
 
   if (provider === "local") {
     const { runLocalOcr } = await import("./ocr-local.js");
-    const text = await runLocalOcr({
+    const r = await runLocalOcr({
       url: media.url,
       mime: media.mime,
       localPath: (media as MediaInfo & { localPath?: string }).localPath ?? null,
     });
-    return { text, provider };
+    return {
+      text: r.text,
+      provider,
+      originalPageCount: r.originalPageCount,
+      truncatedPages: r.truncatedPages,
+      tooLarge: r.tooLarge,
+      fileBytes: r.fileBytes,
+    };
   }
-
 
   throw new Error(`unknown_provider:${provider}`);
 };
+
 
 
 // --------------------------- armazenamento -------------------------------
