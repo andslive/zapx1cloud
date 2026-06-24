@@ -284,6 +284,7 @@ export type OcrOutcome =
   | "DISABLED"
   | "SKIPPED_SOURCE"
   | "SKIPPED_NO_MEDIA"
+  | "MEDIA_ENCRYPTED_UNSUPPORTED"
   | "OK"
   | "FAILED";
 
@@ -300,6 +301,15 @@ export const processOcrShadow = async (
   }
 
   const media = extractMedia(job.payload);
+  const encrypted = isEncryptedWaMedia(media);
+  const logCtx = {
+    mediaUrl: media.url,
+    mimetype: media.mime,
+    messageType: media.messageType,
+    mediaType: media.mediaType,
+    encrypted,
+  };
+
   if (!isOcrCandidate(media.mime, media.url, {
     messageType: media.messageType,
     mediaType: media.mediaType,
@@ -310,7 +320,23 @@ export const processOcrShadow = async (
       c.lastOutcome = "SKIPPED_NO_MEDIA";
       c.lastAt = now;
     });
+    logger.info({ ...logCtx, outcome: "SKIPPED_NO_MEDIA" }, "[ocr-shadow] skip");
     return { outcome: "SKIPPED_NO_MEDIA" };
+  }
+
+  if (encrypted) {
+    bump((c) => {
+      c.encrypted++;
+      c.skipped++;
+      c.lastOutcome = "MEDIA_ENCRYPTED_UNSUPPORTED";
+      c.lastAt = now;
+      c.lastError = null;
+    });
+    logger.warn(
+      { ...logCtx, outcome: "MEDIA_ENCRYPTED_UNSUPPORTED" },
+      "[ocr-shadow] mídia WhatsApp criptografada (.enc) — decrypt não implementado",
+    );
+    return { outcome: "MEDIA_ENCRYPTED_UNSUPPORTED" };
   }
 
   const t0 = Date.now();
@@ -334,7 +360,7 @@ export const processOcrShadow = async (
       c.lastAt = now;
     });
     logger.info(
-      { provider, duration_ms: duration, message_id: media.messageId },
+      { ...logCtx, provider, duration_ms: duration, message_id: media.messageId, outcome: "OK" },
       "[ocr-shadow] OK",
     );
     return { outcome: "OK", file };
@@ -349,7 +375,7 @@ export const processOcrShadow = async (
       c.lastError = msg;
       c.lastAt = now;
     });
-    logger.error({ err: msg }, "[ocr-shadow] FAILED");
+    logger.error({ ...logCtx, err: msg, outcome: "FAILED" }, "[ocr-shadow] FAILED");
     return { outcome: "FAILED", error: msg };
   }
 };
