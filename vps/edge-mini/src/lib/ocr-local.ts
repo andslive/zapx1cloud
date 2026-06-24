@@ -74,13 +74,16 @@ const downloadToTmp = async (
   return file;
 };
 
+const getTimeoutMs = (): number => Number(env.OCR_LOCAL_TIMEOUT_MS || 30000);
+
 const tesseractOcr = async (file: string): Promise<string> => {
   const bin = env.OCR_LOCAL_TESSERACT_BIN || "tesseract";
   const langs = env.OCR_LOCAL_LANGS || "por+eng";
+  const timeoutMs = getTimeoutMs();
   const r = await exec(
     bin,
     [file, "stdout", "-l", langs, "--psm", "6"],
-    Number(env.OCR_LOCAL_TIMEOUT_MS) || 60_000,
+    timeoutMs,
   );
   if (r.code !== 0) {
     throw new Error(
