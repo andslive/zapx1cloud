@@ -20,6 +20,7 @@ interface Counters {
   success: number;
   failed: number;
   skipped: number;
+  encrypted: number;
   totalDurationMs: number;
   lastAt: string | null;
   lastOutcome: string | null;
@@ -31,6 +32,7 @@ const emptyCounters = (): Counters => ({
   success: 0,
   failed: 0,
   skipped: 0,
+  encrypted: 0,
   totalDurationMs: 0,
   lastAt: null,
   lastOutcome: null,
