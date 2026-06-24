@@ -74,13 +74,16 @@ const downloadToTmp = async (
   return file;
 };
 
+const getTimeoutMs = (): number => Number(env.OCR_LOCAL_TIMEOUT_MS || 30000);
+
 const tesseractOcr = async (file: string): Promise<string> => {
   const bin = env.OCR_LOCAL_TESSERACT_BIN || "tesseract";
   const langs = env.OCR_LOCAL_LANGS || "por+eng";
+  const timeoutMs = getTimeoutMs();
   const r = await exec(
     bin,
     [file, "stdout", "-l", langs, "--psm", "6"],
-    Number(env.OCR_LOCAL_TIMEOUT_MS) || 60_000,
+    timeoutMs,
   );
   if (r.code !== 0) {
     throw new Error(
@@ -93,10 +96,11 @@ const tesseractOcr = async (file: string): Promise<string> => {
 const pdfToImages = async (pdfFile: string): Promise<string[]> => {
   const bin = env.OCR_LOCAL_PDFTOPPM_BIN || "pdftoppm";
   const outBase = join(tmpdir(), `ocr-${randomUUID()}`);
+  const timeoutMs = getTimeoutMs();
   const r = await exec(
     bin,
     ["-r", "200", "-png", pdfFile, outBase],
-    Number(env.OCR_LOCAL_TIMEOUT_MS) || 60_000,
+    timeoutMs,
   );
   if (r.code !== 0) {
     throw new Error(
@@ -137,6 +141,16 @@ export const runLocalOcr = async (media: {
   const mime = media.mime ?? "";
   const hasLocal = !!media.localPath;
   if (!media.url && !hasLocal) throw new Error("missing_media_url");
+
+  if (process.env.OCR_LOCAL_DEBUG === "1") {
+    // eslint-disable-next-line no-console
+    console.log("[ocr-local] config", {
+      timeout_ms: getTimeoutMs(),
+      max_pdf_pages: Number(env.OCR_LOCAL_MAX_PDF_PAGES) || null,
+      max_file_mb: Number(env.OCR_LOCAL_MAX_FILE_MB) || null,
+      mime: media.mime,
+    });
+  }
 
   const refForExt = media.localPath ?? media.url ?? "";
   const isPdf = PDF_RE.test(mime) || /\.pdf(\?|$)/i.test(refForExt);
