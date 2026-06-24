@@ -226,6 +226,28 @@ export const processReceiptShadowFile = async (
       c.lastError = null;
       c.lastAt = now;
     });
+
+    // Fase D.3 — persistência shadow opcional em Supabase (default OFF).
+    // Não toca leads, conversations, purchase_audit, pixel_event_logs.
+    try {
+      await writeReceiptShadow({
+        received_at: input.received_at ?? now,
+        instance: input.instance ?? null,
+        message_id: input.message_id ?? null,
+        amount: classification.amount,
+        payer_name: classification.payer_name,
+        pix_id: classification.pix_id,
+        is_receipt: classification.is_receipt,
+        confidence: classification.confidence,
+        ocr_text: input.ocr_text ?? null,
+        provider: "shadow",
+      });
+    } catch (err) {
+      logger.error(
+        { err: (err as Error).message },
+        "[receipt-shadow] supabase write threw",
+      );
+    }
     logger.info(
       {
         message_id: input.message_id,
