@@ -271,6 +271,24 @@ export const processReceiptShadowFile = async (
       );
     }
 
+    // Fase E — IA Shadow (heurística local, sem rede). Default OFF.
+    try {
+      const { processAiShadow } = await import("./ai-shadow.js");
+      await processAiShadow({
+        received_at: input.received_at ?? now,
+        instance: input.instance ?? null,
+        message_id: input.message_id ?? null,
+        ocr_text: input.ocr_text ?? "",
+        receipt: classification,
+      });
+    } catch (err) {
+      logger.error(
+        { err: (err as Error).message },
+        "[ai-shadow] dispatch threw",
+      );
+    }
+
+
     logger.info(
       {
         message_id: input.message_id,
