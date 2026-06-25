@@ -1,7 +1,19 @@
 // Fase D.3 — Receipt Shadow Ingest (HTTP proxy → Edge Function)
 // Envia o resultado classificado para a Edge Function `receipt-shadow-ingest`.
 // Não usa service_role na VPS2. Default OFF.
+//
+// Telemetria persistida em arquivo (igual a receipt-ai-shadow.ts), para que
+// múltiplos workers (PM2 cluster) compartilhem os mesmos contadores. Sem isso,
+// o worker que processa o OCR incrementa contadores locais que NÃO aparecem
+// para o worker que atende GET /stats/receipt-shadow-ingest.
 
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
 import { env } from "../env.js";
 import { logger } from "../logger.js";
 
@@ -13,7 +25,6 @@ export type ReceiptIngestOutcome =
   | "MISCONFIGURED";
 
 interface Counters {
-  enabled: boolean;
   ok: number;
   duplicate: number;
   failed: number;
@@ -23,8 +34,7 @@ interface Counters {
   lastError: string | null;
 }
 
-const counters: Counters = {
-  enabled: env.ENABLE_RECEIPT_SHADOW_INGEST,
+const emptyCounters = (): Counters => ({
   ok: 0,
   duplicate: 0,
   failed: 0,
@@ -32,11 +42,52 @@ const counters: Counters = {
   lastOutcome: null,
   lastAt: null,
   lastError: null,
+});
+
+const COUNTERS_FILE = resolve(
+  env.RAW_STORAGE_DIR,
+  "..",
+  "receipt-shadow-ingest-counters.json",
+);
+
+const ensureDir = (file: string) => {
+  const dir = dirname(file);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 };
 
-export const getReceiptIngestCounters = (): Counters => ({
-  ...counters,
+const readCounters = (): Counters => {
+  try {
+    if (!existsSync(COUNTERS_FILE)) return emptyCounters();
+    const raw = readFileSync(COUNTERS_FILE, "utf8");
+    if (!raw.trim()) return emptyCounters();
+    return { ...emptyCounters(), ...(JSON.parse(raw) as Partial<Counters>) };
+  } catch {
+    return emptyCounters();
+  }
+};
+
+const writeCounters = (c: Counters) => {
+  try {
+    ensureDir(COUNTERS_FILE);
+    writeFileSync(COUNTERS_FILE, JSON.stringify(c), "utf8");
+  } catch (err) {
+    logger.error(
+      { err: (err as Error).message },
+      "[receipt-shadow-ingest] failed to persist counters",
+    );
+  }
+};
+
+const bump = (mutate: (c: Counters) => void): Counters => {
+  const c = readCounters();
+  mutate(c);
+  writeCounters(c);
+  return c;
+};
+
+export const getReceiptIngestCounters = (): Counters & { enabled: boolean } => ({
   enabled: env.ENABLE_RECEIPT_SHADOW_INGEST,
+  ...readCounters(),
 });
 
 export interface ReceiptIngestRow {
@@ -56,17 +107,22 @@ export const sendReceiptShadowIngest = async (
   row: ReceiptIngestRow,
 ): Promise<{ outcome: ReceiptIngestOutcome; error?: string }> => {
   const now = new Date().toISOString();
-  counters.lastAt = now;
 
   if (!env.ENABLE_RECEIPT_SHADOW_INGEST) {
-    counters.lastOutcome = "DISABLED";
+    bump((c) => {
+      c.lastOutcome = "DISABLED";
+      c.lastAt = now;
+    });
     return { outcome: "DISABLED" };
   }
 
   if (!env.RECEIPT_SHADOW_INGEST_URL || !env.RECEIPT_SHADOW_INGEST_TOKEN) {
-    counters.misconfigured++;
-    counters.lastOutcome = "MISCONFIGURED";
-    counters.lastError = "missing_url_or_token";
+    bump((c) => {
+      c.misconfigured++;
+      c.lastOutcome = "MISCONFIGURED";
+      c.lastError = "missing_url_or_token";
+      c.lastAt = now;
+    });
     logger.error("[receipt-shadow-ingest] MISCONFIGURED missing url/token");
     return { outcome: "MISCONFIGURED", error: "missing_url_or_token" };
   }
@@ -102,9 +158,12 @@ export const sendReceiptShadowIngest = async (
 
     if (!res.ok) {
       const msg = `http_${res.status}: ${text.slice(0, 200)}`;
-      counters.failed++;
-      counters.lastOutcome = "FAILED";
-      counters.lastError = msg;
+      bump((c) => {
+        c.failed++;
+        c.lastOutcome = "FAILED";
+        c.lastError = msg;
+        c.lastAt = now;
+      });
       logger.error(
         { status: res.status, body: text.slice(0, 200) },
         "[receipt-shadow-ingest] FAILED",
@@ -113,9 +172,12 @@ export const sendReceiptShadowIngest = async (
     }
 
     if (body.duplicate === true) {
-      counters.duplicate++;
-      counters.lastOutcome = "DUPLICATE";
-      counters.lastError = null;
+      bump((c) => {
+        c.duplicate++;
+        c.lastOutcome = "DUPLICATE";
+        c.lastError = null;
+        c.lastAt = now;
+      });
       logger.info(
         { message_id: row.message_id },
         "[receipt-shadow-ingest] DUPLICATE",
@@ -123,9 +185,12 @@ export const sendReceiptShadowIngest = async (
       return { outcome: "DUPLICATE" };
     }
 
-    counters.ok++;
-    counters.lastOutcome = "OK";
-    counters.lastError = null;
+    bump((c) => {
+      c.ok++;
+      c.lastOutcome = "OK";
+      c.lastError = null;
+      c.lastAt = now;
+    });
     logger.info(
       { message_id: row.message_id, is_receipt: row.is_receipt, amount: row.amount },
       "[receipt-shadow-ingest] OK",
@@ -133,9 +198,12 @@ export const sendReceiptShadowIngest = async (
     return { outcome: "OK" };
   } catch (err) {
     const msg = (err as Error).message;
-    counters.failed++;
-    counters.lastOutcome = "FAILED";
-    counters.lastError = msg;
+    bump((c) => {
+      c.failed++;
+      c.lastOutcome = "FAILED";
+      c.lastError = msg;
+      c.lastAt = now;
+    });
     logger.error({ err: msg }, "[receipt-shadow-ingest] FAILED network");
     return { outcome: "FAILED", error: msg };
   }
