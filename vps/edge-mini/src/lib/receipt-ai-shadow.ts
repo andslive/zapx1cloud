@@ -105,52 +105,84 @@ export interface ReceiptClassification {
   pix_id: string | null;
   confidence: number;
   reason: string;
+  score: number;
+  matched_signals: string[];
+  missing_signals: string[];
 }
 
+// Campo "Valor: R$ 100,00" (formato estruturado)
 const VALUE_RE =
   /(?:^|\n|\b)(?:[-•*]\s*)?(?:\d+[.)]\s*)?\*{0,2}\s*Valor(?:\s+(?:pago|total|do\s+pagamento))?\s*\*{0,2}\s*[:\-]\s*\*{0,2}\s*(?:R\$\s*)?([0-9][0-9.,]*)\s*\*{0,2}/i;
+// Fallback: qualquer "R$ 1.234,56" no texto
+const VALUE_FALLBACK_RE = /R\$\s*([0-9]{1,3}(?:[.\s][0-9]{3})*(?:,[0-9]{2})?|[0-9]+(?:[.,][0-9]{2}))/i;
 const NAME_RE =
-  /(?:^|\n)\s*(?:[-•*]\s*)?(?:\d+[.)]\s*)?\*{0,2}\s*(?:Nome\s+do\s+Pagador|Pagador|Nome)\s*\*{0,2}\s*[:\-]\s*\*{0,2}\s*([^\n\r]+)/i;
-const SIGNALS_RE =
-  /COMPROVANTE IDENTIFICADO|Valor\s*:|Nome do Pagador|Pagador\s*:|Pix Enviado|Efetivada|ID transa[cç][aã]o|Institui[cç][aã]o/i;
+  /(?:^|\n)\s*(?:[-•*]\s*)?(?:\d+[.)]\s*)?\*{0,2}\s*(?:Nome\s+do\s+Pagador|Pagador|Pagador\(a\)|Nome)\s*\*{0,2}\s*[:\-]\s*\*{0,2}\s*([^\n\r]+)/i;
 const PIX_ID_RE =
-  /(?:ID\s+(?:da\s+)?transa[cç][aã]o|E2E\s*ID|End[- ]?to[- ]?End|Identificador)\s*[:\-]?\s*([A-Za-z0-9._-]{8,})/i;
+  /(?:ID\s+(?:da\s+)?transa[cç][aã]o|E2E\s*ID|End[- ]?to[- ]?End|Identificador|Autentica[cç][aã]o)\s*[:\-]?\s*([A-Za-z0-9._-]{8,})/i;
+
+// Sinais lexicais (presença de palavras-chave)
+const SIGNAL_PATTERNS: Array<{ key: string; weight: number; re: RegExp }> = [
+  { key: "pix", weight: 0.15, re: /\b(pix|chave\s+pix|pix\s+enviado|pix\s+recebido)\b/i },
+  { key: "comprovante", weight: 0.15, re: /\bcomprovante(s)?\b/i },
+  { key: "transferencia", weight: 0.10, re: /\btransfer[eê]ncia\b/i },
+  { key: "pagamento", weight: 0.10, re: /\b(pagamento|efetivad[ao]|conclu[ií]d[ao]|aprovad[ao])\b/i },
+  { key: "cpf_cnpj", weight: 0.10, re: /\b(CPF|CNPJ)\b|\b\d{3}\.\d{3}\.\d{3}-\d{2}\b|\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/i },
+  { key: "instituicao", weight: 0.10, re: /\b(institui[cç][aã]o|banco|ag[eê]ncia|conta)\b/i },
+  { key: "data", weight: 0.05, re: /\b\d{2}\/\d{2}\/\d{2,4}\b/ },
+];
+
+const ALL_SIGNAL_KEYS = [
+  ...SIGNAL_PATTERNS.map((s) => s.key),
+  "valor",
+  "pagador",
+  "id_transacao",
+];
 
 export const classifyReceiptShadow = (ocrText: string): ReceiptClassification => {
   const text = String(ocrText || "");
   const valueMatch = text.match(VALUE_RE);
+  const valueFallback = !valueMatch ? text.match(VALUE_FALLBACK_RE) : null;
   const nameMatch = text.match(NAME_RE);
   const pixMatch = text.match(PIX_ID_RE);
 
-  const amount = valueMatch ? normalizeReceiptValue(valueMatch[1]) : null;
+  const amount = valueMatch
+    ? normalizeReceiptValue(valueMatch[1])
+    : valueFallback
+      ? normalizeReceiptValue(valueFallback[1])
+      : null;
   const payer = nameMatch
     ? String(nameMatch[1] || "")
         .replace(/\*{1,2}/g, "")
         .replace(/\s+(?:\d+[.)]\s*)?(?:Data(?:\s+e\s+Hora)?|Valor|CPF|CNPJ|Banco)\b.*$/i, "")
         .trim()
     : "";
-  const hasSignals = SIGNALS_RE.test(text);
 
-  const reasons: string[] = [];
+  const matched: string[] = [];
   let score = 0;
-  if (hasSignals) {
-    score += 0.4;
-    reasons.push("signals");
+
+  for (const sig of SIGNAL_PATTERNS) {
+    if (sig.re.test(text)) {
+      score += sig.weight;
+      matched.push(sig.key);
+    }
   }
   if (amount && amount > 0) {
-    score += 0.35;
-    reasons.push("amount");
+    score += 0.20;
+    matched.push("valor");
   }
   if (payer && payer.length >= 3) {
-    score += 0.2;
-    reasons.push("payer");
+    score += 0.15;
+    matched.push("pagador");
   }
   if (pixMatch) {
-    score += 0.05;
-    reasons.push("pix_id");
+    score += 0.15;
+    matched.push("id_transacao");
   }
-  const confidence = Math.min(1, Number(score.toFixed(2)));
-  const is_receipt = hasSignals && !!amount && !!payer && payer.length >= 3;
+
+  score = Math.min(1, Number(score.toFixed(2)));
+  const confidence = score;
+  const is_receipt = score >= 0.70;
+  const missing = ALL_SIGNAL_KEYS.filter((k) => !matched.includes(k));
 
   return {
     is_receipt,
@@ -158,7 +190,10 @@ export const classifyReceiptShadow = (ocrText: string): ReceiptClassification =>
     payer_name: payer || null,
     pix_id: pixMatch ? pixMatch[1] : null,
     confidence,
-    reason: reasons.join("+") || "no_signals",
+    score,
+    matched_signals: matched,
+    missing_signals: missing,
+    reason: matched.join("+") || "no_signals",
   };
 };
 
@@ -217,6 +252,9 @@ export const processReceiptShadowFile = async (
       pix_id: classification.pix_id,
       is_receipt: classification.is_receipt,
       confidence: classification.confidence,
+      score: classification.score,
+      matched_signals: classification.matched_signals,
+      missing_signals: classification.missing_signals,
       reason: classification.reason,
       provider: "shadow",
     });
@@ -296,6 +334,9 @@ export const processReceiptShadowFile = async (
         is_receipt: classification.is_receipt,
         amount: classification.amount,
         confidence: classification.confidence,
+        score: classification.score,
+        matched: classification.matched_signals,
+        missing: classification.missing_signals,
       },
       "[receipt-shadow] OK",
     );
