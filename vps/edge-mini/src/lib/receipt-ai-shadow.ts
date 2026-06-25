@@ -334,6 +334,9 @@ export const processReceiptShadowFile = async (
         is_receipt: classification.is_receipt,
         amount: classification.amount,
         confidence: classification.confidence,
+        score: classification.score,
+        matched: classification.matched_signals,
+        missing: classification.missing_signals,
       },
       "[receipt-shadow] OK",
     );
