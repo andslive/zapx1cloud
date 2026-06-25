@@ -252,6 +252,9 @@ export const processReceiptShadowFile = async (
       pix_id: classification.pix_id,
       is_receipt: classification.is_receipt,
       confidence: classification.confidence,
+      score: classification.score,
+      matched_signals: classification.matched_signals,
+      missing_signals: classification.missing_signals,
       reason: classification.reason,
       provider: "shadow",
     });
