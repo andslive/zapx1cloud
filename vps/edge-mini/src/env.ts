@@ -83,7 +83,18 @@ const schema = z.object({
     .transform((v) => v.toLowerCase() === "true"),
   RECEIPT_SHADOW_INGEST_URL: z.string().optional().default(""),
   RECEIPT_SHADOW_INGEST_TOKEN: z.string().optional().default(""),
-
+  ENABLE_AI_SHADOW: z
+    .string()
+    .default("false")
+    .transform((v) => v.toLowerCase() === "true"),
+  AI_SHADOW_PROVIDER: z.string().default("none"),
+  AI_SHADOW_DIR: z
+    .string()
+    .default("/opt/x1zap/edge-mini/storage/ai-shadow"),
+  AI_SHADOW_ONLY_RECEIPTS: z
+    .string()
+    .default("true")
+    .transform((v) => v.toLowerCase() !== "false"),
 });
 
 
