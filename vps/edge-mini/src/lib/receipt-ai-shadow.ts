@@ -343,6 +343,7 @@ export const processReceiptShadowFile = async (
         is_receipt: classification.is_receipt,
         confidence: classification.confidence,
         ocr_text: input.ocr_text ?? null,
+        phone: input.chat_id ?? undefined,
       });
     } catch (err) {
       logger.error(
