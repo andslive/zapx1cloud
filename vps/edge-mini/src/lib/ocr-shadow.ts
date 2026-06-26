@@ -299,6 +299,7 @@ const saveResult = async (record: {
   received_at: string;
   instance: string | null;
   message_id: string | null;
+  chat_id?: string | null;
   ocr_text: string;
   provider: string;
   duration_ms: number;
