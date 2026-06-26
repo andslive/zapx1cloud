@@ -118,9 +118,40 @@ Deno.serve(async (req) => {
   if (error) {
     const code = (error as { code?: string }).code;
     if (code === "23505" || /duplicate key/i.test(error.message)) {
-      return json(200, { ok: true, duplicate: true });
+      // mantém comportamento atual — segue para upsert do espelho abaixo.
+    } else {
+      return json(500, { ok: false, error: error.message });
     }
-    return json(500, { ok: false, error: error.message });
+  }
+
+  // Fase G.1 — espelho dedicado para consumo pelo bloco ai_receipt (não
+  // substitui purchase_audit; é fonte de verdade só do resultado da VPS2).
+  // Falha aqui NÃO bloqueia a resposta de sucesso do pipeline F.
+  try {
+    await supabase
+      .from("vps_receipt_results")
+      .upsert(
+        {
+          message_id: messageId,
+          instance,
+          pix_id: pixId,
+          is_receipt: true,
+          amount,
+          customer_name: payerName,
+          confidence,
+          ocr_text: ocrText,
+          ai_reason: aiReason,
+          phone,
+          received_at: receivedAt,
+          raw_payload: body,
+        },
+        { onConflict: "message_id" },
+      );
+  } catch (mirrorErr) {
+    console.warn(
+      "[receipt-production-write] vps_receipt_results mirror failed",
+      (mirrorErr as Error)?.message,
+    );
   }
 
   return json(200, { ok: true, inserted: true });
