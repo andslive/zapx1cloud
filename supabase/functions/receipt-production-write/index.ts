@@ -13,7 +13,7 @@ const json = (status: number, body: unknown) =>
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 
-const ALLOWED_INSTANCES = new Set(["canal46"]);
+const ALLOWED_INSTANCES = new Set(["canal46", "canal36"]);
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
