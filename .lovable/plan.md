@@ -1,112 +1,115 @@
+# Fase F — Piloto controlado canal46 (Receipt Production Write)
 
-# Fase E — IA Shadow (VPS2)
+Habilita a VPS2 a executar a escrita operacional de comprovante **apenas** para a instância `canal46`, mantendo todos os demais chips 100% no fluxo atual da Lovable Cloud. Kill-switch por env: basta desligar a flag para voltar ao comportamento atual.
 
-Executa a IA completa em paralelo ao OCR/Receipt Shadow já validados. Apenas observação. Sem escrita em Leads, Inbox, Conversations, Funis, Pixel, Purchase Audit, CAPI ou WhatsApp. `DRY_RUN=true` mantido.
+## Princípios
+
+- Allowlist estrita por `instance`. Qualquer instância fora da lista é ignorada silenciosamente (sem erro, sem log de warning ruidoso).
+- Idempotência dupla: `message_id` (chave primária) + `pix_id` (chave secundária) — antes de qualquer escrita, consulta `purchase_audit` / `pixel_event_logs` para evitar duplicar com o que a Edge da Lovable já gravou.
+- Default OFF. `ENABLE_RECEIPT_PRODUCTION_WRITE=false` mantém o comportamento atual (apenas shadow).
+- Nenhum envio de mensagem WhatsApp. Nenhuma alteração em funis, leads, inbox, conversations, agentes IA.
+- Reaproveita o pipeline shadow já validado — entra como passo lateral **depois** de `processReceiptShadowFile`, dentro de try/catch, nunca propaga exceção.
 
 ## Arquitetura
 
-Pipeline atual:
-```
-Webhook Shadow → Worker wa-inbound → raw-storage → OCR Shadow → Receipt Shadow → Receipt Shadow Ingest
+```text
+Receipt Shadow (is_receipt=true)
+        │
+        ├─► AI Shadow (já existente, inalterado)
+        │
+        └─► [Fase F] receipt-production-write
+                │
+                ├─ instance ∈ ALLOWED?  ──não──► IGNORED (silencioso)
+                │
+                ├─ já existe message_id em purchase_audit? ──sim──► DUPLICATE
+                ├─ já existe pix_id em purchase_audit?     ──sim──► DUPLICATE
+                │
+                └─ INSERT purchase_audit (provider="vps2-pilot")
+                        │
+                        ├─ INSERT pixel_event_logs (event="Purchase", source="vps2-pilot")
+                        │   └─ idempotência por (message_id, event)
+                        │
+                        └─ contadores file-backed + log estruturado
 ```
 
-Fase E adiciona um passo lateral, disparado **somente** quando o Receipt Shadow produz um resultado:
+A escrita usa o `SUPABASE_SERVICE_ROLE_KEY` já presente na VPS2 (mesmo client do receipt-shadow-writer). Não há nova credencial.
 
-```
-Receipt Shadow (OK) ──► AI Shadow ──► storage/ai-shadow/<dia>/<ts>-<msgid>.json
-                                  └─► counters file
-                                  └─► (opcional, futuro) ingest HTTP
-```
+## Tabelas tocadas (apenas para canal46)
 
-A IA Shadow NÃO chama `sendReceiptShadowIngest`, NÃO escreve em Supabase, NÃO envia mensagens. Apenas classifica o texto OCR + resultado Receipt e persiste localmente.
+- `purchase_audit` — INSERT com `provider='vps2-pilot'`, `instance`, `message_id`, `pix_id`, `amount`, `payer_name`, `ocr_text`, `confidence`, `received_at`.
+- `pixel_event_logs` — INSERT do evento `Purchase` com `source='vps2-pilot'` e `dedupe_key = sha256(message_id|Purchase)`.
+
+Nenhuma escrita em `leads`, `conversations`, `webchat_*`, `deals`, `funnels`, `whatsapp_*`.
 
 ## Idempotência
 
-Chave: `sha256(instance + "|" + message_id)`. Se já existe arquivo `index/<hash>.json` em `storage/ai-shadow/index/`, marca `duplicate` e não reprocessa.
+1. Antes do INSERT em `purchase_audit`: `SELECT 1 ... WHERE message_id = ? OR (pix_id IS NOT NULL AND pix_id = ?) LIMIT 1`. Se achar → `DUPLICATE`.
+2. INSERT usa `ON CONFLICT (message_id) DO NOTHING` como segunda barreira (assumindo unique constraint existente; se não houver, o select cobre).
+3. Pixel: dedupe por `sha256(message_id + '|Purchase')` armazenado em campo `dedupe_key` (já existente em `pixel_event_logs`).
 
-Sem `message_id`: usa `sha256(instance + ocr_text)`.
+## Env novas (defaults seguros)
 
-## Provider de IA
-
-Default `none` (heurística local — sem custo, sem rede): reaproveita `classifyReceiptShadow` e adiciona um score consolidado + label (`receipt_confirmed | receipt_suspect | not_receipt | unknown`). Mantém a porta aberta para `lovable` / `openai` em fase posterior via env (`AI_SHADOW_PROVIDER`), mas Fase E entrega `none` por padrão.
-
-## Estrutura do resultado
-
-```json
-{
-  "received_at": "...",
-  "processed_at": "...",
-  "instance": "canal46",
-  "message_id": "...",
-  "phone": "55...",            // se disponível no payload bruto
-  "conversation_ref": "...",   // se disponível
-  "ocr_text": "...",
-  "receipt": { "is_receipt": true, "amount": 123.45, "payer_name": "...", "pix_id": "...", "confidence": 0.95, "reason": "signals+amount+payer" },
-  "ai": { "provider": "none", "label": "receipt_confirmed", "confidence": 0.95, "reason": "heuristic:receipt+amount+payer", "raw": null },
-  "hash": "sha256:..."
-}
+```
+ENABLE_RECEIPT_PRODUCTION_WRITE=false
+RECEIPT_PRODUCTION_ALLOWED_INSTANCES=canal46
 ```
 
-## Métricas (`GET /stats/ai-shadow`)
+Parser: split por vírgula, trim, lowercase. Comparação case-insensitive contra `instance`.
+
+## Métricas — `GET /stats/receipt-production-write`
 
 ```json
 {
   "enabled": true,
-  "provider": "none",
-  "received": 0,
-  "ignored": 0,
-  "processed": 0,
+  "allowed_instances": ["canal46"],
+  "ok": 0,
   "duplicate": 0,
+  "ignored": 0,
   "failed": 0,
-  "lastOutcome": "OK|DUPLICATE|FAILED|IGNORED",
+  "lastOutcome": "OK|DUPLICATE|IGNORED|FAILED",
   "lastAt": "...",
   "lastError": null,
-  "todayFiles": 0
+  "lastInstance": "canal46",
+  "lastMessageId": "..."
 }
 ```
 
-Contadores file-backed (`storage/ai-shadow-counters.json`) — mesmo padrão de `receipt-shadow-counters.json` para funcionar em PM2 multi-worker.
+Contadores file-backed em `storage/receipt-production-counters.json` (mesmo padrão dos outros módulos, funciona com PM2 multi-worker).
 
 ## Logs
 
-Prefixo `[ai-shadow]`:
-- `received` — chamada entrou
-- `ignored` — Receipt não-comprovante ou desativado
-- `processed` — OK com hash + label
-- `duplicate` — hash já visto
-- `error` — exceção com `err.message`
-
-## Env (novas, defaults seguros)
-
-```
-ENABLE_AI_SHADOW=false        # liga/desliga a etapa
-AI_SHADOW_PROVIDER=none       # none|lovable|openai (Fase E entrega "none")
-AI_SHADOW_DIR=/opt/x1zap/edge-mini/storage/ai-shadow
-AI_SHADOW_ONLY_RECEIPTS=true  # se true, só processa quando receipt.is_receipt=true
-```
-
-Sem credenciais. Sem service_role. Sem URL externa obrigatória.
+Prefixo `[receipt-production-write]`:
+- `OK` — `{instance, message_id, pix_id, amount}`
+- `DUPLICATE` — `{instance, message_id, reason: "message_id"|"pix_id"|"db_conflict"}`
+- `IGNORED` — `{instance, reason: "instance_not_allowed"|"disabled"|"not_receipt"}` (em debug-level pra não poluir)
+- `FAILED` — `{instance, message_id, err}`
 
 ## Arquivos
 
 **Criar:**
-- `vps/edge-mini/src/lib/ai-shadow.ts` — entrypoint `processAiShadow(input)`, classificação heurística, idempotência por hash, persistência em `storage/ai-shadow/<YYYY-MM-DD>/`, contadores file-backed, índice em `storage/ai-shadow/index/<hash>.json` (stub vazio só pra dedupe).
-- `vps/edge-mini/src/routes/stats-ai-shadow.ts` — `GET /stats/ai-shadow`.
+- `vps/edge-mini/src/lib/receipt-production-write.ts` — entrypoint `processReceiptProductionWrite(input)`, allowlist check, idempotência dupla, INSERT purchase_audit + pixel_event_logs, contadores file-backed.
+- `vps/edge-mini/src/routes/stats-receipt-production-write.ts` — `GET /stats/receipt-production-write`.
 
 **Editar:**
-- `vps/edge-mini/src/env.ts` — adiciona `ENABLE_AI_SHADOW`, `AI_SHADOW_PROVIDER`, `AI_SHADOW_DIR`, `AI_SHADOW_ONLY_RECEIPTS`.
-- `vps/edge-mini/src/lib/receipt-ai-shadow.ts` — após `saveResult`, se `ENABLE_AI_SHADOW`, chamar `processAiShadow({...input, receipt: classification})` dentro de `try/catch` (nunca lança).
-- `vps/edge-mini/src/server.ts` — registrar `statsAiShadowRoute`.
+- `vps/edge-mini/src/env.ts` — adicionar `ENABLE_RECEIPT_PRODUCTION_WRITE` e `RECEIPT_PRODUCTION_ALLOWED_INSTANCES` (com helper de parse pra array).
+- `vps/edge-mini/src/lib/receipt-ai-shadow.ts` — após persistir o resultado shadow, se `is_receipt=true` e `ENABLE_RECEIPT_PRODUCTION_WRITE`, chamar `processReceiptProductionWrite({...})` em try/catch (nunca lança).
+- `vps/edge-mini/src/server.ts` — registrar `statsReceiptProductionWriteRoute`.
 
-**NÃO tocar:** workers, webhook routes, OCR, Receipt Shadow writer, ingest, Supabase client, qualquer Edge Function, migrations, código da produção (`src/`, `supabase/functions/`).
+**NÃO tocar:** workers, webhook routes, OCR, Receipt Shadow classifier, Receipt Shadow Ingest, AI Shadow, Supabase Edge Functions, código frontend, migrations, `wa-outbound`, `wa-send`.
+
+## Kill-switch
+
+Setar `ENABLE_RECEIPT_PRODUCTION_WRITE=false` no `.env` e `pm2 reload edge-mini` → volta 100% ao comportamento atual (Lovable processa tudo). Os dados shadow continuam sendo gravados normalmente.
 
 ## Critério de aceite
 
 - `tsc --noEmit` passa.
-- Com `ENABLE_AI_SHADOW=true`, comprovante real espelhado gera `.json` em `storage/ai-shadow/<dia>/`.
-- `/stats/ai-shadow` retorna contadores reais.
-- Segunda entrega do mesmo `message_id` retorna `duplicate`.
-- Receipt Shadow / Ingest / OCR continuam idênticos.
-- Nenhuma chamada de rede saindo da Fase E (provider `none`).
+- Com flag ligada, comprovante real em `canal46` gera linha em `purchase_audit` (provider=`vps2-pilot`) + evento `Purchase` em `pixel_event_logs`.
+- Comprovante em qualquer outra instância: `IGNORED`, zero escrita.
+- Segundo envio do mesmo `message_id`: `DUPLICATE`, zero escrita nova.
+- Se a Lovable já gravou o mesmo `message_id`/`pix_id`: `DUPLICATE`, zero escrita nova.
+- `/stats/receipt-production-write` reflete os contadores reais.
+- Receipt Shadow, AI Shadow, Ingest, OCR continuam idênticos.
+- Nenhum envio de WhatsApp, nenhuma alteração em funis/leads/inbox.
 
-Aprova para eu aplicar?
+Aprova para aplicar?
