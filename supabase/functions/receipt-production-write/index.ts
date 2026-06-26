@@ -41,14 +41,20 @@ Deno.serve(async (req) => {
 
   const instance = ((body.instance as string) ?? "").toLowerCase();
   const messageId = (body.message_id as string) ?? null;
-  const pixId = (body.pix_id as string) ?? null;
-  const amount = (body.amount as number) ?? null;
-  const payerName = (body.payer_name as string) ?? null;
-  const confidence = (body.confidence as number) ?? null;
-  const ocrText = (body.ocr_text as string) ?? null;
+  // Aceita ambos os formatos de contrato (Fase F antigo + atual).
+  const pixId = ((body.pix_id as string) ?? (body.receipt_pix_id as string) ?? null);
+  const amount = ((body.amount as number) ?? (body.purchase_value as number) ?? null);
+  const payerName = ((body.payer_name as string) ?? (body.customer_name as string) ?? null);
+  const confidence = ((body.confidence as number) ?? (body.receipt_confidence as number) ?? null);
+  const ocrText = ((body.ocr_text as string) ?? (body.receipt_ocr_text as string) ?? null);
+  const phone = ((body.phone as string) ?? null);
+  const aiReason = ((body.ai_reason as string) ?? null);
   const receivedAt =
     (body.received_at as string) ?? new Date().toISOString();
-  const isReceipt = (body.is_receipt as boolean) ?? null;
+  // is_receipt pode não vir no novo contrato — assume true se há mensagem + valor/pix.
+  const isReceipt =
+    (body.is_receipt as boolean) ??
+    Boolean(amount != null || pixId);
 
   if (!isReceipt) {
     return json(200, { ok: true, ignored: true, reason: "not_receipt" });
@@ -108,14 +114,49 @@ Deno.serve(async (req) => {
     },
   };
 
+  let purchaseAuditDuplicate = false;
   const { error } = await supabase.from("purchase_audit").insert(row);
   if (error) {
     const code = (error as { code?: string }).code;
     if (code === "23505" || /duplicate key/i.test(error.message)) {
-      return json(200, { ok: true, duplicate: true });
+      purchaseAuditDuplicate = true;
+    } else {
+      return json(500, { ok: false, error: error.message });
     }
-    return json(500, { ok: false, error: error.message });
   }
 
+  // Fase G.1 — espelho dedicado para consumo pelo bloco ai_receipt (não
+  // substitui purchase_audit; é fonte de verdade só do resultado da VPS2).
+  // Falha aqui NÃO bloqueia a resposta de sucesso do pipeline F.
+  try {
+    await supabase
+      .from("vps_receipt_results")
+      .upsert(
+        {
+          message_id: messageId,
+          instance,
+          pix_id: pixId,
+          is_receipt: true,
+          amount,
+          customer_name: payerName,
+          confidence,
+          ocr_text: ocrText,
+          ai_reason: aiReason,
+          phone,
+          received_at: receivedAt,
+          raw_payload: body,
+        },
+        { onConflict: "message_id" },
+      );
+  } catch (mirrorErr) {
+    console.warn(
+      "[receipt-production-write] vps_receipt_results mirror failed",
+      (mirrorErr as Error)?.message,
+    );
+  }
+
+  if (purchaseAuditDuplicate) {
+    return json(200, { ok: true, duplicate: true });
+  }
   return json(200, { ok: true, inserted: true });
 });

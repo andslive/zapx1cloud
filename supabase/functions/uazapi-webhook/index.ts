@@ -4900,7 +4900,7 @@ Deno.serve(async (req) => {
 
           const { data: funnel } = await supabase
             .from("capture_funnels")
-            .select("id, flow_blocks")
+            .select("id, name, flow_blocks")
             .eq("id", (conv as any).current_flow_id)
             .maybeSingle();
 
@@ -6710,6 +6710,159 @@ Mensagem do lead:
                 break;
               }
               case "ai_receipt": {
+                // ─────────────────────────────────────────────────────────
+                // Fase G.1 — Curto-circuito controlado: consumir resultado
+                // oficial da VPS2 (tabela vps_receipt_results). Triplo guard:
+                // flag global + allowlist de instância + allowlist de funil.
+                // Qualquer falha/timeout → fallback automático ao caminho
+                // legado abaixo (fail-open). Nenhuma alteração em Pixel,
+                // CAPI, Purchase, Leads, Inbox, Conversations, WhatsApp.
+                // ─────────────────────────────────────────────────────────
+                try {
+                  const { isVpsReceiptEnabled, pollVpsReceiptResult } =
+                    await import("../_shared/vps-receipt-bridge.ts");
+                  const _gate = isVpsReceiptEnabled(
+                    (instance as any)?.name ?? null,
+                    (funnel as any)?.name ?? null,
+                  );
+                  if (!_gate.enabled) {
+                    console.log("[VPS_RECEIPT_BYPASS]", JSON.stringify({
+                      conversation_id: conversationId,
+                      block_id: b.id,
+                      reason: _gate.reason,
+                      instance: (instance as any)?.name ?? null,
+                      funnel: (funnel as any)?.name ?? null,
+                    }));
+                  } else if (norm.messageId) {
+                    const _vps = await pollVpsReceiptResult(supabase, {
+                      messageId: String(norm.messageId),
+                    });
+                    if (!_vps) {
+                      console.log("[VPS_RECEIPT_FALLBACK]", JSON.stringify({
+                        conversation_id: conversationId,
+                        block_id: b.id,
+                        reason: "vps_timeout_fallback",
+                        message_id: norm.messageId,
+                      }));
+                    } else if (_vps.is_receipt === false) {
+                      console.log("[VPS_RECEIPT_NOT_RECEIPT]", JSON.stringify({
+                        conversation_id: conversationId,
+                        block_id: b.id,
+                        message_id: norm.messageId,
+                      }));
+                      // VPS classificou como não-comprovante: respeitamos e
+                      // caímos no caminho legado (que tem suas próprias
+                      // rotinas de objeção/buffer/figurinha etc.).
+                    } else {
+                      // HIT — usar resultado oficial da VPS2.
+                      const _nameVar =
+                        b.data?.receipt_name_var || "nomecomprovante";
+                      const _valueVar =
+                        b.data?.receipt_value_var || "valorcomprovante";
+                      const _vpsName = (_vps.customer_name ?? "").toString().trim();
+                      const _vpsAmount = _vps.amount != null
+                        ? Number(_vps.amount)
+                        : null;
+                      const _vpsValueStr = _vpsAmount != null && !Number.isNaN(_vpsAmount)
+                        ? _vpsAmount.toFixed(2)
+                        : "";
+
+                      flowVariables[_nameVar] = _vpsName;
+                      flowVariables[_valueVar] = _vpsValueStr;
+                      (flowVariables as any).comprovante_identified = true;
+                      flowVariables["ai.response"] = "";
+
+                      if (!Array.isArray(flowVariables["__consumed_input_message_ids"])) {
+                        flowVariables["__consumed_input_message_ids"] = [];
+                      }
+                      if (
+                        norm.messageId &&
+                        !flowVariables["__consumed_input_message_ids"].includes(norm.messageId)
+                      ) {
+                        flowVariables["__consumed_input_message_ids"].push(norm.messageId);
+                      }
+
+                      // Limpa estados de espera/buffer relacionados a este bloco.
+                      try {
+                        delete (flowVariables as any).__waiting_input;
+                        delete (flowVariables as any).waiting_for_input;
+                        delete (flowVariables as any).waiting_question_sent_at;
+                        if ((flowVariables as any).__pending_receipt_media) {
+                          delete (flowVariables as any).__pending_receipt_media;
+                        }
+                      } catch (_) { /* noop */ }
+
+                      // Atualiza metadata do lead (best-effort).
+                      if ((conv as any).lead_id) {
+                        try {
+                          const { data: _lead } = await supabase
+                            .from("leads")
+                            .select("metadata")
+                            .eq("id", (conv as any).lead_id)
+                            .single();
+                          await supabase.from("leads").update({
+                            metadata: {
+                              ...(_lead?.metadata || {}),
+                              [_nameVar]: _vpsName,
+                              [_valueVar]: _vpsValueStr,
+                              last_receipt_at: new Date().toISOString(),
+                              last_receipt_source: "vps2-pilot",
+                            },
+                          }).eq("id", (conv as any).lead_id);
+                        } catch (_leadErr) { /* best-effort */ }
+                      }
+
+                      const _vpsNext =
+                        b.data?.receipt_success_block_id ||
+                        b.data?.true_next_block_id ||
+                        b.next_block_id ||
+                        null;
+
+                      // Checkpoint imediato — evita race com 2º webhook.
+                      try {
+                        await supabase
+                          .from("webchat_conversations")
+                          .update({
+                            current_block_id: _vpsNext,
+                            flow_variables: flowVariables,
+                            updated_at: new Date().toISOString(),
+                          })
+                          .eq("id", conversationId);
+                      } catch (_persistErr) {
+                        console.warn(
+                          "[VPS_RECEIPT_PERSIST_FAILED]",
+                          (_persistErr as Error)?.message,
+                        );
+                      }
+
+                      console.log("[VPS_RECEIPT_HIT]", JSON.stringify({
+                        conversation_id: conversationId,
+                        block_id: b.id,
+                        message_id: norm.messageId,
+                        pix_id: _vps.pix_id,
+                        amount: _vpsValueStr,
+                        customer_name: _vpsName?.slice(0, 60),
+                        next_block_id: _vpsNext,
+                        confidence: _vps.confidence,
+                        source: "vps2-pilot",
+                      }));
+
+                      (receiptRecognizedThisLoop as any) = true;
+                      nextBlockId = _vpsNext;
+                      currentBlock = _vpsNext ? findBlock(_vpsNext) : null;
+                      break;
+                    }
+                  }
+                } catch (_vpsErr) {
+                  console.warn(
+                    "[VPS_RECEIPT_BRIDGE_ERROR]",
+                    (_vpsErr as Error)?.message,
+                  );
+                  // segue para o caminho legado abaixo
+                }
+                // ─────────────────────────────────────────────────────────
+                // Caminho legado original (inalterado a partir daqui).
+                // ─────────────────────────────────────────────────────────
                 // ───────────────────────────────────────────────────────
                 // [AI_RECEIPT_PENDING_MEDIA_REPLAY] Recupera comprovante
                 // enviado pelo lead ANTES do flow chegar aqui.
