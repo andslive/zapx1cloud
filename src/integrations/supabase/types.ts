@@ -10718,6 +10718,60 @@ export type Database = {
           },
         ]
       }
+      vps_receipt_results: {
+        Row: {
+          ai_reason: string | null
+          amount: number | null
+          confidence: number | null
+          created_at: string
+          customer_name: string | null
+          id: string
+          instance: string | null
+          is_receipt: boolean | null
+          message_id: string
+          ocr_text: string | null
+          phone: string | null
+          pix_id: string | null
+          raw_payload: Json
+          received_at: string | null
+          updated_at: string
+        }
+        Insert: {
+          ai_reason?: string | null
+          amount?: number | null
+          confidence?: number | null
+          created_at?: string
+          customer_name?: string | null
+          id?: string
+          instance?: string | null
+          is_receipt?: boolean | null
+          message_id: string
+          ocr_text?: string | null
+          phone?: string | null
+          pix_id?: string | null
+          raw_payload?: Json
+          received_at?: string | null
+          updated_at?: string
+        }
+        Update: {
+          ai_reason?: string | null
+          amount?: number | null
+          confidence?: number | null
+          created_at?: string
+          customer_name?: string | null
+          id?: string
+          instance?: string | null
+          is_receipt?: boolean | null
+          message_id?: string
+          ocr_text?: string | null
+          phone?: string | null
+          pix_id?: string | null
+          raw_payload?: Json
+          received_at?: string | null
+          updated_at?: string
+        }
+        Relationships: []
+      }
       vps_shadow_webhook_logs: {
         Row: {
           chat_id: string | null
