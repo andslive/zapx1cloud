@@ -100,6 +100,8 @@ const schema = z.object({
     .default("false")
     .transform((v) => v.toLowerCase() === "true"),
   RECEIPT_PRODUCTION_ALLOWED_INSTANCES: z.string().default(""),
+  RECEIPT_PRODUCTION_WRITE_URL: z.string().optional().default(""),
+  RECEIPT_PRODUCTION_WRITE_TOKEN: z.string().optional().default(""),
 });
 
 
