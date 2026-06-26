@@ -172,6 +172,46 @@ export const processReceiptProductionWrite = async (
     return { outcome: "FAILED", error: "missing_message_id" };
   }
 
+  // Fase F — enriquecimento determinístico do payload (sem alterar classificação,
+  // OCR, Receipt Shadow, AI Shadow, Edge Function ou contratos externos).
+  const ocrText = String(input.ocr_text ?? "");
+
+  // (1) receipt_pix_id: extrair do OCR quando ausente.
+  let derivedPixId: string | null = input.pix_id ?? null;
+  if (!derivedPixId && ocrText) {
+    const pixIdRe =
+      /(?:ID\s+(?:da\s+)?Transa[cç][aã]o|Transaction\s*ID|EndToEndId|End[-\s]?to[-\s]?End(?:\s*ID)?|E2E(?:\s*ID)?)\s*[:\-]?\s*\*{0,2}\s*([A-Za-z0-9._-]{8,})/i;
+    const m = ocrText.match(pixIdRe);
+    if (m && m[1]) derivedPixId = m[1].trim();
+  }
+
+  // (2) customer_name: usar payload > "Quem pagou / Nome ..." > "Quem recebeu / Nome ..."
+  let derivedCustomerName: string | null =
+    input.customer_name ?? input.payer_name ?? null;
+  if (!derivedCustomerName && ocrText) {
+    const blockNameRe = (label: string) =>
+      new RegExp(
+        `${label}[\\s\\S]{0,80}?\\bNome\\s*[:\\-]?\\s*\\*{0,2}\\s*([^\\n\\r*]+)`,
+        "i",
+      );
+    const payerBlock = ocrText.match(blockNameRe("Quem\\s+pagou"));
+    const receiverBlock = !payerBlock
+      ? ocrText.match(blockNameRe("Quem\\s+recebeu"))
+      : null;
+    const raw = payerBlock?.[1] ?? receiverBlock?.[1] ?? null;
+    if (raw) {
+      const cleaned = raw.replace(/\*{1,2}/g, "").trim();
+      if (cleaned.length >= 2) derivedCustomerName = cleaned;
+    }
+  }
+
+  // (3) phone: normalizar (apenas dígitos) a partir do chat_id do WhatsApp.
+  let derivedPhone: string | null = null;
+  if (input.phone) {
+    const digits = String(input.phone).replace(/\D/g, "");
+    if (digits.length >= 8) derivedPhone = digits;
+  }
+
   try {
     const res = await fetch(env.RECEIPT_PRODUCTION_WRITE_URL, {
       method: "POST",
@@ -183,11 +223,11 @@ export const processReceiptProductionWrite = async (
         instance,
         message_id: messageId,
         purchase_value: input.amount ?? null,
-        receipt_pix_id: input.pix_id ?? null,
+        receipt_pix_id: derivedPixId,
         receipt_confidence: input.confidence ?? null,
         receipt_ocr_text: input.ocr_text ?? null,
-        phone: input.phone ?? null,
-        customer_name: input.customer_name ?? input.payer_name ?? null,
+        phone: derivedPhone,
+        customer_name: derivedCustomerName,
       }),
     });
 

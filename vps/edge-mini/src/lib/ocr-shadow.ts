@@ -299,6 +299,7 @@ const saveResult = async (record: {
   received_at: string;
   instance: string | null;
   message_id: string | null;
+  chat_id?: string | null;
   ocr_text: string;
   provider: string;
   duration_ms: number;
@@ -457,6 +458,7 @@ export const processOcrShadow = async (
         received_at: job.receivedAt,
         instance: media.instance,
         message_id: media.messageId,
+        chat_id: media.chatId,
         ocr_text: "",
         provider: result.provider,
         duration_ms: duration,
@@ -489,6 +491,7 @@ export const processOcrShadow = async (
       received_at: job.receivedAt,
       instance: media.instance,
       message_id: media.messageId,
+      chat_id: media.chatId,
       ocr_text: result.text,
       provider: result.provider,
       duration_ms: duration,

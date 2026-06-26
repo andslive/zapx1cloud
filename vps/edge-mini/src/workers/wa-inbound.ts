@@ -96,6 +96,7 @@ const worker = new Worker(
               received_at?: string;
               instance?: string | null;
               message_id?: string | null;
+              chat_id?: string | null;
               ocr_text?: string;
             };
             const { processReceiptShadowFile } = await import(
