@@ -114,11 +114,12 @@ Deno.serve(async (req) => {
     },
   };
 
+  let purchaseAuditDuplicate = false;
   const { error } = await supabase.from("purchase_audit").insert(row);
   if (error) {
     const code = (error as { code?: string }).code;
     if (code === "23505" || /duplicate key/i.test(error.message)) {
-      // mantém comportamento atual — segue para upsert do espelho abaixo.
+      purchaseAuditDuplicate = true;
     } else {
       return json(500, { ok: false, error: error.message });
     }
@@ -154,5 +155,8 @@ Deno.serve(async (req) => {
     );
   }
 
+  if (purchaseAuditDuplicate) {
+    return json(200, { ok: true, duplicate: true });
+  }
   return json(200, { ok: true, inserted: true });
 });
