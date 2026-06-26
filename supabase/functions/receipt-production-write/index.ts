@@ -41,14 +41,20 @@ Deno.serve(async (req) => {
 
   const instance = ((body.instance as string) ?? "").toLowerCase();
   const messageId = (body.message_id as string) ?? null;
-  const pixId = (body.pix_id as string) ?? null;
-  const amount = (body.amount as number) ?? null;
-  const payerName = (body.payer_name as string) ?? null;
-  const confidence = (body.confidence as number) ?? null;
-  const ocrText = (body.ocr_text as string) ?? null;
+  // Aceita ambos os formatos de contrato (Fase F antigo + atual).
+  const pixId = ((body.pix_id as string) ?? (body.receipt_pix_id as string) ?? null);
+  const amount = ((body.amount as number) ?? (body.purchase_value as number) ?? null);
+  const payerName = ((body.payer_name as string) ?? (body.customer_name as string) ?? null);
+  const confidence = ((body.confidence as number) ?? (body.receipt_confidence as number) ?? null);
+  const ocrText = ((body.ocr_text as string) ?? (body.receipt_ocr_text as string) ?? null);
+  const phone = ((body.phone as string) ?? null);
+  const aiReason = ((body.ai_reason as string) ?? null);
   const receivedAt =
     (body.received_at as string) ?? new Date().toISOString();
-  const isReceipt = (body.is_receipt as boolean) ?? null;
+  // is_receipt pode não vir no novo contrato — assume true se há mensagem + valor/pix.
+  const isReceipt =
+    (body.is_receipt as boolean) ??
+    Boolean(amount != null || pixId);
 
   if (!isReceipt) {
     return json(200, { ok: true, ignored: true, reason: "not_receipt" });
