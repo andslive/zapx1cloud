@@ -4900,7 +4900,7 @@ Deno.serve(async (req) => {
 
           const { data: funnel } = await supabase
             .from("capture_funnels")
-            .select("id, flow_blocks")
+            .select("id, name, flow_blocks")
             .eq("id", (conv as any).current_flow_id)
             .maybeSingle();
 
