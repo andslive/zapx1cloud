@@ -115,6 +115,8 @@ export interface ReceiptProductionInput {
   is_receipt?: boolean | null;
   confidence?: number | null;
   ocr_text?: string | null;
+  phone?: string;
+  customer_name?: string;
 }
 
 export const processReceiptProductionWrite = async (
@@ -178,15 +180,14 @@ export const processReceiptProductionWrite = async (
         "X-Receipt-Production-Token": env.RECEIPT_PRODUCTION_WRITE_TOKEN,
       },
       body: JSON.stringify({
-        received_at: input.received_at ?? now,
         instance,
         message_id: messageId,
-        amount: input.amount ?? null,
-        payer_name: input.payer_name ?? null,
-        pix_id: input.pix_id ?? null,
-        is_receipt: input.is_receipt ?? null,
-        confidence: input.confidence ?? null,
-        ocr_text: input.ocr_text ?? null,
+        purchase_value: input.amount ?? null,
+        receipt_pix_id: input.pix_id ?? null,
+        receipt_confidence: input.confidence ?? null,
+        receipt_ocr_text: input.ocr_text ?? null,
+        phone: input.phone ?? null,
+        customer_name: input.customer_name ?? input.payer_name ?? null,
       }),
     });
 
