@@ -1,14 +1,11 @@
-// Fase F — Receipt Production Write (piloto controlado)
-// Atua APENAS para instâncias presentes em RECEIPT_PRODUCTION_ALLOWED_INSTANCES.
-// Default OFF (ENABLE_RECEIPT_PRODUCTION_WRITE=false).
+// Fase F — Receipt Production Write (HTTP proxy → Edge Function)
+// Envia o resultado classificado para a Edge Function `receipt-production-write`.
+// Não usa service_role na VPS2. Default OFF.
+// Allowlist por instance é aplicada localmente (curto-circuito) e também
+// re-validada pela Edge Function.
 //
-// Escreve uma linha em public.purchase_audit equivalente ao reconhecimento
-// operacional feito hoje pela Edge `uazapi-webhook`. Idempotência dupla por
-// message_id (event_id) e pix_id, ambos restritos a purchase_source='vps2-pilot'
-// para nunca colidir com registros já gravados pela Lovable.
-//
-// NÃO escreve em leads, conversations, webchat_*, pixel_event_logs, deals,
-// funnels. NÃO envia mensagem WhatsApp. NÃO chama CAPI.
+// NÃO escreve em leads, conversations, pixel_event_logs, inbox, funis,
+// WhatsApp.
 
 import {
   existsSync,
@@ -17,7 +14,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { env } from "../env.js";
 import { logger } from "../logger.js";
 
@@ -26,13 +22,15 @@ export type ReceiptProductionOutcome =
   | "OK"
   | "DUPLICATE"
   | "IGNORED"
-  | "FAILED";
+  | "FAILED"
+  | "MISCONFIGURED";
 
 interface Counters {
   ok: number;
   duplicate: number;
   ignored: number;
   failed: number;
+  misconfigured: number;
   lastOutcome: ReceiptProductionOutcome | null;
   lastAt: string | null;
   lastError: string | null;
@@ -45,6 +43,7 @@ const empty = (): Counters => ({
   duplicate: 0,
   ignored: 0,
   failed: 0,
+  misconfigured: 0,
   lastOutcome: null,
   lastAt: null,
   lastError: null,
@@ -101,18 +100,10 @@ export const getAllowedInstances = (): string[] =>
 export const getReceiptProductionCounters = () => ({
   enabled: env.ENABLE_RECEIPT_PRODUCTION_WRITE,
   allowed_instances: getAllowedInstances(),
+  urlConfigured: Boolean(env.RECEIPT_PRODUCTION_WRITE_URL),
+  tokenConfigured: Boolean(env.RECEIPT_PRODUCTION_WRITE_TOKEN),
   ...readCounters(),
 });
-
-let client: SupabaseClient | null = null;
-const getClient = (): SupabaseClient | null => {
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return null;
-  if (client) return client;
-  client = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-  return client;
-};
 
 export interface ReceiptProductionInput {
   received_at?: string | null;
@@ -125,8 +116,6 @@ export interface ReceiptProductionInput {
   confidence?: number | null;
   ocr_text?: string | null;
 }
-
-const PILOT_SOURCE = "vps2-pilot";
 
 export const processReceiptProductionWrite = async (
   input: ReceiptProductionInput,
@@ -154,9 +143,20 @@ export const processReceiptProductionWrite = async (
     return { outcome: "IGNORED" };
   }
 
-  const messageId = input.message_id ?? null;
-  const pixId = input.pix_id ?? null;
+  if (!env.RECEIPT_PRODUCTION_WRITE_URL || !env.RECEIPT_PRODUCTION_WRITE_TOKEN) {
+    bump((c) => {
+      c.misconfigured++;
+      c.lastOutcome = "MISCONFIGURED";
+      c.lastError = "missing_url_or_token";
+      c.lastAt = now;
+      c.lastInstance = instance;
+      c.lastMessageId = input.message_id ?? null;
+    });
+    logger.error("[receipt-production-write] MISCONFIGURED missing url/token");
+    return { outcome: "MISCONFIGURED", error: "missing_url_or_token" };
+  }
 
+  const messageId = input.message_id ?? null;
   if (!messageId) {
     bump((c) => {
       c.failed++;
@@ -170,153 +170,111 @@ export const processReceiptProductionWrite = async (
     return { outcome: "FAILED", error: "missing_message_id" };
   }
 
-  const c = getClient();
-  if (!c) {
-    bump((x) => {
-      x.failed++;
-      x.lastOutcome = "FAILED";
-      x.lastError = "missing_supabase_credentials";
-      x.lastAt = now;
-      x.lastInstance = instance;
-      x.lastMessageId = messageId;
-    });
-    logger.error("[receipt-production-write] FAILED missing_credentials");
-    return { outcome: "FAILED", error: "missing_supabase_credentials" };
-  }
-
-  // Idempotência 1 — message_id (event_id) já gravado por nós OU pela Lovable.
   try {
-    const { data: dupByEvent, error: e1 } = await c
-      .from("purchase_audit")
-      .select("id, purchase_source")
-      .eq("event_id", messageId)
-      .limit(1);
-    if (e1) throw e1;
-    if (dupByEvent && dupByEvent.length > 0) {
-      bump((x) => {
-        x.duplicate++;
-        x.lastOutcome = "DUPLICATE";
-        x.lastError = null;
-        x.lastAt = now;
-        x.lastInstance = instance;
-        x.lastMessageId = messageId;
+    const res = await fetch(env.RECEIPT_PRODUCTION_WRITE_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Receipt-Production-Token": env.RECEIPT_PRODUCTION_WRITE_TOKEN,
+      },
+      body: JSON.stringify({
+        received_at: input.received_at ?? now,
+        instance,
+        message_id: messageId,
+        amount: input.amount ?? null,
+        payer_name: input.payer_name ?? null,
+        pix_id: input.pix_id ?? null,
+        is_receipt: input.is_receipt ?? null,
+        confidence: input.confidence ?? null,
+        ocr_text: input.ocr_text ?? null,
+      }),
+    });
+
+    const text = await res.text();
+    let body: Record<string, unknown> = {};
+    try {
+      body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    } catch {
+      // ignore
+    }
+
+    if (!res.ok) {
+      const msg = `http_${res.status}: ${text.slice(0, 200)}`;
+      bump((c) => {
+        c.failed++;
+        c.lastOutcome = "FAILED";
+        c.lastError = msg;
+        c.lastAt = now;
+        c.lastInstance = instance;
+        c.lastMessageId = messageId;
+      });
+      logger.error(
+        { status: res.status, body: text.slice(0, 200), instance, message_id: messageId },
+        "[receipt-production-write] FAILED",
+      );
+      return { outcome: "FAILED", error: msg };
+    }
+
+    if (body.duplicate === true) {
+      bump((c) => {
+        c.duplicate++;
+        c.lastOutcome = "DUPLICATE";
+        c.lastError = null;
+        c.lastAt = now;
+        c.lastInstance = instance;
+        c.lastMessageId = messageId;
       });
       logger.info(
-        { instance, message_id: messageId, reason: "message_id" },
+        { instance, message_id: messageId },
         "[receipt-production-write] DUPLICATE",
       );
       return { outcome: "DUPLICATE" };
     }
 
-    // Idempotência 2 — pix_id (gravado no raw_payload como receipt_pix_id).
-    if (pixId) {
-      const { data: dupByPix, error: e2 } = await c
-        .from("purchase_audit")
-        .select("id")
-        .filter("raw_payload->>receipt_pix_id", "eq", pixId)
-        .limit(1);
-      if (e2) throw e2;
-      if (dupByPix && dupByPix.length > 0) {
-        bump((x) => {
-          x.duplicate++;
-          x.lastOutcome = "DUPLICATE";
-          x.lastError = null;
-          x.lastAt = now;
-          x.lastInstance = instance;
-          x.lastMessageId = messageId;
-        });
-        logger.info(
-          { instance, message_id: messageId, pix_id: pixId, reason: "pix_id" },
-          "[receipt-production-write] DUPLICATE",
-        );
-        return { outcome: "DUPLICATE" };
-      }
+    if (body.ignored === true) {
+      bump((c) => {
+        c.ignored++;
+        c.lastOutcome = "IGNORED";
+        c.lastError = null;
+        c.lastAt = now;
+        c.lastInstance = instance;
+        c.lastMessageId = messageId;
+      });
+      return { outcome: "IGNORED" };
     }
+
+    bump((c) => {
+      c.ok++;
+      c.lastOutcome = "OK";
+      c.lastError = null;
+      c.lastAt = now;
+      c.lastInstance = instance;
+      c.lastMessageId = messageId;
+    });
+    logger.info(
+      {
+        instance,
+        message_id: messageId,
+        pix_id: input.pix_id ?? null,
+        amount: input.amount ?? null,
+      },
+      "[receipt-production-write] OK",
+    );
+    return { outcome: "OK" };
   } catch (err) {
     const msg = (err as Error).message;
-    bump((x) => {
-      x.failed++;
-      x.lastOutcome = "FAILED";
-      x.lastError = `idempotency_check: ${msg}`;
-      x.lastAt = now;
-      x.lastInstance = instance;
-      x.lastMessageId = messageId;
+    bump((c) => {
+      c.failed++;
+      c.lastOutcome = "FAILED";
+      c.lastError = msg;
+      c.lastAt = now;
+      c.lastInstance = instance;
+      c.lastMessageId = messageId;
     });
     logger.error(
       { err: msg, instance, message_id: messageId },
-      "[receipt-production-write] FAILED idempotency check",
+      "[receipt-production-write] FAILED network",
     );
     return { outcome: "FAILED", error: msg };
   }
-
-  // INSERT operacional.
-  const row = {
-    connection_id: instance,
-    customer_name: input.payer_name ?? null,
-    purchase_value: input.amount ?? null,
-    currency: "BRL",
-    event_id: messageId,
-    purchase_source: PILOT_SOURCE,
-    purchase_status: "recognized",
-    raw_payload: {
-      receipt_message_id: messageId,
-      receipt_pix_id: pixId,
-      receipt_confidence: input.confidence ?? null,
-      receipt_ocr_text: input.ocr_text ?? null,
-      receipt_received_at: input.received_at ?? now,
-      pilot: PILOT_SOURCE,
-    } as Record<string, unknown>,
-  };
-
-  const { error } = await c.from("purchase_audit").insert(row);
-  if (error) {
-    const code = (error as { code?: string }).code;
-    if (code === "23505" || /duplicate key/i.test(error.message)) {
-      bump((x) => {
-        x.duplicate++;
-        x.lastOutcome = "DUPLICATE";
-        x.lastError = null;
-        x.lastAt = now;
-        x.lastInstance = instance;
-        x.lastMessageId = messageId;
-      });
-      logger.info(
-        { instance, message_id: messageId, reason: "db_conflict" },
-        "[receipt-production-write] DUPLICATE",
-      );
-      return { outcome: "DUPLICATE" };
-    }
-    bump((x) => {
-      x.failed++;
-      x.lastOutcome = "FAILED";
-      x.lastError = error.message;
-      x.lastAt = now;
-      x.lastInstance = instance;
-      x.lastMessageId = messageId;
-    });
-    logger.error(
-      { err: error.message, code, instance, message_id: messageId },
-      "[receipt-production-write] FAILED",
-    );
-    return { outcome: "FAILED", error: error.message };
-  }
-
-  bump((x) => {
-    x.ok++;
-    x.lastOutcome = "OK";
-    x.lastError = null;
-    x.lastAt = now;
-    x.lastInstance = instance;
-    x.lastMessageId = messageId;
-  });
-  logger.info(
-    {
-      instance,
-      message_id: messageId,
-      pix_id: pixId,
-      amount: input.amount,
-    },
-    "[receipt-production-write] OK",
-  );
-  return { outcome: "OK" };
 };
