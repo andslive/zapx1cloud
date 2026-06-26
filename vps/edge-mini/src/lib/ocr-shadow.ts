@@ -458,6 +458,7 @@ export const processOcrShadow = async (
         received_at: job.receivedAt,
         instance: media.instance,
         message_id: media.messageId,
+        chat_id: media.chatId,
         ocr_text: "",
         provider: result.provider,
         duration_ms: duration,
