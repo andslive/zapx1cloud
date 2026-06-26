@@ -326,6 +326,30 @@ export const processReceiptShadowFile = async (
       );
     }
 
+    // Fase F — Piloto controlado: escrita operacional para instâncias
+    // explicitamente permitidas (allowlist). Default OFF. Nunca lança.
+    try {
+      const { processReceiptProductionWrite } = await import(
+        "./receipt-production-write.js"
+      );
+      await processReceiptProductionWrite({
+        received_at: input.received_at ?? now,
+        instance: input.instance ?? null,
+        message_id: input.message_id ?? null,
+        amount: classification.amount,
+        payer_name: classification.payer_name,
+        pix_id: classification.pix_id,
+        is_receipt: classification.is_receipt,
+        confidence: classification.confidence,
+        ocr_text: input.ocr_text ?? null,
+      });
+    } catch (err) {
+      logger.error(
+        { err: (err as Error).message },
+        "[receipt-production-write] dispatch threw",
+      );
+    }
+
 
     logger.info(
       {

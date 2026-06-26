@@ -95,6 +95,11 @@ const schema = z.object({
     .string()
     .default("true")
     .transform((v) => v.toLowerCase() !== "false"),
+  ENABLE_RECEIPT_PRODUCTION_WRITE: z
+    .string()
+    .default("false")
+    .transform((v) => v.toLowerCase() === "true"),
+  RECEIPT_PRODUCTION_ALLOWED_INSTANCES: z.string().default(""),
 });
 
 
