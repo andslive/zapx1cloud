@@ -215,6 +215,11 @@ async function isDuplicateInboundMessage(
   return false;
 }
 
+// [FASE 23.2] TTL do buffer de comprovante pendente (__pending_receipt_media).
+// Era 10 min hardcoded no replay; comprovante real chegou 52 min antes do bloco
+// e expirou. 60 min cobre os casos observados sem reter mídia indefinidamente.
+const PENDING_RECEIPT_MEDIA_TTL_MS = 60 * 60 * 1000;
+
 /** Tenta adquirir lock por conversa de forma ATÔMICA via RPC. Retorna true se conseguiu. */
 async function acquireConversationLock(
   supabase: any,
@@ -4652,6 +4657,116 @@ Deno.serve(async (req) => {
         );
       }
 
+      // ───────────────────────────────────────────────────────────────
+      // [AI_RECEIPT_PENDING_MEDIA v2 — FASE 23.2] Buffer de comprovante
+      // ANTES do grouping e do lock de conversa. A invocação de uma mídia
+      // pode ser descartada pelo grouping (o texto seguinte assume o turno,
+      // return "debounced" abaixo) ou pelo lock ("conversation_locked") —
+      // e nesses retornos o save antigo (pós-lock) nunca rodava, perdendo
+      // o comprovante. Também salva quando a conversa JÁ está no bloco
+      // ai_receipt (o guard notYetAtAiReceipt do save antigo descartava
+      // exatamente os comprovantes enviados na hora certa). Persiste o
+      // texto OCR já extraído acima (processedContent) para o replay do
+      // bloco reconhecer sem precisar re-baixar a mídia.
+      // Substitui o buffer antigo pós-lock (removido).
+      // ───────────────────────────────────────────────────────────────
+      try {
+        const RECEIPT_MIME_ALLOWLIST = new Set([
+          "application/pdf",
+          "image/jpeg",
+          "image/jpg",
+          "image/png",
+        ]);
+        const _normAny: any = norm as any;
+        const isInboundLead = _normAny?.kind === "message" &&
+          _normAny?.fromMe === false &&
+          (_normAny?.direction === "inbound" || !_normAny?.direction) &&
+          (_normAny?.senderType === "visitor" || !_normAny?.senderType);
+        const mediaType = _normAny?.media?.type || null;
+        const mediaMime = String(
+          _normAny?.media?.mime || _normAny?.media?.mimetype || "",
+        ).toLowerCase().split(";")[0].trim();
+        const mediaUrl = _normAny?.media?.url || null;
+        const isReceiptCandidate = isInboundLead &&
+          !!_normAny?.media &&
+          (mediaType === "document" || mediaType === "image") &&
+          RECEIPT_MIME_ALLOWLIST.has(mediaMime) &&
+          !!mediaUrl;
+
+        if (isReceiptCandidate && conversationId) {
+          const { data: _convRow } = await supabase
+            .from("webchat_conversations")
+            .select("flow_variables, flow_completed, status, current_flow_id")
+            .eq("id", conversationId)
+            .maybeSingle();
+          const convActive = !!_convRow &&
+            !(_convRow as any).flow_completed &&
+            (_convRow as any).status !== "closed" &&
+            !!(_convRow as any).current_flow_id;
+          if (convActive) {
+            const flowVarsExisting: any = (_convRow as any).flow_variables ||
+              {};
+            // OCR real ≥ 40 chars úteis; placeholders curtos do pipeline
+            // ("📎 [Documento recebido]", "🖼️ [Imagem: erro]" etc.) NÃO são
+            // gravados — replay com placeholder não reconhece nada.
+            const _ocrText =
+              (typeof processedContent === "string" &&
+                  processedContent.trim().length >= 40 &&
+                  processedContent !== _normAny?.content)
+                ? processedContent.slice(0, 2000)
+                : null;
+            // URL pública do Storage (mediaMeta.url) quando disponível: a
+            // norm.media.url original pode ser a criptografada do WhatsApp,
+            // que o fetch do bloco ai_receipt pula (isWhatsappEncryptedUrl).
+            const _publicUrl =
+              (mediaMeta?.url && !isWhatsappEncryptedUrl(mediaMeta.url))
+                ? mediaMeta.url
+                : mediaUrl;
+            // rawMessage habilita o fallback downloadMediaBase64 do bloco
+            // quando não há OCR nem URL pública utilizável (cap de tamanho
+            // p/ não inflar flow_variables).
+            let _rawMessage: any = null;
+            try {
+              const _rm = _normAny?.media?.rawMessage;
+              if (_rm && JSON.stringify(_rm).length <= 20000) _rawMessage = _rm;
+            } catch (_) { /* noop */ }
+            const pendingPayload = {
+              url: _publicUrl,
+              mime: mediaMime,
+              type: mediaType,
+              message_id: _normAny?.messageId || null,
+              received_at: new Date().toISOString(),
+              ocr_text: _ocrText,
+              raw_message: _rawMessage,
+              original_text_preview: typeof _normAny?.content === "string"
+                ? String(_normAny.content).slice(0, 200)
+                : null,
+            };
+            flowVarsExisting.__pending_receipt_media = pendingPayload;
+            await supabase
+              .from("webchat_conversations")
+              .update({ flow_variables: flowVarsExisting })
+              .eq("id", conversationId);
+            console.log(
+              "[AI_RECEIPT_PENDING_MEDIA_SAVED_V2]",
+              JSON.stringify({
+                conversation_id: conversationId,
+                type: mediaType,
+                mime: mediaMime,
+                message_id: pendingPayload.message_id,
+                has_ocr_text: !!_ocrText,
+                ocr_len: _ocrText ? _ocrText.length : 0,
+              }),
+            );
+          }
+        }
+      } catch (pendingErr) {
+        console.warn(
+          "[AI_RECEIPT_PENDING_MEDIA_SAVE_V2_FAILED]",
+          String(pendingErr),
+        );
+      }
+
       // ============================================================
       // BUFFER CURTO (humanização sem queimar tempo)
       // ============================================================
@@ -4911,85 +5026,10 @@ Deno.serve(async (req) => {
 
           let currentBlock: any = findBlock((conv as any).current_block_id);
 
-          // ───────────────────────────────────────────────────────────────
-          // [AI_RECEIPT_PENDING_MEDIA] Buffer de mídia pré-ai_receipt
-          // Persiste comprovantes (PDF/imagem) enviados ANTES do flow
-          // chegar no bloco ai_receipt, para replay posterior.
-          // NÃO afeta texto, áudio, OCR, Pixel, Purchase ou debounce.
-          // ───────────────────────────────────────────────────────────────
-          try {
-            const hasAiReceiptInFunnel = blocks.some(
-              (b: any) => String(b?.type || "").toLowerCase() === "ai_receipt",
-            );
-            // [COMPROVANTE_UNSUPPORTED_MEDIA_IGNORED] image/webp removido
-            // intencionalmente: figurinhas WhatsApp chegam como image/webp
-            // sem caption e contaminavam o pipeline de comprovante. Mantemos
-            // somente formatos comprovadamente válidos para Pix/recibo.
-            const RECEIPT_MIME_ALLOWLIST = new Set([
-              "application/pdf",
-              "image/jpeg",
-              "image/jpg",
-              "image/png",
-            ]);
-            const _normAny: any = norm as any;
-            const isInboundLead = _normAny?.kind === "message" &&
-              _normAny?.fromMe === false &&
-              (_normAny?.direction === "inbound" || !_normAny?.direction) &&
-              (_normAny?.senderType === "visitor" || !_normAny?.senderType);
-            const mediaType = _normAny?.media?.type || null;
-            const mediaMime = String(
-              _normAny?.media?.mime || _normAny?.media?.mimetype || "",
-            ).toLowerCase().split(";")[0].trim();
-            const mediaUrl = _normAny?.media?.url || null;
-            const isReceiptCandidate = isInboundLead &&
-              !!_normAny?.media &&
-              (mediaType === "document" || mediaType === "image") &&
-              RECEIPT_MIME_ALLOWLIST.has(mediaMime) &&
-              !!mediaUrl;
-            const convActive = !(conv as any)?.flow_completed &&
-              (conv as any)?.status !== "closed";
-            const notYetAtAiReceipt =
-              String(currentBlock?.type || "").toLowerCase() !== "ai_receipt";
-
-            if (
-              hasAiReceiptInFunnel && isReceiptCandidate && convActive &&
-              notYetAtAiReceipt
-            ) {
-              const flowVarsExisting: any =
-                (conv as any)?.flow_variables || {};
-              const pendingPayload = {
-                url: mediaUrl,
-                mime: mediaMime,
-                type: mediaType,
-                message_id: _normAny?.messageId || null,
-                received_at: new Date().toISOString(),
-                original_text_preview:
-                  typeof _normAny?.content === "string"
-                    ? String(_normAny.content).slice(0, 200)
-                    : null,
-              };
-              flowVarsExisting.__pending_receipt_media = pendingPayload;
-              (conv as any).flow_variables = flowVarsExisting;
-              await supabase
-                .from("webchat_conversations")
-                .update({ flow_variables: flowVarsExisting })
-                .eq("id", conversationId);
-              console.log(
-                "[AI_RECEIPT_PENDING_MEDIA_SAVED]",
-                JSON.stringify({
-                  conversation_id: conversationId,
-                  current_block_id: (conv as any).current_block_id,
-                  current_block_type: currentBlock?.type || null,
-                  media: pendingPayload,
-                }),
-              );
-            }
-          } catch (pendingErr) {
-            console.warn(
-              "[AI_RECEIPT_PENDING_MEDIA_SAVE_FAILED]",
-              String(pendingErr),
-            );
-          }
+          // [AI_RECEIPT_PENDING_MEDIA — FASE 23.2] O buffer de comprovante
+          // agora é salvo ANTES do grouping/lock (v2, mais acima), pois os
+          // returns de defer ("debounced") e de lock ("conversation_locked")
+          // impediam este ponto de rodar e o comprovante era perdido.
 
           // Refined lock check for funnels (smart pause / timeout)
           if (conv?.bot_locked_until && !(payload as any).__is_resume) {
@@ -6867,8 +6907,11 @@ Mensagem do lead:
                 // [AI_RECEIPT_PENDING_MEDIA_REPLAY] Recupera comprovante
                 // enviado pelo lead ANTES do flow chegar aqui.
                 // Se a mensagem atual não trouxe mídia mas o buffer tem
-                // um PDF/imagem válido (<10 min), reinjeta em norm.media
-                // para que a recognition pipeline normal o processe.
+                // um PDF/imagem válido (< PENDING_RECEIPT_MEDIA_TTL_MS),
+                // reinjeta em norm.media E injeta o texto OCR salvo em
+                // processedContent — sem isso o bloco processava só o
+                // texto do gatilho e o comprovante nunca era lido
+                // ([FASE 23.2]: replays com OCR = "Vc recebeu?").
                 // ───────────────────────────────────────────────────────
                 let _replayedFromPending = false;
                 try {
@@ -6878,20 +6921,34 @@ Mensagem do lead:
                   if (pending && pending.url && !hasIncomingMedia) {
                     const ageMs = Date.now() -
                       new Date(pending.received_at || 0).getTime();
-                    if (ageMs >= 0 && ageMs <= 10 * 60 * 1000) {
+                    if (ageMs >= 0 && ageMs <= PENDING_RECEIPT_MEDIA_TTL_MS) {
                       (norm as any).media = {
                         type: pending.type || "document",
                         url: pending.url,
                         mime: pending.mime,
                         caption: "",
                         needsDownload: false,
+                        // [FASE 23.2] rawMessage/messageId habilitam o
+                        // fallback downloadMediaBase64 do bloco quando não
+                        // há ocr_text nem URL pública utilizável.
+                        rawMessage: pending.raw_message || undefined,
+                        messageId: pending.message_id || undefined,
                       };
+                      // [FASE 23.2] OCR do comprovante salvo no buffer →
+                      // alimenta o extrator determinístico e o prompt da IA.
+                      if (
+                        typeof pending.ocr_text === "string" &&
+                        pending.ocr_text.trim().length > 0
+                      ) {
+                        processedContent = pending.ocr_text;
+                      }
                       _replayedFromPending = true;
                       console.log("[AI_RECEIPT_PENDING_MEDIA_REPLAY]",
                         JSON.stringify({
                           conversation_id: conversationId,
                           block_id: b.id,
                           age_ms: ageMs,
+                          has_ocr_text: !!pending.ocr_text,
                           media: pending,
                         }));
                     } else {
@@ -7313,6 +7370,47 @@ Mensagem do lead:
                     });
                   } catch (_auditErr) { /* best-effort */ }
                 };
+
+                // [AI_RECEIPT_ENTER_DEDUP — FASE 23.2] Guard anti-loop: a
+                // MESMA mensagem não pode reprocessar este bloco em janela
+                // curta (caso real: 101 ai_receipt_enter em 45s vindos de 3
+                // message_ids). Comprovante novo = message_id novo → passa.
+                // Fail-open: erro na consulta não bloqueia o fluxo.
+                const _enterMsgId: string | null =
+                  ((norm as any)?.messageId as string) || null;
+                if (_enterMsgId && !_replayedFromPending) {
+                  let _enterDup = false;
+                  try {
+                    const _dupSince = new Date(Date.now() - 60_000)
+                      .toISOString();
+                    const { data: _dupRows } = await supabase
+                      .from("ai_receipt_audits")
+                      .select("id")
+                      .eq("conversation_id", conversationId)
+                      .eq("block_id", b.id)
+                      .eq("message_id", _enterMsgId)
+                      .eq("decision", "ai_receipt_enter")
+                      .gte("created_at", _dupSince)
+                      .limit(1);
+                    _enterDup = !!(_dupRows && _dupRows.length > 0);
+                  } catch (_dedupErr) { /* fail-open */ }
+                  if (_enterDup) {
+                    console.log(
+                      "[AI_RECEIPT_ENTER_DUPLICATE_SKIPPED]",
+                      JSON.stringify({
+                        conversation_id: conversationId,
+                        block_id: b.id,
+                        message_id: _enterMsgId,
+                      }),
+                    );
+                    // Mesmo idioma do deterministic_dedup_blocked: fica no
+                    // bloco, não chama IA, não avança, não responde.
+                    nextBlockId = b.id;
+                    currentBlock = null;
+                    safety = 1000;
+                    break;
+                  }
+                }
 
                 await _auditReceipt({
                   source: "enter",
@@ -8123,6 +8221,90 @@ FORMATO JSON:
                         value: result.value,
                         llm_identified: false,
                       });
+                    }
+
+                    // [AI_RECEIPT_VALUE_ZERO_GUARD — FASE 23.2] Comprovante
+                    // "identificado" com valor 0/vazio NÃO pode avançar rota
+                    // verde silenciosamente (caso real: PDF PicPay com OCR
+                    // "COMPROVANTE IDENTIFICADO | Valor: 0.00" avançou para
+                    // brinde/upsell sem Purchase). 1) fallback regex de moeda
+                    // no OCR completo; 2) sem valor → rota vermelha auditada
+                    // pedindo reenvio. Não altera comprovantes com valor > 0.
+                    try {
+                      const _resValNum = parseFloat(
+                        String(result.value ?? "")
+                          .replace(/[^\d.,]/g, "")
+                          .replace(/\.(?=\d{3}(\D|$))/g, "")
+                          .replace(",", "."),
+                      );
+                      if (
+                        result.identified === true &&
+                        (!Number.isFinite(_resValNum) || _resValNum <= 0)
+                      ) {
+                        const _ocrFull = String(deterministicOcrText || "");
+                        const _moneyRe =
+                          /R\$\s*([0-9]+(?:\.[0-9]{3})*(?:[.,][0-9]{1,2})?)|(?:\bvalor\b[^\d]{0,20})([0-9]+(?:\.[0-9]{3})*(?:[.,][0-9]{1,2})?)/gi;
+                        let _m: RegExpExecArray | null;
+                        let _fallbackVal = 0;
+                        while ((_m = _moneyRe.exec(_ocrFull))) {
+                          let _raw = String(_m[1] || _m[2] || "");
+                          if (_raw.includes(",") && _raw.includes(".")) {
+                            _raw = _raw.replace(/\./g, "").replace(",", ".");
+                          } else if (_raw.includes(",")) {
+                            _raw = _raw.replace(",", ".");
+                          }
+                          const _v = parseFloat(_raw);
+                          if (Number.isFinite(_v) && _v > 0) {
+                            _fallbackVal = _v;
+                            break;
+                          }
+                        }
+                        if (_fallbackVal > 0) {
+                          result.value = _fallbackVal.toFixed(2);
+                          console.log(
+                            "[AI_RECEIPT_VALUE_ZERO_FALLBACK_APPLIED]",
+                            JSON.stringify({ value: result.value }),
+                          );
+                          await _auditReceipt({
+                            source: "value_zero_guard",
+                            identified: true,
+                            name: result.name || null,
+                            value: result.value,
+                            decision: "value_zero_regex_fallback",
+                            metadata: { llm_identified: true },
+                          });
+                        } else {
+                          console.log(
+                            "[AI_RECEIPT_VALUE_ZERO_RED_ROUTE]",
+                            JSON.stringify({
+                              conversation_id: conversationId,
+                              block_id: b.id,
+                            }),
+                          );
+                          await _auditReceipt({
+                            source: "value_zero_guard",
+                            identified: false,
+                            name: result.name || null,
+                            value: "0.00",
+                            route: "red",
+                            decision: "receipt_identified_value_zero",
+                            metadata: { llm_identified: true },
+                          });
+                          result.identified = false;
+                          if (
+                            !result.response ||
+                            !String(result.response).trim()
+                          ) {
+                            result.response =
+                              "Recebi seu comprovante, mas não consegui confirmar o valor pago 😕 Pode me enviar o comprovante completo novamente, por favor? 🙏";
+                          }
+                        }
+                      }
+                    } catch (_zeroGuardErr) {
+                      console.warn(
+                        "[AI_RECEIPT_VALUE_ZERO_GUARD_FAILED]",
+                        String(_zeroGuardErr),
+                      );
                     }
 
                     // Importante: Considerar identificado se tiver nome E valor mesmo que a IA oscile no booleano
