@@ -1969,6 +1969,11 @@ async function sendFacebookConversion(
     fbp?: string;
     client_ip_address?: string;
     client_user_agent?: string;
+    // [FASE 24] Atribuição CTWA (Meta CAPI business messaging): vão em
+    // user_data em TEXTO PLANO (sem hash), conforme spec. custom_data.ctwa_clid
+    // é ignorado pelo matching — por isso a atribuição parava em ~74%.
+    ctwa_clid?: string;
+    page_id?: string;
   },
   customData: {
     value?: number;
@@ -2007,6 +2012,10 @@ async function sendFacebookConversion(
   if (userData.fbp) user_data.fbp = userData.fbp;
   if (userData.client_ip_address) user_data.client_ip_address = userData.client_ip_address;
   if (userData.client_user_agent) user_data.client_user_agent = userData.client_user_agent;
+  // [FASE 24] CTWA em user_data (plano, sem hash) — chave da atribuição
+  // determinística no Gerenciador para eventos de business messaging.
+  if (userData.ctwa_clid) user_data.ctwa_clid = userData.ctwa_clid;
+  if (userData.page_id) user_data.page_id = userData.page_id;
 
   const custom_data: any = {};
   if (customData.value !== undefined) custom_data.value = customData.value;
@@ -2028,30 +2037,31 @@ async function sendFacebookConversion(
   const event_id = options?.eventId || `capi_${crypto.randomUUID()}`;
   const action_source = options?.actionSource || "system_generated";
 
-  const payload: any = {
-    data: [
-      {
-        event_name: eventName,
-        event_time: Math.floor(Date.now() / 1000),
-        event_id,
-        action_source,
-        user_data,
-        custom_data,
-      },
-    ],
+  const eventBody: any = {
+    event_name: eventName,
+    event_time: Math.floor(Date.now() / 1000),
+    event_id,
+    action_source,
+    user_data,
+    custom_data,
   };
+  // [FASE 24] Spec de business messaging exige o canal no nível do evento.
+  if (action_source === "business_messaging") {
+    eventBody.messaging_channel = "whatsapp";
+  }
+
+  const payload: any = { data: [eventBody] };
 
   if (options?.testEventCode) {
     payload.test_event_code = options.testEventCode;
   }
 
-  try {
+  const doPost = async (body: any) => {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
     });
-
     const respText = await response.text();
     let respData: any = {};
     try {
@@ -2059,13 +2069,50 @@ async function sendFacebookConversion(
     } catch {
       respData = { raw: respText };
     }
+    return { ok: response.ok, respData, respText };
+  };
 
-    if (!response.ok) {
-      console.error("[facebook-pixel] API error:", respText);
-      return { success: false, payload, response: respData };
+  try {
+    const first = await doPost(payload);
+    if (first.ok) {
+      console.log("[facebook-pixel] Event sent:", eventName, "action_source:", action_source, "ctwa_clid:", user_data.ctwa_clid ? "yes" : "no");
+      return { success: true, payload, response: first.respData };
     }
-    console.log("[facebook-pixel] Event sent:", eventName, "action_source:", action_source, "ctwa_clid:", customData.ctwa_clid ? "yes" : "no");
-    return { success: true, payload, response: respData };
+    console.error("[facebook-pixel] API error:", first.respText);
+
+    // [FASE 24] Fallback de segurança: se o formato business_messaging for
+    // rejeitado pelo Graph (ex.: ctwa_clid expirado/inválido, page_id não
+    // vinculado ao dataset), reenvia UMA vez no formato legado ("chat",
+    // sem ctwa/page em user_data), com o MESMO event_id — garante que a
+    // compra nunca deixe de ser contabilizada por causa da atribuição.
+    if (action_source === "business_messaging") {
+      const legacyUserData: any = { ...user_data };
+      delete legacyUserData.ctwa_clid;
+      delete legacyUserData.page_id;
+      const legacyPayload: any = {
+        data: [{
+          event_name: eventName,
+          event_time: Math.floor(Date.now() / 1000),
+          event_id,
+          action_source: "chat",
+          user_data: legacyUserData,
+          custom_data,
+        }],
+      };
+      if (options?.testEventCode) {
+        legacyPayload.test_event_code = options.testEventCode;
+      }
+      console.warn("[facebook-pixel] business_messaging_rejected_fallback_chat", JSON.stringify({ event_id, first_error: first.respData?.error?.message || null }));
+      const second = await doPost(legacyPayload);
+      if (second.ok) {
+        console.log("[facebook-pixel] Event sent (fallback chat):", eventName, "event_id:", event_id);
+        return { success: true, payload: legacyPayload, response: { ...second.respData, fallback_used: "chat", first_error: first.respData?.error || null } };
+      }
+      console.error("[facebook-pixel] fallback API error:", second.respText);
+      return { success: false, payload: legacyPayload, response: second.respData };
+    }
+
+    return { success: false, payload, response: first.respData };
   } catch (e) {
     console.error("[facebook-pixel] fetch exception:", e);
     return { success: false, payload, error: String(e) };
@@ -6270,7 +6317,7 @@ Mensagem do lead:
                     }
 
                     // 2. Find integration
-                    let query = supabase.from("facebook_lead_integrations").select("pixel_id, pixel_access_token").eq("is_active", true);
+                    let query = supabase.from("facebook_lead_integrations").select("pixel_id, pixel_access_token, page_id").eq("is_active", true);
                     if (pageId) {
                       query = query.eq("page_id", pageId);
                     } else if (blockPixelId) {
@@ -6350,9 +6397,14 @@ Mensagem do lead:
                       const creationTime = leadCreatedAt ? new Date(leadCreatedAt).getTime() : Date.now();
                       const fbc = fbclid ? `fb.1.${creationTime}.${fbclid}` : undefined;
 
-                      // CTWA evidence → action_source = "chat" (Meta's recommended value for WhatsApp Business)
+                      // [FASE 24] Com ctwa_clid → "business_messaging" + user_data.ctwa_clid
+                      // + page_id + messaging_channel (spec CAPI p/ CTWA; atribuição
+                      // determinística no Gerenciador). Sem ctwa_clid → comportamento
+                      // anterior (chat/system_generated, matching por telefone).
                       const isCtwa = !!(ctwa_clid || convCtwa.ctwa_payload || entry_point_conversion_source === "ctwa_ad" || leadRow?.ctwa_detected);
-                      const action_source = isCtwa ? "chat" : "system_generated";
+                      const action_source = ctwa_clid
+                        ? "business_messaging"
+                        : (isCtwa ? "chat" : "system_generated");
 
                       console.log(`[pixel_attribution_resolved] ctwa_clid=${ctwa_clid || "-"} ad_source_id=${ad_source_id || "-"} action_source=${action_source} sources={fv:${!!fv.ctwa_clid},conv:${!!convCtwa.ctwa_clid},lt:${!!lt?.ctwa_clid},lead:${!!leadRow?.ctwa_clid}}`);
 
@@ -6369,6 +6421,9 @@ Mensagem do lead:
                           fbp,
                           client_ip_address,
                           client_user_agent,
+                          // [FASE 24] atribuição CTWA no user_data (texto plano)
+                          ctwa_clid,
+                          page_id: (integ as any)?.page_id || undefined,
                         },
                         {
                           value: isNaN(numericValue) ? undefined : numericValue,
