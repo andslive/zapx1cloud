@@ -5216,6 +5216,9 @@ Deno.serve(async (req) => {
               /{{lead_name}}/g,
               (conv as any).contact_name || "",
             );
+            // [FIX 18/18.1] Nunca vazar placeholders não resolvidos ({{ai.response}} etc.)
+            // ao usuário: qualquer {{token}} restante vira string vazia.
+            result = result.replace(/{{\s*[\w.]+\s*}}/g, "");
             return result;
           };
 
@@ -7777,10 +7780,11 @@ Mensagem do lead:
 
 
                 try {
-                  const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-                  if (!LOVABLE_API_KEY) {
-                    throw new Error("LOVABLE_API_KEY not set");
-                  }
+                  // [FIX 18.1] Guard de LOVABLE_API_KEY removido APENAS deste fluxo ai_receipt:
+                  // a chave/provider reais são resolvidos por applyProviderModel abaixo
+                  // (openai -> OPENAI_API_KEY; gemini/lovable -> gateway Lovable). Assim o bloco
+                  // configurado como OpenAI não é mais barrado por falta de LOVABLE_API_KEY.
+                  // Uma falha real de credencial/IA cai no catch com fallback seguro.
 
                   // Substitui variáveis no prompt também para garantir que referências como {{nome}} funcionem
                   // Removemos redundâncias e focamos no objetivo
@@ -8447,6 +8451,15 @@ FORMATO JSON:
 
                 } catch (e) {
                   console.error("[uazapi-webhook] ai_receipt exception:", e);
+                  // [FIX 18.1] Fallback seguro quando a IA realmente falha: garante que a chave
+                  // ai.response exista (vazia) para o renderizador substituir por "" em vez de
+                  // vazar o literal {{ai.response}}. Segue a rota não-comprovante (não trava/loopa).
+                  if (
+                    !(flowVariables as any)["ai.response"] ||
+                    !String((flowVariables as any)["ai.response"]).trim()
+                  ) {
+                    (flowVariables as any)["ai.response"] = "";
+                  }
                   nextBlockId = b.data?.false_next_block_id || null;
                 }
 
