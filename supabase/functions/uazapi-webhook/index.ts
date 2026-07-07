@@ -464,6 +464,23 @@ function normalizeInstanceName(value?: string | null) {
     .replace(/^chi+p+/i, 'chip');
 }
 
+/**
+ * FASE 28: normaliza message_id para o "id puro" do WhatsApp.
+ * Linhas antigas de whatsapp_message_retries (e alguns payloads UazAPI)
+ * usam o formato composto "jid:id" (ex.: "5511...@s.whatsapp.net:3EB0...").
+ * IDs puros do WhatsApp não contêm ":" precedido de jid, então só corta
+ * quando o prefixo antes do último ":" contém "@".
+ */
+function normalizePureMessageId(raw: unknown): string {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  const lastColon = s.lastIndexOf(":");
+  if (lastColon > 0 && s.slice(0, lastColon).includes("@")) {
+    return s.slice(lastColon + 1);
+  }
+  return s;
+}
+
 function extractString(val: any): string {
   if (val == null) return "";
   if (typeof val === "string") return val.trim();
@@ -991,9 +1008,45 @@ function normalizePayload(payload: any): Normalized | null {
         kind: "ack" as any,
         instance,
         messageId,
+        messageIds: [messageId],
         ack,
         remoteJid: extractString(statusData.remoteJid || statusData.key?.remoteJid || statusData.participant || ""),
       } as any;
+    }
+  }
+
+  // ---- FASE 28: UazAPI receipt ACKs (Type: Delivered/Read + MessageIDs[]) ----
+  // whatsmeow-style receipts chegam com um array de IDs por evento. Detecção
+  // por shape (MessageIDs[] + Type) porque o nome do evento varia entre
+  // versões (ReadReceipt / Receipt / messages_update).
+  {
+    const receiptData = data.event && typeof data.event === "object" ? data.event : data;
+    const rawIds = receiptData?.MessageIDs || receiptData?.messageIds || receiptData?.messageIDs;
+    if (Array.isArray(rawIds) && rawIds.length > 0) {
+      const receiptType = String(receiptData.Type ?? receiptData.type ?? "").toLowerCase();
+      // whatsmeow usa Type "" para delivered; UazAPI manda "Delivered"/"Read".
+      const ack = receiptType === "read" || receiptType === "readself" || receiptType === "played"
+        ? 4
+        : receiptType === "delivered" || receiptType === ""
+        ? 3
+        : 0;
+      if (ack > 0) {
+        const messageIds = rawIds
+          .map((id: unknown) => normalizePureMessageId(id))
+          .filter(Boolean);
+        if (messageIds.length > 0) {
+          return {
+            kind: "ack" as any,
+            instance,
+            messageId: messageIds[0],
+            messageIds,
+            ack,
+            remoteJid: extractString(
+              receiptData.Chat || receiptData.chat || receiptData.Sender || receiptData.sender || "",
+            ),
+          } as any;
+        }
+      }
     }
   }
 
@@ -2318,43 +2371,90 @@ Deno.serve(async (req) => {
       } catch (e) {
         console.warn("[uazapi-webhook] payload dump error:", e);
       }
-
-      // 3. PROCESSAR EVENTOS DE ACK
-      if (norm && (norm as any).kind === "ack") {
-        const ackEvent = norm as any;
-        console.log(`[uazapi-webhook] processing ack for message ${ackEvent.messageId}: ${ackEvent.ack}`);
-        
-        // Atualizar status na tabela processed_messages
-        await supabase.from("processed_messages")
-          .update({ 
-            ack: ackEvent.ack, 
-            ack_at: new Date().toISOString() 
-          })
-          .eq("message_id", ackEvent.messageId);
-
-        // Remover do controle de retentativas se entregue ou lido
-        if (ackEvent.ack >= 3) {
-          await supabase.from("whatsapp_message_retries")
-            .delete()
-            .eq("message_id", ackEvent.messageId);
-            
-          // Atualizar status na webchat_messages para refletir no UI
-          await supabase.from("webchat_messages")
-            .update({ 
-              status: ackEvent.ack === 4 ? "read" : "delivered",
-              delivered_at: ackEvent.ack >= 3 ? new Date().toISOString() : null,
-              read_at: ackEvent.ack === 4 ? new Date().toISOString() : null
-            })
-            .or(`metadata->>evolution_message_id.eq."${ackEvent.messageId}",metadata->>external_id.eq."${ackEvent.messageId}"`);
-        }
-        
-        return new Response(JSON.stringify({ ok: true, task: "ack_processed" }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
     }
 
-    
+    // 3. PROCESSAR EVENTOS DE ACK
+    // FASE 28: fora do gate rawEvent === "messages" — receipts UazAPI
+    // (Delivered/Read + MessageIDs[]) chegam com outros nomes de evento.
+    if (norm && (norm as any).kind === "ack") {
+      const ackEvent = norm as any;
+      const ackIds: string[] = (
+        Array.isArray(ackEvent.messageIds) && ackEvent.messageIds.length > 0
+          ? ackEvent.messageIds
+          : [ackEvent.messageId]
+      )
+        .map((id: unknown) => normalizePureMessageId(id))
+        .filter(Boolean);
+
+      console.log(
+        `[uazapi-webhook] processing ack ${ackEvent.ack} for ${ackIds.length} message(s):`,
+        ackIds.join(","),
+      );
+
+      for (const ackId of ackIds) {
+        // Tolerante: falha em um ID não pode travar os demais nem o webhook.
+        try {
+          // Atualizar status na tabela processed_messages
+          await supabase.from("processed_messages")
+            .update({
+              ack: ackEvent.ack,
+              ack_at: new Date().toISOString(),
+            })
+            .eq("message_id", ackId);
+
+          // Remover do controle de retentativas se entregue ou lido
+          if (ackEvent.ack >= 3) {
+            const { error: delErr } = await supabase.from("whatsapp_message_retries")
+              .delete()
+              .eq("message_id", ackId);
+            if (delErr) {
+              console.warn(`[uazapi-webhook] retry delete failed for ${ackId}:`, delErr.message);
+            }
+
+            // COMPAT TEMPORÁRIA (FASE 28): linhas antigas gravadas como
+            // "jid:id". Remover este LIKE após a fila legada drenar.
+            // Hardening: só roda o LIKE com id de charset seguro — "%" no
+            // padrão faria o LIKE casar (e apagar) linhas de outras
+            // mensagens. Id fora do padrão fica só com o DELETE por
+            // igualdade acima. "_" é permitido mas escapado (curinga LIKE).
+            if (/^[A-Za-z0-9=_-]+$/.test(ackId)) {
+              const { error: legacyDelErr } = await supabase.from("whatsapp_message_retries")
+                .delete()
+                .like("message_id", `%:${ackId.replace(/_/g, "\\_")}`);
+              if (legacyDelErr) {
+                console.warn(`[uazapi-webhook] legacy retry delete failed for ${ackId}:`, legacyDelErr.message);
+              }
+            } else {
+              console.warn(`[uazapi-webhook] legacy LIKE skipped for unsafe ackId: ${JSON.stringify(ackId).slice(0, 80)}`);
+            }
+
+            // Atualizar status na webchat_messages para refletir no UI.
+            // FASE 28.1: só a coluna status — delivered_at/read_at não
+            // existem na tabela e faziam o UPDATE inteiro falhar em silêncio.
+            const { error: uiErr } = await supabase.from("webchat_messages")
+              .update({
+                status: ackEvent.ack === 4 ? "read" : "delivered",
+              })
+              .or(`metadata->>evolution_message_id.eq."${ackId}",metadata->>external_id.eq."${ackId}"`);
+            if (uiErr) {
+              console.warn(`[uazapi-webhook] webchat status update failed for ${ackId}:`, uiErr.message);
+            }
+          }
+        } catch (ackErr) {
+          console.warn(
+            `[uazapi-webhook] ack handling failed for ${ackId}:`,
+            (ackErr as any)?.message || ackErr,
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({ ok: true, task: "ack_processed", count: ackIds.length }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+
     // 2. ATUALIZAR STATUS DO LOG (LEAD RESOLVED/RECEIVED)
     if (logRecordId) {
       try {

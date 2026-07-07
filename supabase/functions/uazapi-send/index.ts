@@ -9,10 +9,26 @@ const corsHeaders = {
 
 interface SendBody {
   organization_id?: string;
-  instance_id?: string; 
+  instance_id?: string;
   type: string;
-  to: string; 
+  to: string;
   payload: any;
+}
+
+/**
+ * FASE 28: normaliza message_id para o "id puro" do WhatsApp antes de gravar
+ * em whatsapp_message_retries. Algumas respostas UazAPI retornam o formato
+ * composto "jid:id" (ex.: "5511...@s.whatsapp.net:3EB0..."), que impedia o
+ * match com os ACKs de Delivered/Read no webhook.
+ */
+function normalizePureMessageId(raw: unknown): string {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  const lastColon = s.lastIndexOf(":");
+  if (lastColon > 0 && s.slice(0, lastColon).includes("@")) {
+    return s.slice(lastColon + 1);
+  }
+  return s;
 }
 
 async function uazFetch(url: string, token: string, path: string, body: any, method = "POST") {
@@ -377,7 +393,7 @@ Deno.serve(async (req) => {
 
     // Tracker & Metrics
     if (res.ok && res.body?.id && type !== "presence" && type !== "markRead") {
-        const messageId = res.body.id;
+        const messageId = normalizePureMessageId(res.body.id);
         // Run database updates without awaiting or with individual try-catches to avoid stopping the response
         supabase.from("whatsapp_message_retries").insert({
             organization_id: organization_id,
