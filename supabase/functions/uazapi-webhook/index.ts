@@ -6809,6 +6809,138 @@ Mensagem do lead:
               }
               case "ai_receipt": {
                 // ─────────────────────────────────────────────────────────
+                // [FASE 27] Hardening do parser de valores. Helpers usados
+                // pelos 3 caminhos que gravam valorcomprovante (VPS2,
+                // determinístico, IA). Valor acima do limite passa por
+                // releitura; se irresolvível e houver valores aceitos, cai
+                // no menor valor aceito — nunca envia valor absurdo à Meta.
+                // ─────────────────────────────────────────────────────────
+                const _parseBRLNumbers = (txt: string): number[] => {
+                  const out: number[] = [];
+                  const re = /R\$\s*([0-9]+(?:\.[0-9]{3})*(?:[.,][0-9]{1,2})?)/g;
+                  let m: RegExpExecArray | null;
+                  while ((m = re.exec(txt || ""))) {
+                    let raw = m[1];
+                    if (raw.includes(",") && raw.includes(".")) raw = raw.replace(/\./g, "").replace(",", ".");
+                    else if (raw.includes(",")) raw = raw.replace(",", ".");
+                    const v = parseFloat(raw);
+                    if (Number.isFinite(v) && v > 0) out.push(Number(v.toFixed(2)));
+                  }
+                  return Array.from(new Set(out));
+                };
+                const _receiptAcceptedValues: number[] = (() => {
+                  let acc: number[] = [];
+                  const _accRaw: any = b.data?.accepted_values;
+                  if (Array.isArray(_accRaw)) {
+                    acc = _accRaw
+                      .map((v: any) => parseFloat(String(v).replace(",", ".")))
+                      .filter((n: number) => Number.isFinite(n) && n > 0)
+                      .map((n: number) => Number(n.toFixed(2)));
+                  }
+                  if (acc.length === 0 && b.data?.expected_value != null) {
+                    const ev = parseFloat(String(b.data.expected_value).replace(",", "."));
+                    if (Number.isFinite(ev) && ev > 0) acc = [Number(ev.toFixed(2))];
+                  }
+                  if (acc.length === 0 && typeof b.data?.receipt_prompt === "string") {
+                    acc = _parseBRLNumbers(b.data.receipt_prompt);
+                  }
+                  return acc;
+                })();
+                const HIGH_VALUE_THRESHOLD =
+                  Number(b.data?.high_value_threshold) > 0
+                    ? Number(b.data.high_value_threshold)
+                    : 100;
+                const reprocessHighAmount = (
+                  firstAmount: number,
+                  rawAmountText: string,
+                  ocrText: string,
+                  acceptedValues: number[],
+                  amountSource: "vps" | "deterministic_parser" | "ai",
+                ) => {
+                  const out = {
+                    amount: firstAmount,
+                    high_value_reprocessed: false,
+                    resolved: true,
+                    first_amount: firstAmount,
+                    second_amount: null as number | null,
+                    raw_amount_text: rawAmountText,
+                    amount_source: amountSource,
+                    amount_correction_reason: null as string | null,
+                    reprocess_reason: null as string | null,
+                  };
+                  if (!(firstAmount > HIGH_VALUE_THRESHOLD)) return out;
+                  out.high_value_reprocessed = true;
+                  out.reprocess_reason = "amount_above_threshold";
+
+                  // Passo 1 — prioridade absoluta: padrões explícitos
+                  // "R$ xx,xx" (vírgula decimal) no OCR completo.
+                  const explicit: number[] = [];
+                  const re = /R\$\s*(\d{1,3}(?:\.\d{3})*,\d{2})\b/g;
+                  let m: RegExpExecArray | null;
+                  while ((m = re.exec(ocrText || ""))) {
+                    const v = parseFloat(m[1].replace(/\./g, "").replace(",", "."));
+                    if (Number.isFinite(v) && v > 0 && v <= HIGH_VALUE_THRESHOLD) explicit.push(v);
+                  }
+                  const pick =
+                    explicit.find((v) => acceptedValues.some((a) => Math.abs(a - v) <= 0.01)) ??
+                    explicit.find((v) => Math.abs(v * 100 - firstAmount) <= 1) ??
+                    (new Set(explicit).size === 1 ? explicit[0] : undefined);
+
+                  // Passo 2 — heurística ÷100 contra a lista de valores aceitos.
+                  const div100 = Number((firstAmount / 100).toFixed(2));
+                  const second = pick ??
+                    (acceptedValues.some((a) => Math.abs(a - div100) <= 0.01) ? div100 : undefined);
+
+                  if (second !== undefined) {
+                    out.amount = Number(second.toFixed(2));
+                    out.second_amount = out.amount;
+                    out.amount_correction_reason = pick !== undefined
+                      ? "explicit_brl_pattern"
+                      : "divided_by_100_matches_accepted";
+                  } else if (acceptedValues.length > 0) {
+                    // Releitura não resolveu: fallback seguro para o menor
+                    // valor aceito do bloco — jamais o valor absurdo.
+                    out.amount = Number(Math.min(...acceptedValues).toFixed(2));
+                    out.second_amount = out.amount;
+                    out.resolved = false;
+                    out.amount_correction_reason = "fallback_to_expected_amount";
+                  } else {
+                    out.resolved = false; // irresolvível sem lista: mantém e audita
+                  }
+                  return out;
+                };
+                const _auditHighValue = async (corr: any) => {
+                  try {
+                    console.log("[AI_RECEIPT_HIGH_VALUE_REPROCESSED]", JSON.stringify({
+                      conversation_id: conversationId,
+                      block_id: b.id,
+                      ...corr,
+                    }));
+                    await supabase.from("ai_receipt_audits").insert({
+                      conversation_id: conversationId,
+                      lead_id: (conv as any).lead_id || null,
+                      organization_id: (conv as any).organization_id || null,
+                      funnel_id: (conv as any).current_flow_id || null,
+                      block_id: b.id,
+                      message_id: ((norm as any)?.messageId as string) || null,
+                      source: corr.amount_source,
+                      decision: "high_value_reprocessed",
+                      value: Number(corr.amount).toFixed(2),
+                      metadata: {
+                        high_value_reprocessed: true,
+                        first_amount: corr.first_amount,
+                        second_amount: corr.second_amount,
+                        raw_amount_text: String(corr.raw_amount_text || "").slice(0, 80),
+                        amount_source: corr.amount_source,
+                        amount_correction_reason: corr.amount_correction_reason,
+                        reprocess_reason: corr.reprocess_reason,
+                        resolved: corr.resolved,
+                        threshold: HIGH_VALUE_THRESHOLD,
+                      },
+                    });
+                  } catch (_hvErr) { /* best-effort */ }
+                };
+                // ─────────────────────────────────────────────────────────
                 // Fase G.1 — Curto-circuito controlado: consumir resultado
                 // oficial da VPS2 (tabela vps_receipt_results). Triplo guard:
                 // flag global + allowlist de instância + allowlist de funil.
@@ -6858,9 +6990,23 @@ Mensagem do lead:
                       const _valueVar =
                         b.data?.receipt_value_var || "valorcomprovante";
                       const _vpsName = (_vps.customer_name ?? "").toString().trim();
-                      const _vpsAmount = _vps.amount != null
+                      let _vpsAmount = _vps.amount != null
                         ? Number(_vps.amount)
                         : null;
+                      // [FASE 27] Releitura de valor alto antes de gravar.
+                      if (_vpsAmount != null && !Number.isNaN(_vpsAmount)) {
+                        const _hvOcr = [processedContent, (norm as any)?.content]
+                          .filter((p) => typeof p === "string" && p.trim().length > 0 && !p.trim().startsWith("{"))
+                          .join("\n");
+                        const _corr = reprocessHighAmount(
+                          _vpsAmount, String(_vps.amount), _hvOcr,
+                          _receiptAcceptedValues, "vps",
+                        );
+                        if (_corr.high_value_reprocessed) {
+                          _vpsAmount = _corr.amount;
+                          await _auditHighValue(_corr);
+                        }
+                      }
                       const _vpsValueStr = _vpsAmount != null && !Number.isNaN(_vpsAmount)
                         ? _vpsAmount.toFixed(2)
                         : "";
@@ -7495,36 +7641,9 @@ Mensagem do lead:
                     _curText.length > 0 && _curText.length <= 25 &&
                     _shortAckRe.test(_curText) && !_extSignalsRe.test(_curText);
 
-                  // Lista de valores aceitos: prioriza config do bloco, depois
-                  // parsing dos R$ X,XX do receipt_prompt.
-                  const _parseBRLNumbers = (txt: string): number[] => {
-                    const out: number[] = [];
-                    const re = /R\$\s*([0-9]+(?:\.[0-9]{3})*(?:[.,][0-9]{1,2})?)/g;
-                    let m: RegExpExecArray | null;
-                    while ((m = re.exec(txt || ""))) {
-                      let raw = m[1];
-                      if (raw.includes(",") && raw.includes(".")) raw = raw.replace(/\./g, "").replace(",", ".");
-                      else if (raw.includes(",")) raw = raw.replace(",", ".");
-                      const v = parseFloat(raw);
-                      if (Number.isFinite(v) && v > 0) out.push(Number(v.toFixed(2)));
-                    }
-                    return Array.from(new Set(out));
-                  };
-                  let _acceptedValues: number[] = [];
-                  const _accRaw: any = b.data?.accepted_values;
-                  if (Array.isArray(_accRaw)) {
-                    _acceptedValues = _accRaw
-                      .map((v: any) => parseFloat(String(v).replace(",", ".")))
-                      .filter((n: number) => Number.isFinite(n) && n > 0)
-                      .map((n: number) => Number(n.toFixed(2)));
-                  }
-                  if (_acceptedValues.length === 0 && b.data?.expected_value != null) {
-                    const ev = parseFloat(String(b.data.expected_value).replace(",", "."));
-                    if (Number.isFinite(ev) && ev > 0) _acceptedValues = [Number(ev.toFixed(2))];
-                  }
-                  if (_acceptedValues.length === 0 && typeof b.data?.receipt_prompt === "string") {
-                    _acceptedValues = _parseBRLNumbers(b.data.receipt_prompt);
-                  }
+                  // Lista de valores aceitos: calculada uma única vez no topo
+                  // do case (FASE 27) e compartilhada pelos 3 caminhos.
+                  const _acceptedValues: number[] = _receiptAcceptedValues;
 
                   if (_hasSignals && _detName.length >= 3 && Number.isFinite(_detVal) && _detVal > 0) {
                     await _auditReceipt({
@@ -7547,19 +7666,33 @@ Mensagem do lead:
                       });
                       // Segue para o fluxo IA normal abaixo (não força break).
                     } else {
+                      // [FASE 27] Releitura de valor alto ANTES de aceitar:
+                      // corrige vírgula perdida (990 → 9,90) ou cai no menor
+                      // valor aceito. É o valor final que segue para
+                      // flowVariables, lead e Meta.
+                      const _hvCorr = reprocessHighAmount(
+                        _detVal,
+                        String(deterministicExtraction.raw_value || ""),
+                        _ocrText,
+                        _acceptedValues,
+                        "deterministic_parser",
+                      );
+                      const _detValFinal = _hvCorr.amount;
+                      if (_hvCorr.high_value_reprocessed) await _auditHighValue(_hvCorr);
+
                       // [FIX pague-o-que-puder] Aceitar QUALQUER valor positivo desde que
                       // haja evidências de comprovante + nome (>=3) + valor > 0. A lista
                       // accepted_values é apenas informativa e não bloqueia rota verde.
                       const _matched = _acceptedValues.length === 0
                         ? null
-                        : _acceptedValues.find((av) => Math.abs(av - _detVal) <= 0.01);
+                        : _acceptedValues.find((av) => Math.abs(av - _detValFinal) <= 0.01);
 
                       console.log("[DEPLOY_MARKER_ANY_AMOUNT_ACTIVE]", { build: "6f860259", ts: new Date().toISOString() });
                       console.log("[AI_RECEIPT_VALUE_ACCEPTED_ANY_AMOUNT]", {
-                        value: _detVal, accepted_values: _acceptedValues, matched_value: _matched,
+                        value: _detValFinal, accepted_values: _acceptedValues, matched_value: _matched,
                       });
                       await _auditReceipt({
-                        source: "deterministic", identified: true, name: _detName, value: _detVal.toFixed(2),
+                        source: "deterministic", identified: true, name: _detName, value: _detValFinal.toFixed(2),
                         route: "info", decision: "receipt_value_accepted_any_amount",
                         metadata: { accepted_values: _acceptedValues, matched_value: _matched },
                       });
@@ -7581,7 +7714,7 @@ Mensagem do lead:
                         if (_dup) {
                           console.log("[AI_RECEIPT_DETERMINISTIC_DEDUP_BLOCKED]", { key: _detKey });
                           await _auditReceipt({
-                            source: "deterministic", identified: true, name: _detName, value: _detVal.toFixed(2),
+                            source: "deterministic", identified: true, name: _detName, value: _detValFinal.toFixed(2),
                             route: "none", decision: "deterministic_dedup_blocked",
                             metadata: { ocr_hash: _ocrHash },
                           });
@@ -7595,7 +7728,7 @@ Mensagem do lead:
 
                         const _nameVar = b.data?.receipt_name_var || "nomecomprovante";
                         const _valueVar = b.data?.receipt_value_var || "valorcomprovante";
-                        const _finalValue = _detVal.toFixed(2);
+                        const _finalValue = _detValFinal.toFixed(2);
                         flowVariables[_nameVar] = _detName;
                         flowVariables[_valueVar] = _finalValue;
                         (flowVariables as any).comprovante_identified = true;
@@ -8399,7 +8532,22 @@ FORMATO JSON:
                       
                       // Ensure it's a valid number or default to 0
                       const finalValueNum = parseFloat(extractedValue);
-                      const finalValue = isNaN(finalValueNum) ? "0.00" : finalValueNum.toFixed(2);
+                      let finalValue = isNaN(finalValueNum) ? "0.00" : finalValueNum.toFixed(2);
+
+                      // [FASE 27] Releitura de valor alto antes de gravar.
+                      if (!isNaN(finalValueNum)) {
+                        const _hvCorr = reprocessHighAmount(
+                          finalValueNum,
+                          String(result.value || ""),
+                          String(deterministicOcrText || ""),
+                          _receiptAcceptedValues,
+                          "ai",
+                        );
+                        if (_hvCorr.high_value_reprocessed) {
+                          finalValue = _hvCorr.amount.toFixed(2);
+                          await _auditHighValue(_hvCorr);
+                        }
+                      }
 
                       flowVariables[nameVar] = extractedName;
                       flowVariables[valueVar] = finalValue;
