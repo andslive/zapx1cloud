@@ -13,7 +13,7 @@ import { OnboardingBanner } from '@/components/onboarding/OnboardingBanner';
 
 // Factories nomeadas para podermos reutilizá-las no prefetch on-hover.
 const f = {
-  AdminDashboard: () => import('@/components/admin/CommercialDashboard').then(m => ({ default: m.CommercialDashboard })),
+  AdminDashboard: () => import('@/components/admin/Dashboard').then(m => ({ default: m.Dashboard })),
   TeamManager: () => import('@/components/admin/TeamManager').then(m => ({ default: m.TeamManager })),
   FinancialDashboard: () => import('@/components/admin/FinancialDashboard').then(m => ({ default: m.FinancialDashboard })),
   CalendarManager: () => import('@/components/admin/CalendarManager').then(m => ({ default: m.CalendarManager })),
