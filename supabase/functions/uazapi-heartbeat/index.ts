@@ -7,6 +7,22 @@ const corsHeaders = {
 };
 
 /**
+ * FASE 28: normaliza message_id para o "id puro" do WhatsApp.
+ * Linhas antigas de whatsapp_message_retries usam o formato composto
+ * "jid:id" (ex.: "5511...@s.whatsapp.net:3EB0..."); o provider só aceita
+ * o id puro na consulta de status.
+ */
+function normalizePureMessageId(raw: unknown): string {
+    const s = String(raw ?? "").trim();
+    if (!s) return "";
+    const lastColon = s.lastIndexOf(":");
+    if (lastColon > 0 && s.slice(0, lastColon).includes("@")) {
+        return s.slice(lastColon + 1);
+    }
+    return s;
+}
+
+/**
  * Requirement #12 & #3: DETECÇÃO DE GHOST CONNECTION
  */
 async function checkGhostConnection(supabase: any, inst: any, statusData: any, platformSettings: any) {
@@ -568,7 +584,31 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
  */
 async function processAckRetries(supabase: any, platformSettings: any) {
     const uazapiUrl = String(platformSettings?.uazapi_url || "").replace(/\/$/, "");
-    
+
+    // FASE 28: TERMINAL DELETE — linhas com retry_count >= 10 nunca mais são
+    // elegíveis (a query abaixo filtra lt 10) e ficavam presas em 'retrying'
+    // para sempre. Drena em lotes de 500 por tick para não travar o banco.
+    try {
+        const { data: exhausted } = await supabase
+            .from("whatsapp_message_retries")
+            .select("id")
+            .gte("retry_count", 10)
+            .limit(500);
+        if (exhausted && exhausted.length > 0) {
+            const { error: termErr } = await supabase
+                .from("whatsapp_message_retries")
+                .delete()
+                .in("id", exhausted.map((r: any) => r.id));
+            if (termErr) {
+                console.error("[uazapi-heartbeat] [ACK_WORKER] terminal delete failed:", termErr.message);
+            } else {
+                console.log(`[uazapi-heartbeat] [ACK_WORKER] terminal delete: ${exhausted.length} exhausted retries removed`);
+            }
+        }
+    } catch (termErr) {
+        console.error("[uazapi-heartbeat] [ACK_WORKER] terminal delete exception:", (termErr as any)?.message || termErr);
+    }
+
     const { data: retries } = await supabase
         .from("whatsapp_message_retries")
         .select("*")
@@ -602,8 +642,10 @@ async function processAckRetries(supabase: any, platformSettings: any) {
             }).catch(() => {});
 
             // 2. Consult provider for real status
+            // FASE 28: linhas antigas guardam "jid:id"; o provider só aceita o id puro.
+            const pureMessageId = normalizePureMessageId(item.message_id);
             try {
-                const statusRes = await fetch(`${uazapiUrl}/message/status?id=${item.message_id}&number=${item.remote_jid}`, {
+                const statusRes = await fetch(`${uazapiUrl}/message/status?id=${encodeURIComponent(pureMessageId)}&number=${encodeURIComponent(item.remote_jid || "")}`, {
                     headers: { "token": token }
                 });
                 if (statusRes.ok) {
@@ -613,12 +655,12 @@ async function processAckRetries(supabase: any, platformSettings: any) {
                         await supabase.from("whatsapp_message_retries").delete().eq("id", item.id);
                         await supabase.from("webchat_messages")
                             .update({ status: rawStatus === 4 || rawStatus === "read" ? "read" : "delivered" })
-                            .or(`metadata->>evolution_message_id.eq."${item.message_id}",metadata->>external_id.eq."${item.message_id}"`);
+                            .or(`metadata->>evolution_message_id.eq."${pureMessageId}",metadata->>external_id.eq."${pureMessageId}"`);
                         continue;
                     }
                 }
             } catch (statusErr) {
-                console.warn(`[uazapi-heartbeat] [ACK_WORKER] failed to query status for ${item.message_id}`, statusErr.message);
+                console.warn(`[uazapi-heartbeat] [ACK_WORKER] failed to query status for ${pureMessageId}`, statusErr.message);
             }
 
             // Update retry count

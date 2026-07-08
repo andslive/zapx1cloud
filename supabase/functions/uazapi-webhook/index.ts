@@ -215,6 +215,11 @@ async function isDuplicateInboundMessage(
   return false;
 }
 
+// [FASE 23.2] TTL do buffer de comprovante pendente (__pending_receipt_media).
+// Era 10 min hardcoded no replay; comprovante real chegou 52 min antes do bloco
+// e expirou. 60 min cobre os casos observados sem reter mídia indefinidamente.
+const PENDING_RECEIPT_MEDIA_TTL_MS = 60 * 60 * 1000;
+
 /** Tenta adquirir lock por conversa de forma ATÔMICA via RPC. Retorna true se conseguiu. */
 async function acquireConversationLock(
   supabase: any,
@@ -457,6 +462,23 @@ function normalizeInstanceName(value?: string | null) {
     .replace(/\s+/g, '')
     // Handle common typos like chipp221 -> chip221
     .replace(/^chi+p+/i, 'chip');
+}
+
+/**
+ * FASE 28: normaliza message_id para o "id puro" do WhatsApp.
+ * Linhas antigas de whatsapp_message_retries (e alguns payloads UazAPI)
+ * usam o formato composto "jid:id" (ex.: "5511...@s.whatsapp.net:3EB0...").
+ * IDs puros do WhatsApp não contêm ":" precedido de jid, então só corta
+ * quando o prefixo antes do último ":" contém "@".
+ */
+function normalizePureMessageId(raw: unknown): string {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  const lastColon = s.lastIndexOf(":");
+  if (lastColon > 0 && s.slice(0, lastColon).includes("@")) {
+    return s.slice(lastColon + 1);
+  }
+  return s;
 }
 
 function extractString(val: any): string {
@@ -986,9 +1008,45 @@ function normalizePayload(payload: any): Normalized | null {
         kind: "ack" as any,
         instance,
         messageId,
+        messageIds: [messageId],
         ack,
         remoteJid: extractString(statusData.remoteJid || statusData.key?.remoteJid || statusData.participant || ""),
       } as any;
+    }
+  }
+
+  // ---- FASE 28: UazAPI receipt ACKs (Type: Delivered/Read + MessageIDs[]) ----
+  // whatsmeow-style receipts chegam com um array de IDs por evento. Detecção
+  // por shape (MessageIDs[] + Type) porque o nome do evento varia entre
+  // versões (ReadReceipt / Receipt / messages_update).
+  {
+    const receiptData = data.event && typeof data.event === "object" ? data.event : data;
+    const rawIds = receiptData?.MessageIDs || receiptData?.messageIds || receiptData?.messageIDs;
+    if (Array.isArray(rawIds) && rawIds.length > 0) {
+      const receiptType = String(receiptData.Type ?? receiptData.type ?? "").toLowerCase();
+      // whatsmeow usa Type "" para delivered; UazAPI manda "Delivered"/"Read".
+      const ack = receiptType === "read" || receiptType === "readself" || receiptType === "played"
+        ? 4
+        : receiptType === "delivered" || receiptType === ""
+        ? 3
+        : 0;
+      if (ack > 0) {
+        const messageIds = rawIds
+          .map((id: unknown) => normalizePureMessageId(id))
+          .filter(Boolean);
+        if (messageIds.length > 0) {
+          return {
+            kind: "ack" as any,
+            instance,
+            messageId: messageIds[0],
+            messageIds,
+            ack,
+            remoteJid: extractString(
+              receiptData.Chat || receiptData.chat || receiptData.Sender || receiptData.sender || "",
+            ),
+          } as any;
+        }
+      }
     }
   }
 
@@ -1964,6 +2022,11 @@ async function sendFacebookConversion(
     fbp?: string;
     client_ip_address?: string;
     client_user_agent?: string;
+    // [FASE 24] Atribuição CTWA (Meta CAPI business messaging): vão em
+    // user_data em TEXTO PLANO (sem hash), conforme spec. custom_data.ctwa_clid
+    // é ignorado pelo matching — por isso a atribuição parava em ~74%.
+    ctwa_clid?: string;
+    page_id?: string;
   },
   customData: {
     value?: number;
@@ -2002,6 +2065,10 @@ async function sendFacebookConversion(
   if (userData.fbp) user_data.fbp = userData.fbp;
   if (userData.client_ip_address) user_data.client_ip_address = userData.client_ip_address;
   if (userData.client_user_agent) user_data.client_user_agent = userData.client_user_agent;
+  // [FASE 24] CTWA em user_data (plano, sem hash) — chave da atribuição
+  // determinística no Gerenciador para eventos de business messaging.
+  if (userData.ctwa_clid) user_data.ctwa_clid = userData.ctwa_clid;
+  if (userData.page_id) user_data.page_id = userData.page_id;
 
   const custom_data: any = {};
   if (customData.value !== undefined) custom_data.value = customData.value;
@@ -2023,30 +2090,31 @@ async function sendFacebookConversion(
   const event_id = options?.eventId || `capi_${crypto.randomUUID()}`;
   const action_source = options?.actionSource || "system_generated";
 
-  const payload: any = {
-    data: [
-      {
-        event_name: eventName,
-        event_time: Math.floor(Date.now() / 1000),
-        event_id,
-        action_source,
-        user_data,
-        custom_data,
-      },
-    ],
+  const eventBody: any = {
+    event_name: eventName,
+    event_time: Math.floor(Date.now() / 1000),
+    event_id,
+    action_source,
+    user_data,
+    custom_data,
   };
+  // [FASE 24] Spec de business messaging exige o canal no nível do evento.
+  if (action_source === "business_messaging") {
+    eventBody.messaging_channel = "whatsapp";
+  }
+
+  const payload: any = { data: [eventBody] };
 
   if (options?.testEventCode) {
     payload.test_event_code = options.testEventCode;
   }
 
-  try {
+  const doPost = async (body: any) => {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
     });
-
     const respText = await response.text();
     let respData: any = {};
     try {
@@ -2054,13 +2122,50 @@ async function sendFacebookConversion(
     } catch {
       respData = { raw: respText };
     }
+    return { ok: response.ok, respData, respText };
+  };
 
-    if (!response.ok) {
-      console.error("[facebook-pixel] API error:", respText);
-      return { success: false, payload, response: respData };
+  try {
+    const first = await doPost(payload);
+    if (first.ok) {
+      console.log("[facebook-pixel] Event sent:", eventName, "action_source:", action_source, "ctwa_clid:", user_data.ctwa_clid ? "yes" : "no");
+      return { success: true, payload, response: first.respData };
     }
-    console.log("[facebook-pixel] Event sent:", eventName, "action_source:", action_source, "ctwa_clid:", customData.ctwa_clid ? "yes" : "no");
-    return { success: true, payload, response: respData };
+    console.error("[facebook-pixel] API error:", first.respText);
+
+    // [FASE 24] Fallback de segurança: se o formato business_messaging for
+    // rejeitado pelo Graph (ex.: ctwa_clid expirado/inválido, page_id não
+    // vinculado ao dataset), reenvia UMA vez no formato legado ("chat",
+    // sem ctwa/page em user_data), com o MESMO event_id — garante que a
+    // compra nunca deixe de ser contabilizada por causa da atribuição.
+    if (action_source === "business_messaging") {
+      const legacyUserData: any = { ...user_data };
+      delete legacyUserData.ctwa_clid;
+      delete legacyUserData.page_id;
+      const legacyPayload: any = {
+        data: [{
+          event_name: eventName,
+          event_time: Math.floor(Date.now() / 1000),
+          event_id,
+          action_source: "chat",
+          user_data: legacyUserData,
+          custom_data,
+        }],
+      };
+      if (options?.testEventCode) {
+        legacyPayload.test_event_code = options.testEventCode;
+      }
+      console.warn("[facebook-pixel] business_messaging_rejected_fallback_chat", JSON.stringify({ event_id, first_error: first.respData?.error?.message || null }));
+      const second = await doPost(legacyPayload);
+      if (second.ok) {
+        console.log("[facebook-pixel] Event sent (fallback chat):", eventName, "event_id:", event_id);
+        return { success: true, payload: legacyPayload, response: { ...second.respData, fallback_used: "chat", first_error: first.respData?.error || null } };
+      }
+      console.error("[facebook-pixel] fallback API error:", second.respText);
+      return { success: false, payload: legacyPayload, response: second.respData };
+    }
+
+    return { success: false, payload, response: first.respData };
   } catch (e) {
     console.error("[facebook-pixel] fetch exception:", e);
     return { success: false, payload, error: String(e) };
@@ -2266,43 +2371,90 @@ Deno.serve(async (req) => {
       } catch (e) {
         console.warn("[uazapi-webhook] payload dump error:", e);
       }
-
-      // 3. PROCESSAR EVENTOS DE ACK
-      if (norm && (norm as any).kind === "ack") {
-        const ackEvent = norm as any;
-        console.log(`[uazapi-webhook] processing ack for message ${ackEvent.messageId}: ${ackEvent.ack}`);
-        
-        // Atualizar status na tabela processed_messages
-        await supabase.from("processed_messages")
-          .update({ 
-            ack: ackEvent.ack, 
-            ack_at: new Date().toISOString() 
-          })
-          .eq("message_id", ackEvent.messageId);
-
-        // Remover do controle de retentativas se entregue ou lido
-        if (ackEvent.ack >= 3) {
-          await supabase.from("whatsapp_message_retries")
-            .delete()
-            .eq("message_id", ackEvent.messageId);
-            
-          // Atualizar status na webchat_messages para refletir no UI
-          await supabase.from("webchat_messages")
-            .update({ 
-              status: ackEvent.ack === 4 ? "read" : "delivered",
-              delivered_at: ackEvent.ack >= 3 ? new Date().toISOString() : null,
-              read_at: ackEvent.ack === 4 ? new Date().toISOString() : null
-            })
-            .or(`metadata->>evolution_message_id.eq."${ackEvent.messageId}",metadata->>external_id.eq."${ackEvent.messageId}"`);
-        }
-        
-        return new Response(JSON.stringify({ ok: true, task: "ack_processed" }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
     }
 
-    
+    // 3. PROCESSAR EVENTOS DE ACK
+    // FASE 28: fora do gate rawEvent === "messages" — receipts UazAPI
+    // (Delivered/Read + MessageIDs[]) chegam com outros nomes de evento.
+    if (norm && (norm as any).kind === "ack") {
+      const ackEvent = norm as any;
+      const ackIds: string[] = (
+        Array.isArray(ackEvent.messageIds) && ackEvent.messageIds.length > 0
+          ? ackEvent.messageIds
+          : [ackEvent.messageId]
+      )
+        .map((id: unknown) => normalizePureMessageId(id))
+        .filter(Boolean);
+
+      console.log(
+        `[uazapi-webhook] processing ack ${ackEvent.ack} for ${ackIds.length} message(s):`,
+        ackIds.join(","),
+      );
+
+      for (const ackId of ackIds) {
+        // Tolerante: falha em um ID não pode travar os demais nem o webhook.
+        try {
+          // Atualizar status na tabela processed_messages
+          await supabase.from("processed_messages")
+            .update({
+              ack: ackEvent.ack,
+              ack_at: new Date().toISOString(),
+            })
+            .eq("message_id", ackId);
+
+          // Remover do controle de retentativas se entregue ou lido
+          if (ackEvent.ack >= 3) {
+            const { error: delErr } = await supabase.from("whatsapp_message_retries")
+              .delete()
+              .eq("message_id", ackId);
+            if (delErr) {
+              console.warn(`[uazapi-webhook] retry delete failed for ${ackId}:`, delErr.message);
+            }
+
+            // COMPAT TEMPORÁRIA (FASE 28): linhas antigas gravadas como
+            // "jid:id". Remover este LIKE após a fila legada drenar.
+            // Hardening: só roda o LIKE com id de charset seguro — "%" no
+            // padrão faria o LIKE casar (e apagar) linhas de outras
+            // mensagens. Id fora do padrão fica só com o DELETE por
+            // igualdade acima. "_" é permitido mas escapado (curinga LIKE).
+            if (/^[A-Za-z0-9=_-]+$/.test(ackId)) {
+              const { error: legacyDelErr } = await supabase.from("whatsapp_message_retries")
+                .delete()
+                .like("message_id", `%:${ackId.replace(/_/g, "\\_")}`);
+              if (legacyDelErr) {
+                console.warn(`[uazapi-webhook] legacy retry delete failed for ${ackId}:`, legacyDelErr.message);
+              }
+            } else {
+              console.warn(`[uazapi-webhook] legacy LIKE skipped for unsafe ackId: ${JSON.stringify(ackId).slice(0, 80)}`);
+            }
+
+            // Atualizar status na webchat_messages para refletir no UI.
+            // FASE 28.1: só a coluna status — delivered_at/read_at não
+            // existem na tabela e faziam o UPDATE inteiro falhar em silêncio.
+            const { error: uiErr } = await supabase.from("webchat_messages")
+              .update({
+                status: ackEvent.ack === 4 ? "read" : "delivered",
+              })
+              .or(`metadata->>evolution_message_id.eq."${ackId}",metadata->>external_id.eq."${ackId}"`);
+            if (uiErr) {
+              console.warn(`[uazapi-webhook] webchat status update failed for ${ackId}:`, uiErr.message);
+            }
+          }
+        } catch (ackErr) {
+          console.warn(
+            `[uazapi-webhook] ack handling failed for ${ackId}:`,
+            (ackErr as any)?.message || ackErr,
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({ ok: true, task: "ack_processed", count: ackIds.length }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+
     // 2. ATUALIZAR STATUS DO LOG (LEAD RESOLVED/RECEIVED)
     if (logRecordId) {
       try {
@@ -4652,6 +4804,116 @@ Deno.serve(async (req) => {
         );
       }
 
+      // ───────────────────────────────────────────────────────────────
+      // [AI_RECEIPT_PENDING_MEDIA v2 — FASE 23.2] Buffer de comprovante
+      // ANTES do grouping e do lock de conversa. A invocação de uma mídia
+      // pode ser descartada pelo grouping (o texto seguinte assume o turno,
+      // return "debounced" abaixo) ou pelo lock ("conversation_locked") —
+      // e nesses retornos o save antigo (pós-lock) nunca rodava, perdendo
+      // o comprovante. Também salva quando a conversa JÁ está no bloco
+      // ai_receipt (o guard notYetAtAiReceipt do save antigo descartava
+      // exatamente os comprovantes enviados na hora certa). Persiste o
+      // texto OCR já extraído acima (processedContent) para o replay do
+      // bloco reconhecer sem precisar re-baixar a mídia.
+      // Substitui o buffer antigo pós-lock (removido).
+      // ───────────────────────────────────────────────────────────────
+      try {
+        const RECEIPT_MIME_ALLOWLIST = new Set([
+          "application/pdf",
+          "image/jpeg",
+          "image/jpg",
+          "image/png",
+        ]);
+        const _normAny: any = norm as any;
+        const isInboundLead = _normAny?.kind === "message" &&
+          _normAny?.fromMe === false &&
+          (_normAny?.direction === "inbound" || !_normAny?.direction) &&
+          (_normAny?.senderType === "visitor" || !_normAny?.senderType);
+        const mediaType = _normAny?.media?.type || null;
+        const mediaMime = String(
+          _normAny?.media?.mime || _normAny?.media?.mimetype || "",
+        ).toLowerCase().split(";")[0].trim();
+        const mediaUrl = _normAny?.media?.url || null;
+        const isReceiptCandidate = isInboundLead &&
+          !!_normAny?.media &&
+          (mediaType === "document" || mediaType === "image") &&
+          RECEIPT_MIME_ALLOWLIST.has(mediaMime) &&
+          !!mediaUrl;
+
+        if (isReceiptCandidate && conversationId) {
+          const { data: _convRow } = await supabase
+            .from("webchat_conversations")
+            .select("flow_variables, flow_completed, status, current_flow_id")
+            .eq("id", conversationId)
+            .maybeSingle();
+          const convActive = !!_convRow &&
+            !(_convRow as any).flow_completed &&
+            (_convRow as any).status !== "closed" &&
+            !!(_convRow as any).current_flow_id;
+          if (convActive) {
+            const flowVarsExisting: any = (_convRow as any).flow_variables ||
+              {};
+            // OCR real ≥ 40 chars úteis; placeholders curtos do pipeline
+            // ("📎 [Documento recebido]", "🖼️ [Imagem: erro]" etc.) NÃO são
+            // gravados — replay com placeholder não reconhece nada.
+            const _ocrText =
+              (typeof processedContent === "string" &&
+                  processedContent.trim().length >= 40 &&
+                  processedContent !== _normAny?.content)
+                ? processedContent.slice(0, 2000)
+                : null;
+            // URL pública do Storage (mediaMeta.url) quando disponível: a
+            // norm.media.url original pode ser a criptografada do WhatsApp,
+            // que o fetch do bloco ai_receipt pula (isWhatsappEncryptedUrl).
+            const _publicUrl =
+              (mediaMeta?.url && !isWhatsappEncryptedUrl(mediaMeta.url))
+                ? mediaMeta.url
+                : mediaUrl;
+            // rawMessage habilita o fallback downloadMediaBase64 do bloco
+            // quando não há OCR nem URL pública utilizável (cap de tamanho
+            // p/ não inflar flow_variables).
+            let _rawMessage: any = null;
+            try {
+              const _rm = _normAny?.media?.rawMessage;
+              if (_rm && JSON.stringify(_rm).length <= 20000) _rawMessage = _rm;
+            } catch (_) { /* noop */ }
+            const pendingPayload = {
+              url: _publicUrl,
+              mime: mediaMime,
+              type: mediaType,
+              message_id: _normAny?.messageId || null,
+              received_at: new Date().toISOString(),
+              ocr_text: _ocrText,
+              raw_message: _rawMessage,
+              original_text_preview: typeof _normAny?.content === "string"
+                ? String(_normAny.content).slice(0, 200)
+                : null,
+            };
+            flowVarsExisting.__pending_receipt_media = pendingPayload;
+            await supabase
+              .from("webchat_conversations")
+              .update({ flow_variables: flowVarsExisting })
+              .eq("id", conversationId);
+            console.log(
+              "[AI_RECEIPT_PENDING_MEDIA_SAVED_V2]",
+              JSON.stringify({
+                conversation_id: conversationId,
+                type: mediaType,
+                mime: mediaMime,
+                message_id: pendingPayload.message_id,
+                has_ocr_text: !!_ocrText,
+                ocr_len: _ocrText ? _ocrText.length : 0,
+              }),
+            );
+          }
+        }
+      } catch (pendingErr) {
+        console.warn(
+          "[AI_RECEIPT_PENDING_MEDIA_SAVE_V2_FAILED]",
+          String(pendingErr),
+        );
+      }
+
       // ============================================================
       // BUFFER CURTO (humanização sem queimar tempo)
       // ============================================================
@@ -4911,85 +5173,10 @@ Deno.serve(async (req) => {
 
           let currentBlock: any = findBlock((conv as any).current_block_id);
 
-          // ───────────────────────────────────────────────────────────────
-          // [AI_RECEIPT_PENDING_MEDIA] Buffer de mídia pré-ai_receipt
-          // Persiste comprovantes (PDF/imagem) enviados ANTES do flow
-          // chegar no bloco ai_receipt, para replay posterior.
-          // NÃO afeta texto, áudio, OCR, Pixel, Purchase ou debounce.
-          // ───────────────────────────────────────────────────────────────
-          try {
-            const hasAiReceiptInFunnel = blocks.some(
-              (b: any) => String(b?.type || "").toLowerCase() === "ai_receipt",
-            );
-            // [COMPROVANTE_UNSUPPORTED_MEDIA_IGNORED] image/webp removido
-            // intencionalmente: figurinhas WhatsApp chegam como image/webp
-            // sem caption e contaminavam o pipeline de comprovante. Mantemos
-            // somente formatos comprovadamente válidos para Pix/recibo.
-            const RECEIPT_MIME_ALLOWLIST = new Set([
-              "application/pdf",
-              "image/jpeg",
-              "image/jpg",
-              "image/png",
-            ]);
-            const _normAny: any = norm as any;
-            const isInboundLead = _normAny?.kind === "message" &&
-              _normAny?.fromMe === false &&
-              (_normAny?.direction === "inbound" || !_normAny?.direction) &&
-              (_normAny?.senderType === "visitor" || !_normAny?.senderType);
-            const mediaType = _normAny?.media?.type || null;
-            const mediaMime = String(
-              _normAny?.media?.mime || _normAny?.media?.mimetype || "",
-            ).toLowerCase().split(";")[0].trim();
-            const mediaUrl = _normAny?.media?.url || null;
-            const isReceiptCandidate = isInboundLead &&
-              !!_normAny?.media &&
-              (mediaType === "document" || mediaType === "image") &&
-              RECEIPT_MIME_ALLOWLIST.has(mediaMime) &&
-              !!mediaUrl;
-            const convActive = !(conv as any)?.flow_completed &&
-              (conv as any)?.status !== "closed";
-            const notYetAtAiReceipt =
-              String(currentBlock?.type || "").toLowerCase() !== "ai_receipt";
-
-            if (
-              hasAiReceiptInFunnel && isReceiptCandidate && convActive &&
-              notYetAtAiReceipt
-            ) {
-              const flowVarsExisting: any =
-                (conv as any)?.flow_variables || {};
-              const pendingPayload = {
-                url: mediaUrl,
-                mime: mediaMime,
-                type: mediaType,
-                message_id: _normAny?.messageId || null,
-                received_at: new Date().toISOString(),
-                original_text_preview:
-                  typeof _normAny?.content === "string"
-                    ? String(_normAny.content).slice(0, 200)
-                    : null,
-              };
-              flowVarsExisting.__pending_receipt_media = pendingPayload;
-              (conv as any).flow_variables = flowVarsExisting;
-              await supabase
-                .from("webchat_conversations")
-                .update({ flow_variables: flowVarsExisting })
-                .eq("id", conversationId);
-              console.log(
-                "[AI_RECEIPT_PENDING_MEDIA_SAVED]",
-                JSON.stringify({
-                  conversation_id: conversationId,
-                  current_block_id: (conv as any).current_block_id,
-                  current_block_type: currentBlock?.type || null,
-                  media: pendingPayload,
-                }),
-              );
-            }
-          } catch (pendingErr) {
-            console.warn(
-              "[AI_RECEIPT_PENDING_MEDIA_SAVE_FAILED]",
-              String(pendingErr),
-            );
-          }
+          // [AI_RECEIPT_PENDING_MEDIA — FASE 23.2] O buffer de comprovante
+          // agora é salvo ANTES do grouping/lock (v2, mais acima), pois os
+          // returns de defer ("debounced") e de lock ("conversation_locked")
+          // impediam este ponto de rodar e o comprovante era perdido.
 
           // Refined lock check for funnels (smart pause / timeout)
           if (conv?.bot_locked_until && !(payload as any).__is_resume) {
@@ -5176,6 +5363,9 @@ Deno.serve(async (req) => {
               /{{lead_name}}/g,
               (conv as any).contact_name || "",
             );
+            // [FIX 18/18.1] Nunca vazar placeholders não resolvidos ({{ai.response}} etc.)
+            // ao usuário: qualquer {{token}} restante vira string vazia.
+            result = result.replace(/{{\s*[\w.]+\s*}}/g, "");
             return result;
           };
 
@@ -6227,7 +6417,7 @@ Mensagem do lead:
                     }
 
                     // 2. Find integration
-                    let query = supabase.from("facebook_lead_integrations").select("pixel_id, pixel_access_token").eq("is_active", true);
+                    let query = supabase.from("facebook_lead_integrations").select("pixel_id, pixel_access_token, page_id").eq("is_active", true);
                     if (pageId) {
                       query = query.eq("page_id", pageId);
                     } else if (blockPixelId) {
@@ -6307,9 +6497,14 @@ Mensagem do lead:
                       const creationTime = leadCreatedAt ? new Date(leadCreatedAt).getTime() : Date.now();
                       const fbc = fbclid ? `fb.1.${creationTime}.${fbclid}` : undefined;
 
-                      // CTWA evidence → action_source = "chat" (Meta's recommended value for WhatsApp Business)
+                      // [FASE 24] Com ctwa_clid → "business_messaging" + user_data.ctwa_clid
+                      // + page_id + messaging_channel (spec CAPI p/ CTWA; atribuição
+                      // determinística no Gerenciador). Sem ctwa_clid → comportamento
+                      // anterior (chat/system_generated, matching por telefone).
                       const isCtwa = !!(ctwa_clid || convCtwa.ctwa_payload || entry_point_conversion_source === "ctwa_ad" || leadRow?.ctwa_detected);
-                      const action_source = isCtwa ? "chat" : "system_generated";
+                      const action_source = ctwa_clid
+                        ? "business_messaging"
+                        : (isCtwa ? "chat" : "system_generated");
 
                       console.log(`[pixel_attribution_resolved] ctwa_clid=${ctwa_clid || "-"} ad_source_id=${ad_source_id || "-"} action_source=${action_source} sources={fv:${!!fv.ctwa_clid},conv:${!!convCtwa.ctwa_clid},lt:${!!lt?.ctwa_clid},lead:${!!leadRow?.ctwa_clid}}`);
 
@@ -6326,6 +6521,9 @@ Mensagem do lead:
                           fbp,
                           client_ip_address,
                           client_user_agent,
+                          // [FASE 24] atribuição CTWA no user_data (texto plano)
+                          ctwa_clid,
+                          page_id: (integ as any)?.page_id || undefined,
                         },
                         {
                           value: isNaN(numericValue) ? undefined : numericValue,
@@ -6711,6 +6909,138 @@ Mensagem do lead:
               }
               case "ai_receipt": {
                 // ─────────────────────────────────────────────────────────
+                // [FASE 27] Hardening do parser de valores. Helpers usados
+                // pelos 3 caminhos que gravam valorcomprovante (VPS2,
+                // determinístico, IA). Valor acima do limite passa por
+                // releitura; se irresolvível e houver valores aceitos, cai
+                // no menor valor aceito — nunca envia valor absurdo à Meta.
+                // ─────────────────────────────────────────────────────────
+                const _parseBRLNumbers = (txt: string): number[] => {
+                  const out: number[] = [];
+                  const re = /R\$\s*([0-9]+(?:\.[0-9]{3})*(?:[.,][0-9]{1,2})?)/g;
+                  let m: RegExpExecArray | null;
+                  while ((m = re.exec(txt || ""))) {
+                    let raw = m[1];
+                    if (raw.includes(",") && raw.includes(".")) raw = raw.replace(/\./g, "").replace(",", ".");
+                    else if (raw.includes(",")) raw = raw.replace(",", ".");
+                    const v = parseFloat(raw);
+                    if (Number.isFinite(v) && v > 0) out.push(Number(v.toFixed(2)));
+                  }
+                  return Array.from(new Set(out));
+                };
+                const _receiptAcceptedValues: number[] = (() => {
+                  let acc: number[] = [];
+                  const _accRaw: any = b.data?.accepted_values;
+                  if (Array.isArray(_accRaw)) {
+                    acc = _accRaw
+                      .map((v: any) => parseFloat(String(v).replace(",", ".")))
+                      .filter((n: number) => Number.isFinite(n) && n > 0)
+                      .map((n: number) => Number(n.toFixed(2)));
+                  }
+                  if (acc.length === 0 && b.data?.expected_value != null) {
+                    const ev = parseFloat(String(b.data.expected_value).replace(",", "."));
+                    if (Number.isFinite(ev) && ev > 0) acc = [Number(ev.toFixed(2))];
+                  }
+                  if (acc.length === 0 && typeof b.data?.receipt_prompt === "string") {
+                    acc = _parseBRLNumbers(b.data.receipt_prompt);
+                  }
+                  return acc;
+                })();
+                const HIGH_VALUE_THRESHOLD =
+                  Number(b.data?.high_value_threshold) > 0
+                    ? Number(b.data.high_value_threshold)
+                    : 100;
+                const reprocessHighAmount = (
+                  firstAmount: number,
+                  rawAmountText: string,
+                  ocrText: string,
+                  acceptedValues: number[],
+                  amountSource: "vps" | "deterministic_parser" | "ai",
+                ) => {
+                  const out = {
+                    amount: firstAmount,
+                    high_value_reprocessed: false,
+                    resolved: true,
+                    first_amount: firstAmount,
+                    second_amount: null as number | null,
+                    raw_amount_text: rawAmountText,
+                    amount_source: amountSource,
+                    amount_correction_reason: null as string | null,
+                    reprocess_reason: null as string | null,
+                  };
+                  if (!(firstAmount > HIGH_VALUE_THRESHOLD)) return out;
+                  out.high_value_reprocessed = true;
+                  out.reprocess_reason = "amount_above_threshold";
+
+                  // Passo 1 — prioridade absoluta: padrões explícitos
+                  // "R$ xx,xx" (vírgula decimal) no OCR completo.
+                  const explicit: number[] = [];
+                  const re = /R\$\s*(\d{1,3}(?:\.\d{3})*,\d{2})\b/g;
+                  let m: RegExpExecArray | null;
+                  while ((m = re.exec(ocrText || ""))) {
+                    const v = parseFloat(m[1].replace(/\./g, "").replace(",", "."));
+                    if (Number.isFinite(v) && v > 0 && v <= HIGH_VALUE_THRESHOLD) explicit.push(v);
+                  }
+                  const pick =
+                    explicit.find((v) => acceptedValues.some((a) => Math.abs(a - v) <= 0.01)) ??
+                    explicit.find((v) => Math.abs(v * 100 - firstAmount) <= 1) ??
+                    (new Set(explicit).size === 1 ? explicit[0] : undefined);
+
+                  // Passo 2 — heurística ÷100 contra a lista de valores aceitos.
+                  const div100 = Number((firstAmount / 100).toFixed(2));
+                  const second = pick ??
+                    (acceptedValues.some((a) => Math.abs(a - div100) <= 0.01) ? div100 : undefined);
+
+                  if (second !== undefined) {
+                    out.amount = Number(second.toFixed(2));
+                    out.second_amount = out.amount;
+                    out.amount_correction_reason = pick !== undefined
+                      ? "explicit_brl_pattern"
+                      : "divided_by_100_matches_accepted";
+                  } else if (acceptedValues.length > 0) {
+                    // Releitura não resolveu: fallback seguro para o menor
+                    // valor aceito do bloco — jamais o valor absurdo.
+                    out.amount = Number(Math.min(...acceptedValues).toFixed(2));
+                    out.second_amount = out.amount;
+                    out.resolved = false;
+                    out.amount_correction_reason = "fallback_to_expected_amount";
+                  } else {
+                    out.resolved = false; // irresolvível sem lista: mantém e audita
+                  }
+                  return out;
+                };
+                const _auditHighValue = async (corr: any) => {
+                  try {
+                    console.log("[AI_RECEIPT_HIGH_VALUE_REPROCESSED]", JSON.stringify({
+                      conversation_id: conversationId,
+                      block_id: b.id,
+                      ...corr,
+                    }));
+                    await supabase.from("ai_receipt_audits").insert({
+                      conversation_id: conversationId,
+                      lead_id: (conv as any).lead_id || null,
+                      organization_id: (conv as any).organization_id || null,
+                      funnel_id: (conv as any).current_flow_id || null,
+                      block_id: b.id,
+                      message_id: ((norm as any)?.messageId as string) || null,
+                      source: corr.amount_source,
+                      decision: "high_value_reprocessed",
+                      value: Number(corr.amount).toFixed(2),
+                      metadata: {
+                        high_value_reprocessed: true,
+                        first_amount: corr.first_amount,
+                        second_amount: corr.second_amount,
+                        raw_amount_text: String(corr.raw_amount_text || "").slice(0, 80),
+                        amount_source: corr.amount_source,
+                        amount_correction_reason: corr.amount_correction_reason,
+                        reprocess_reason: corr.reprocess_reason,
+                        resolved: corr.resolved,
+                        threshold: HIGH_VALUE_THRESHOLD,
+                      },
+                    });
+                  } catch (_hvErr) { /* best-effort */ }
+                };
+                // ─────────────────────────────────────────────────────────
                 // Fase G.1 — Curto-circuito controlado: consumir resultado
                 // oficial da VPS2 (tabela vps_receipt_results). Triplo guard:
                 // flag global + allowlist de instância + allowlist de funil.
@@ -6760,9 +7090,23 @@ Mensagem do lead:
                       const _valueVar =
                         b.data?.receipt_value_var || "valorcomprovante";
                       const _vpsName = (_vps.customer_name ?? "").toString().trim();
-                      const _vpsAmount = _vps.amount != null
+                      let _vpsAmount = _vps.amount != null
                         ? Number(_vps.amount)
                         : null;
+                      // [FASE 27] Releitura de valor alto antes de gravar.
+                      if (_vpsAmount != null && !Number.isNaN(_vpsAmount)) {
+                        const _hvOcr = [processedContent, (norm as any)?.content]
+                          .filter((p) => typeof p === "string" && p.trim().length > 0 && !p.trim().startsWith("{"))
+                          .join("\n");
+                        const _corr = reprocessHighAmount(
+                          _vpsAmount, String(_vps.amount), _hvOcr,
+                          _receiptAcceptedValues, "vps",
+                        );
+                        if (_corr.high_value_reprocessed) {
+                          _vpsAmount = _corr.amount;
+                          await _auditHighValue(_corr);
+                        }
+                      }
                       const _vpsValueStr = _vpsAmount != null && !Number.isNaN(_vpsAmount)
                         ? _vpsAmount.toFixed(2)
                         : "";
@@ -6867,8 +7211,11 @@ Mensagem do lead:
                 // [AI_RECEIPT_PENDING_MEDIA_REPLAY] Recupera comprovante
                 // enviado pelo lead ANTES do flow chegar aqui.
                 // Se a mensagem atual não trouxe mídia mas o buffer tem
-                // um PDF/imagem válido (<10 min), reinjeta em norm.media
-                // para que a recognition pipeline normal o processe.
+                // um PDF/imagem válido (< PENDING_RECEIPT_MEDIA_TTL_MS),
+                // reinjeta em norm.media E injeta o texto OCR salvo em
+                // processedContent — sem isso o bloco processava só o
+                // texto do gatilho e o comprovante nunca era lido
+                // ([FASE 23.2]: replays com OCR = "Vc recebeu?").
                 // ───────────────────────────────────────────────────────
                 let _replayedFromPending = false;
                 try {
@@ -6878,20 +7225,34 @@ Mensagem do lead:
                   if (pending && pending.url && !hasIncomingMedia) {
                     const ageMs = Date.now() -
                       new Date(pending.received_at || 0).getTime();
-                    if (ageMs >= 0 && ageMs <= 10 * 60 * 1000) {
+                    if (ageMs >= 0 && ageMs <= PENDING_RECEIPT_MEDIA_TTL_MS) {
                       (norm as any).media = {
                         type: pending.type || "document",
                         url: pending.url,
                         mime: pending.mime,
                         caption: "",
                         needsDownload: false,
+                        // [FASE 23.2] rawMessage/messageId habilitam o
+                        // fallback downloadMediaBase64 do bloco quando não
+                        // há ocr_text nem URL pública utilizável.
+                        rawMessage: pending.raw_message || undefined,
+                        messageId: pending.message_id || undefined,
                       };
+                      // [FASE 23.2] OCR do comprovante salvo no buffer →
+                      // alimenta o extrator determinístico e o prompt da IA.
+                      if (
+                        typeof pending.ocr_text === "string" &&
+                        pending.ocr_text.trim().length > 0
+                      ) {
+                        processedContent = pending.ocr_text;
+                      }
                       _replayedFromPending = true;
                       console.log("[AI_RECEIPT_PENDING_MEDIA_REPLAY]",
                         JSON.stringify({
                           conversation_id: conversationId,
                           block_id: b.id,
                           age_ms: ageMs,
+                          has_ocr_text: !!pending.ocr_text,
                           media: pending,
                         }));
                     } else {
@@ -7314,6 +7675,47 @@ Mensagem do lead:
                   } catch (_auditErr) { /* best-effort */ }
                 };
 
+                // [AI_RECEIPT_ENTER_DEDUP — FASE 23.2] Guard anti-loop: a
+                // MESMA mensagem não pode reprocessar este bloco em janela
+                // curta (caso real: 101 ai_receipt_enter em 45s vindos de 3
+                // message_ids). Comprovante novo = message_id novo → passa.
+                // Fail-open: erro na consulta não bloqueia o fluxo.
+                const _enterMsgId: string | null =
+                  ((norm as any)?.messageId as string) || null;
+                if (_enterMsgId && !_replayedFromPending) {
+                  let _enterDup = false;
+                  try {
+                    const _dupSince = new Date(Date.now() - 60_000)
+                      .toISOString();
+                    const { data: _dupRows } = await supabase
+                      .from("ai_receipt_audits")
+                      .select("id")
+                      .eq("conversation_id", conversationId)
+                      .eq("block_id", b.id)
+                      .eq("message_id", _enterMsgId)
+                      .eq("decision", "ai_receipt_enter")
+                      .gte("created_at", _dupSince)
+                      .limit(1);
+                    _enterDup = !!(_dupRows && _dupRows.length > 0);
+                  } catch (_dedupErr) { /* fail-open */ }
+                  if (_enterDup) {
+                    console.log(
+                      "[AI_RECEIPT_ENTER_DUPLICATE_SKIPPED]",
+                      JSON.stringify({
+                        conversation_id: conversationId,
+                        block_id: b.id,
+                        message_id: _enterMsgId,
+                      }),
+                    );
+                    // Mesmo idioma do deterministic_dedup_blocked: fica no
+                    // bloco, não chama IA, não avança, não responde.
+                    nextBlockId = b.id;
+                    currentBlock = null;
+                    safety = 1000;
+                    break;
+                  }
+                }
+
                 await _auditReceipt({
                   source: "enter",
                   decision: "ai_receipt_enter",
@@ -7339,36 +7741,9 @@ Mensagem do lead:
                     _curText.length > 0 && _curText.length <= 25 &&
                     _shortAckRe.test(_curText) && !_extSignalsRe.test(_curText);
 
-                  // Lista de valores aceitos: prioriza config do bloco, depois
-                  // parsing dos R$ X,XX do receipt_prompt.
-                  const _parseBRLNumbers = (txt: string): number[] => {
-                    const out: number[] = [];
-                    const re = /R\$\s*([0-9]+(?:\.[0-9]{3})*(?:[.,][0-9]{1,2})?)/g;
-                    let m: RegExpExecArray | null;
-                    while ((m = re.exec(txt || ""))) {
-                      let raw = m[1];
-                      if (raw.includes(",") && raw.includes(".")) raw = raw.replace(/\./g, "").replace(",", ".");
-                      else if (raw.includes(",")) raw = raw.replace(",", ".");
-                      const v = parseFloat(raw);
-                      if (Number.isFinite(v) && v > 0) out.push(Number(v.toFixed(2)));
-                    }
-                    return Array.from(new Set(out));
-                  };
-                  let _acceptedValues: number[] = [];
-                  const _accRaw: any = b.data?.accepted_values;
-                  if (Array.isArray(_accRaw)) {
-                    _acceptedValues = _accRaw
-                      .map((v: any) => parseFloat(String(v).replace(",", ".")))
-                      .filter((n: number) => Number.isFinite(n) && n > 0)
-                      .map((n: number) => Number(n.toFixed(2)));
-                  }
-                  if (_acceptedValues.length === 0 && b.data?.expected_value != null) {
-                    const ev = parseFloat(String(b.data.expected_value).replace(",", "."));
-                    if (Number.isFinite(ev) && ev > 0) _acceptedValues = [Number(ev.toFixed(2))];
-                  }
-                  if (_acceptedValues.length === 0 && typeof b.data?.receipt_prompt === "string") {
-                    _acceptedValues = _parseBRLNumbers(b.data.receipt_prompt);
-                  }
+                  // Lista de valores aceitos: calculada uma única vez no topo
+                  // do case (FASE 27) e compartilhada pelos 3 caminhos.
+                  const _acceptedValues: number[] = _receiptAcceptedValues;
 
                   if (_hasSignals && _detName.length >= 3 && Number.isFinite(_detVal) && _detVal > 0) {
                     await _auditReceipt({
@@ -7391,19 +7766,33 @@ Mensagem do lead:
                       });
                       // Segue para o fluxo IA normal abaixo (não força break).
                     } else {
+                      // [FASE 27] Releitura de valor alto ANTES de aceitar:
+                      // corrige vírgula perdida (990 → 9,90) ou cai no menor
+                      // valor aceito. É o valor final que segue para
+                      // flowVariables, lead e Meta.
+                      const _hvCorr = reprocessHighAmount(
+                        _detVal,
+                        String(deterministicExtraction.raw_value || ""),
+                        _ocrText,
+                        _acceptedValues,
+                        "deterministic_parser",
+                      );
+                      const _detValFinal = _hvCorr.amount;
+                      if (_hvCorr.high_value_reprocessed) await _auditHighValue(_hvCorr);
+
                       // [FIX pague-o-que-puder] Aceitar QUALQUER valor positivo desde que
                       // haja evidências de comprovante + nome (>=3) + valor > 0. A lista
                       // accepted_values é apenas informativa e não bloqueia rota verde.
                       const _matched = _acceptedValues.length === 0
                         ? null
-                        : _acceptedValues.find((av) => Math.abs(av - _detVal) <= 0.01);
+                        : _acceptedValues.find((av) => Math.abs(av - _detValFinal) <= 0.01);
 
                       console.log("[DEPLOY_MARKER_ANY_AMOUNT_ACTIVE]", { build: "6f860259", ts: new Date().toISOString() });
                       console.log("[AI_RECEIPT_VALUE_ACCEPTED_ANY_AMOUNT]", {
-                        value: _detVal, accepted_values: _acceptedValues, matched_value: _matched,
+                        value: _detValFinal, accepted_values: _acceptedValues, matched_value: _matched,
                       });
                       await _auditReceipt({
-                        source: "deterministic", identified: true, name: _detName, value: _detVal.toFixed(2),
+                        source: "deterministic", identified: true, name: _detName, value: _detValFinal.toFixed(2),
                         route: "info", decision: "receipt_value_accepted_any_amount",
                         metadata: { accepted_values: _acceptedValues, matched_value: _matched },
                       });
@@ -7425,7 +7814,7 @@ Mensagem do lead:
                         if (_dup) {
                           console.log("[AI_RECEIPT_DETERMINISTIC_DEDUP_BLOCKED]", { key: _detKey });
                           await _auditReceipt({
-                            source: "deterministic", identified: true, name: _detName, value: _detVal.toFixed(2),
+                            source: "deterministic", identified: true, name: _detName, value: _detValFinal.toFixed(2),
                             route: "none", decision: "deterministic_dedup_blocked",
                             metadata: { ocr_hash: _ocrHash },
                           });
@@ -7439,7 +7828,7 @@ Mensagem do lead:
 
                         const _nameVar = b.data?.receipt_name_var || "nomecomprovante";
                         const _valueVar = b.data?.receipt_value_var || "valorcomprovante";
-                        const _finalValue = _detVal.toFixed(2);
+                        const _finalValue = _detValFinal.toFixed(2);
                         flowVariables[_nameVar] = _detName;
                         flowVariables[_valueVar] = _finalValue;
                         (flowVariables as any).comprovante_identified = true;
@@ -7679,10 +8068,11 @@ Mensagem do lead:
 
 
                 try {
-                  const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-                  if (!LOVABLE_API_KEY) {
-                    throw new Error("LOVABLE_API_KEY not set");
-                  }
+                  // [FIX 18.1] Guard de LOVABLE_API_KEY removido APENAS deste fluxo ai_receipt:
+                  // a chave/provider reais são resolvidos por applyProviderModel abaixo
+                  // (openai -> OPENAI_API_KEY; gemini/lovable -> gateway Lovable). Assim o bloco
+                  // configurado como OpenAI não é mais barrado por falta de LOVABLE_API_KEY.
+                  // Uma falha real de credencial/IA cai no catch com fallback seguro.
 
                   // Substitui variáveis no prompt também para garantir que referências como {{nome}} funcionem
                   // Removemos redundâncias e focamos no objetivo
@@ -8125,6 +8515,90 @@ FORMATO JSON:
                       });
                     }
 
+                    // [AI_RECEIPT_VALUE_ZERO_GUARD — FASE 23.2] Comprovante
+                    // "identificado" com valor 0/vazio NÃO pode avançar rota
+                    // verde silenciosamente (caso real: PDF PicPay com OCR
+                    // "COMPROVANTE IDENTIFICADO | Valor: 0.00" avançou para
+                    // brinde/upsell sem Purchase). 1) fallback regex de moeda
+                    // no OCR completo; 2) sem valor → rota vermelha auditada
+                    // pedindo reenvio. Não altera comprovantes com valor > 0.
+                    try {
+                      const _resValNum = parseFloat(
+                        String(result.value ?? "")
+                          .replace(/[^\d.,]/g, "")
+                          .replace(/\.(?=\d{3}(\D|$))/g, "")
+                          .replace(",", "."),
+                      );
+                      if (
+                        result.identified === true &&
+                        (!Number.isFinite(_resValNum) || _resValNum <= 0)
+                      ) {
+                        const _ocrFull = String(deterministicOcrText || "");
+                        const _moneyRe =
+                          /R\$\s*([0-9]+(?:\.[0-9]{3})*(?:[.,][0-9]{1,2})?)|(?:\bvalor\b[^\d]{0,20})([0-9]+(?:\.[0-9]{3})*(?:[.,][0-9]{1,2})?)/gi;
+                        let _m: RegExpExecArray | null;
+                        let _fallbackVal = 0;
+                        while ((_m = _moneyRe.exec(_ocrFull))) {
+                          let _raw = String(_m[1] || _m[2] || "");
+                          if (_raw.includes(",") && _raw.includes(".")) {
+                            _raw = _raw.replace(/\./g, "").replace(",", ".");
+                          } else if (_raw.includes(",")) {
+                            _raw = _raw.replace(",", ".");
+                          }
+                          const _v = parseFloat(_raw);
+                          if (Number.isFinite(_v) && _v > 0) {
+                            _fallbackVal = _v;
+                            break;
+                          }
+                        }
+                        if (_fallbackVal > 0) {
+                          result.value = _fallbackVal.toFixed(2);
+                          console.log(
+                            "[AI_RECEIPT_VALUE_ZERO_FALLBACK_APPLIED]",
+                            JSON.stringify({ value: result.value }),
+                          );
+                          await _auditReceipt({
+                            source: "value_zero_guard",
+                            identified: true,
+                            name: result.name || null,
+                            value: result.value,
+                            decision: "value_zero_regex_fallback",
+                            metadata: { llm_identified: true },
+                          });
+                        } else {
+                          console.log(
+                            "[AI_RECEIPT_VALUE_ZERO_RED_ROUTE]",
+                            JSON.stringify({
+                              conversation_id: conversationId,
+                              block_id: b.id,
+                            }),
+                          );
+                          await _auditReceipt({
+                            source: "value_zero_guard",
+                            identified: false,
+                            name: result.name || null,
+                            value: "0.00",
+                            route: "red",
+                            decision: "receipt_identified_value_zero",
+                            metadata: { llm_identified: true },
+                          });
+                          result.identified = false;
+                          if (
+                            !result.response ||
+                            !String(result.response).trim()
+                          ) {
+                            result.response =
+                              "Recebi seu comprovante, mas não consegui confirmar o valor pago 😕 Pode me enviar o comprovante completo novamente, por favor? 🙏";
+                          }
+                        }
+                      }
+                    } catch (_zeroGuardErr) {
+                      console.warn(
+                        "[AI_RECEIPT_VALUE_ZERO_GUARD_FAILED]",
+                        String(_zeroGuardErr),
+                      );
+                    }
+
                     // Importante: Considerar identificado se tiver nome E valor mesmo que a IA oscile no booleano
                     const isIdentified = result.identified === true || (!!result.name && !!result.value && parseFloat(result.value.replace(/[^\d.,]/g, "").replace(",", ".")) > 0);
                     console.log("[AI_RECEIPT_IS_IDENTIFIED_DECISION]", { isIdentified, reason: result.identified === true ? "llm_true" : (isIdentified ? "name_value_fallback" : "llm_false_no_fallback") });
@@ -8158,7 +8632,22 @@ FORMATO JSON:
                       
                       // Ensure it's a valid number or default to 0
                       const finalValueNum = parseFloat(extractedValue);
-                      const finalValue = isNaN(finalValueNum) ? "0.00" : finalValueNum.toFixed(2);
+                      let finalValue = isNaN(finalValueNum) ? "0.00" : finalValueNum.toFixed(2);
+
+                      // [FASE 27] Releitura de valor alto antes de gravar.
+                      if (!isNaN(finalValueNum)) {
+                        const _hvCorr = reprocessHighAmount(
+                          finalValueNum,
+                          String(result.value || ""),
+                          String(deterministicOcrText || ""),
+                          _receiptAcceptedValues,
+                          "ai",
+                        );
+                        if (_hvCorr.high_value_reprocessed) {
+                          finalValue = _hvCorr.amount.toFixed(2);
+                          await _auditHighValue(_hvCorr);
+                        }
+                      }
 
                       flowVariables[nameVar] = extractedName;
                       flowVariables[valueVar] = finalValue;
@@ -8265,6 +8754,15 @@ FORMATO JSON:
 
                 } catch (e) {
                   console.error("[uazapi-webhook] ai_receipt exception:", e);
+                  // [FIX 18.1] Fallback seguro quando a IA realmente falha: garante que a chave
+                  // ai.response exista (vazia) para o renderizador substituir por "" em vez de
+                  // vazar o literal {{ai.response}}. Segue a rota não-comprovante (não trava/loopa).
+                  if (
+                    !(flowVariables as any)["ai.response"] ||
+                    !String((flowVariables as any)["ai.response"]).trim()
+                  ) {
+                    (flowVariables as any)["ai.response"] = "";
+                  }
                   nextBlockId = b.data?.false_next_block_id || null;
                 }
 

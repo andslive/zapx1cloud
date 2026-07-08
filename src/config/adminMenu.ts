@@ -45,7 +45,7 @@ export interface AdminMenuGroup {
 
 // Itens fixos (sempre visíveis, sem accordion)
 export const fixedItems: AdminMenuItem[] = [
-  { id: 'dashboard', label: 'Painel Comercial', icon: LayoutDashboard },
+  { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'capture', label: 'Funil', icon: Zap, plusAction: 'new' },
   { id: 'inbox', label: 'Atendimentos', icon: MessageSquare },
   { id: 'pipeline', label: 'Pipeline', icon: LayoutGrid },
