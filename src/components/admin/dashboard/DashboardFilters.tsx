@@ -1,4 +1,5 @@
 import { CalendarIcon, RefreshCw, X } from 'lucide-react';
+import { format } from 'date-fns';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Calendar } from '@/components/ui/calendar';
@@ -64,8 +65,11 @@ export function DashboardFilters({ filters, onChange, connections, funnels, onRe
               selected={range}
               onSelect={(r) => {
                 if (!r?.from) return;
-                const startDate = r.from.toISOString().slice(0, 10);
-                const endDate = (r.to || r.from).toISOString().slice(0, 10);
+                // format() usa o dia local do calendário — evita o
+                // deslocamento de data que toISOString() causaria
+                // dependendo do fuso do navegador.
+                const startDate = format(r.from, 'yyyy-MM-dd');
+                const endDate = format(r.to || r.from, 'yyyy-MM-dd');
                 onChange({ ...filters, startDate, endDate });
               }}
               numberOfMonths={2}
