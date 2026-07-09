@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -17,20 +16,32 @@ import {
   Check,
   X,
   AlertTriangle,
+  Plus,
+  Download,
+  FileSpreadsheet,
 } from 'lucide-react';
 import {
-  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import {
-  useCommercialDashboard,
+  useCommercialDashboardV2,
+  useCommercialFilterOptions,
   useSaveMetaSpend,
   resolvePeriod,
   CommercialFilters,
-  CommercialPeriod,
+  SaleHistoryRow,
 } from '@/hooks/useCommercialDashboard';
 import { cn } from '@/lib/utils';
+import { DashboardFilters } from '@/components/admin/dashboard/DashboardFilters';
+import { SalesHistoryTable } from '@/components/admin/dashboard/SalesHistoryTable';
+import { NewManualSaleDialog } from '@/components/admin/dashboard/NewManualSaleDialog';
+import { EditSaleDialog } from '@/components/admin/dashboard/EditSaleDialog';
+import { exportSalesToCsv, exportSalesToXlsx } from '@/lib/exportSales';
 
 const CHART_PURPLE = '#8b5cf6';
+const CHART_ORANGE = '#fb923c';
+const CHART_EMERALD = '#34d399';
+const CHART_VIOLET = '#a78bfa';
 
 const formatBRL = (value: number) =>
   new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
@@ -38,13 +49,23 @@ const formatBRL = (value: number) =>
 const formatNumber = (value: number) =>
   new Intl.NumberFormat('pt-BR').format(value);
 
+const tooltipStyle = {
+  backgroundColor: 'hsl(var(--popover))',
+  border: '1px solid hsl(var(--border))',
+  borderRadius: '8px',
+  color: 'hsl(var(--popover-foreground))',
+};
+
 export function Dashboard() {
   const [filters, setFilters] = useState<CommercialFilters>({ period: 'today' });
-  const { data, isLoading, isError, refetch } = useCommercialDashboard(filters);
+  const { data, isLoading, isFetching, isError, refetch } = useCommercialDashboardV2(filters);
+  const { data: filterOptions } = useCommercialFilterOptions();
   const saveSpend = useSaveMetaSpend();
 
   const [editingSpend, setEditingSpend] = useState(false);
   const [spendDraft, setSpendDraft] = useState('');
+  const [newSaleOpen, setNewSaleOpen] = useState(false);
+  const [editingSale, setEditingSale] = useState<SaleHistoryRow | null>(null);
 
   // Sai do modo de edição ao trocar o período (o valor pertence a outro range)
   useEffect(() => {
@@ -119,46 +140,22 @@ export function Dashboard() {
   ];
 
   const totalSalesInSeries = data?.salesSeries.reduce((acc, p) => acc + p.sales, 0) ?? 0;
+  const connections = filterOptions?.connections ?? [];
+  const funnels = filterOptions?.funnels ?? [];
 
   return (
     <div className="space-y-6 animate-fade-in pb-12">
       {/* Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
-        <div className="flex flex-wrap items-center gap-2">
-          {filters.period === 'custom' && (
-            <>
-              <Input
-                type="date"
-                className="h-9 w-[150px]"
-                value={filters.startDate || ''}
-                onChange={(e) => setFilters((f) => ({ ...f, startDate: e.target.value }))}
-              />
-              <span className="text-muted-foreground text-sm">até</span>
-              <Input
-                type="date"
-                className="h-9 w-[150px]"
-                value={filters.endDate || ''}
-                onChange={(e) => setFilters((f) => ({ ...f, endDate: e.target.value }))}
-              />
-            </>
-          )}
-          <Select
-            value={filters.period}
-            onValueChange={(v) => setFilters((f) => ({ ...f, period: v as CommercialPeriod }))}
-          >
-            <SelectTrigger className="w-[160px] h-9">
-              <SelectValue placeholder="Período" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="today">Hoje</SelectItem>
-              <SelectItem value="yesterday">Ontem</SelectItem>
-              <SelectItem value="7d">Últimos 7 dias</SelectItem>
-              <SelectItem value="30d">Últimos 30 dias</SelectItem>
-              <SelectItem value="custom">Personalizado</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
+        <DashboardFilters
+          filters={filters}
+          onChange={setFilters}
+          connections={connections}
+          funnels={funnels}
+          onRefresh={() => refetch()}
+          isRefreshing={isFetching}
+        />
       </div>
 
       {/* Error state */}
@@ -287,12 +284,7 @@ export function Dashboard() {
                   />
                   <Tooltip
                     cursor={{ stroke: CHART_PURPLE, strokeOpacity: 0.3 }}
-                    contentStyle={{
-                      backgroundColor: 'hsl(var(--popover))',
-                      border: '1px solid hsl(var(--border))',
-                      borderRadius: '8px',
-                      color: 'hsl(var(--popover-foreground))',
-                    }}
+                    contentStyle={tooltipStyle}
                     formatter={(v: any) => [formatNumber(Number(v)), 'Vendas']}
                   />
                   <Area
@@ -309,6 +301,137 @@ export function Dashboard() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Gráficos por instância e por estado */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Card className="border-border bg-card shadow-sm rounded-xl">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base font-bold">Vendas por instância</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="h-[260px] w-full">
+              {isLoading ? (
+                <Skeleton className="h-full w-full rounded-lg" />
+              ) : !data?.salesByInstance.length ? (
+                <div className="h-full flex items-center justify-center">
+                  <p className="text-sm text-muted-foreground italic">Sem vendas no período.</p>
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={data.salesByInstance} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
+                    <XAxis dataKey="label" tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 10 }} interval={0} angle={-20} textAnchor="end" height={50} />
+                    <YAxis allowDecimals={false} tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 11 }} />
+                    <Tooltip contentStyle={tooltipStyle} formatter={(v: any) => [formatNumber(Number(v)), 'Vendas']} />
+                    <Bar dataKey="sales" fill={CHART_ORANGE} radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card shadow-sm rounded-xl">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base font-bold">Faturamento por instância</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="h-[260px] w-full">
+              {isLoading ? (
+                <Skeleton className="h-full w-full rounded-lg" />
+              ) : !data?.salesByInstance.length ? (
+                <div className="h-full flex items-center justify-center">
+                  <p className="text-sm text-muted-foreground italic">Sem vendas no período.</p>
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={data.salesByInstance} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
+                    <XAxis dataKey="label" tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 10 }} interval={0} angle={-20} textAnchor="end" height={50} />
+                    <YAxis tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 11 }} />
+                    <Tooltip contentStyle={tooltipStyle} formatter={(v: any) => [formatBRL(Number(v)), 'Faturamento']} />
+                    <Bar dataKey="revenue" fill={CHART_EMERALD} radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card shadow-sm rounded-xl">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base font-bold">Vendas por estado</CardTitle>
+            <p className="text-[10px] text-muted-foreground">
+              Estimativa pelo DDD do telefone do lead — não é o endereço real do cliente.
+            </p>
+          </CardHeader>
+          <CardContent>
+            <div className="h-[260px] w-full">
+              {isLoading ? (
+                <Skeleton className="h-full w-full rounded-lg" />
+              ) : !data?.salesByState.length ? (
+                <div className="h-full flex items-center justify-center">
+                  <p className="text-sm text-muted-foreground italic">Sem vendas no período.</p>
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={data.salesByState} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
+                    <XAxis dataKey="uf" tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 10 }} interval={0} angle={-20} textAnchor="end" height={50} />
+                    <YAxis allowDecimals={false} tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 11 }} />
+                    <Tooltip contentStyle={tooltipStyle} formatter={(v: any) => [formatNumber(Number(v)), 'Vendas']} />
+                    <Bar dataKey="sales" fill={CHART_VIOLET} radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Histórico de Vendas */}
+      <Card className="border-border bg-card shadow-sm rounded-xl">
+        <CardHeader className="pb-2 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <CardTitle className="text-lg font-bold">Histórico de Vendas</CardTitle>
+            <p className="text-xs text-muted-foreground">Vendas automáticas e manuais, com trilha de edições auditadas.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline" size="sm"
+              disabled={!data?.history.length}
+              onClick={() => data && exportSalesToCsv(data.history)}
+            >
+              <Download className="mr-1.5 h-3.5 w-3.5" /> CSV
+            </Button>
+            <Button
+              variant="outline" size="sm"
+              disabled={!data?.history.length}
+              onClick={() => data && exportSalesToXlsx(data.history)}
+            >
+              <FileSpreadsheet className="mr-1.5 h-3.5 w-3.5" /> XLSX
+            </Button>
+            <Button size="sm" onClick={() => setNewSaleOpen(true)}>
+              <Plus className="mr-1.5 h-3.5 w-3.5" /> Nova venda
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {isLoading ? (
+            <Skeleton className="h-64 w-full rounded-lg" />
+          ) : (
+            <SalesHistoryTable rows={data?.history ?? []} onEdit={setEditingSale} />
+          )}
+        </CardContent>
+      </Card>
+
+      <NewManualSaleDialog
+        open={newSaleOpen}
+        onOpenChange={setNewSaleOpen}
+        connections={connections}
+        funnels={funnels}
+      />
+      <EditSaleDialog sale={editingSale} onOpenChange={(open) => !open && setEditingSale(null)} />
     </div>
   );
 }
