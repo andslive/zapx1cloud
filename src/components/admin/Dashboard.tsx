@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -56,16 +57,44 @@ const tooltipStyle = {
   color: 'hsl(var(--popover-foreground))',
 };
 
+const FILTER_OPTIONS_QUERY_KEY = ['commercial-dashboard-filter-options'];
+const MIN_REFRESH_SPINNER_MS = 500;
+
 export function Dashboard() {
   const [filters, setFilters] = useState<CommercialFilters>({ period: 'today' });
   const { data, isLoading, isFetching, isError, refetch } = useCommercialDashboardV2(filters);
   const { data: filterOptions } = useCommercialFilterOptions();
   const saveSpend = useSaveMetaSpend();
+  const queryClient = useQueryClient();
 
   const [editingSpend, setEditingSpend] = useState(false);
   const [spendDraft, setSpendDraft] = useState('');
   const [newSaleOpen, setNewSaleOpen] = useState(false);
   const [editingSale, setEditingSale] = useState<SaleHistoryRow | null>(null);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+
+  // Botão "Atualizar": refaz a query principal (cards, gráfico de período,
+  // gráficos por instância/estado e Histórico de Vendas vêm todos do mesmo
+  // `data`) e também as opções de filtro (instâncias/funis), sem resetar
+  // `filters` nem duplicar dados — react-query substitui o cache existente
+  // pela mesma queryKey. Um piso de duração mantém o spinner visível mesmo
+  // quando a rede responde muito rápido, para o clique ficar perceptível.
+  const handleRefresh = async () => {
+    setManualRefreshing(true);
+    const startedAt = Date.now();
+    try {
+      await Promise.all([
+        refetch(),
+        queryClient.invalidateQueries({ queryKey: FILTER_OPTIONS_QUERY_KEY }),
+      ]);
+    } finally {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < MIN_REFRESH_SPINNER_MS) {
+        await new Promise((resolve) => setTimeout(resolve, MIN_REFRESH_SPINNER_MS - elapsed));
+      }
+      setManualRefreshing(false);
+    }
+  };
 
   // Sai do modo de edição ao trocar o período (o valor pertence a outro range)
   useEffect(() => {
@@ -153,8 +182,8 @@ export function Dashboard() {
           onChange={setFilters}
           connections={connections}
           funnels={funnels}
-          onRefresh={() => refetch()}
-          isRefreshing={isFetching}
+          onRefresh={handleRefresh}
+          isRefreshing={isFetching || manualRefreshing}
         />
       </div>
 
