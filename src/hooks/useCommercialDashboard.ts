@@ -595,6 +595,48 @@ export function useCommercialDashboardV2(filters: CommercialFilters) {
   });
 }
 
+/**
+ * Leads por instância no período (leads.connection_id). Consulta mínima e
+ * adicional — não existe hoje nenhuma fonte já buscada pelo Dashboard V2 com
+ * granularidade por instância para Leads (o `newLeads` do V2 é um total
+ * único do período). Usada apenas pelo card "Resumo por Instância e Funil".
+ */
+export function useLeadsByInstance(filters: CommercialFilters) {
+  const { profile } = useAuth();
+  const orgId = profile?.organization_id;
+
+  return useQuery<Map<string, number>>({
+    queryKey: ['commercial-dashboard-leads-by-instance', orgId, JSON.stringify(filters)],
+    queryFn: async () => {
+      if (!orgId) return new Map();
+      const client = supabase as any;
+
+      const { startKey, endKey } = resolvePeriod(filters);
+      const startIso = spDayBoundaries(startKey).start.toISOString();
+      const endIso = spDayBoundaries(endKey).end.toISOString();
+
+      let query = client
+        .from('leads')
+        .select('connection_id')
+        .eq('organization_id', orgId)
+        .gte('created_at', startIso)
+        .lte('created_at', endIso);
+      if (filters.connectionId) query = query.eq('connection_id', filters.connectionId);
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      const map = new Map<string, number>();
+      for (const r of (data || []) as any[]) {
+        const key = r.connection_id || 'none';
+        map.set(key, (map.get(key) || 0) + 1);
+      }
+      return map;
+    },
+    enabled: !!orgId,
+  });
+}
+
 export interface CreateManualSaleInput {
   saleDate: string;
   connectionId?: string;

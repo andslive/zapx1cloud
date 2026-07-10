@@ -28,12 +28,14 @@ import {
   useCommercialDashboardV2,
   useCommercialFilterOptions,
   useSaveMetaSpend,
+  useLeadsByInstance,
   resolvePeriod,
   CommercialFilters,
   SaleHistoryRow,
 } from '@/hooks/useCommercialDashboard';
 import { cn } from '@/lib/utils';
 import { DashboardFilters } from '@/components/admin/dashboard/DashboardFilters';
+import { SalesSummaryTable } from '@/components/admin/dashboard/SalesSummaryTable';
 import { SalesHistoryTable } from '@/components/admin/dashboard/SalesHistoryTable';
 import { NewManualSaleDialog } from '@/components/admin/dashboard/NewManualSaleDialog';
 import { EditSaleDialog } from '@/components/admin/dashboard/EditSaleDialog';
@@ -58,11 +60,13 @@ const tooltipStyle = {
 };
 
 const FILTER_OPTIONS_QUERY_KEY = ['commercial-dashboard-filter-options'];
+const LEADS_BY_INSTANCE_QUERY_KEY = ['commercial-dashboard-leads-by-instance'];
 const MIN_REFRESH_SPINNER_MS = 500;
 
 export function Dashboard() {
   const [filters, setFilters] = useState<CommercialFilters>({ period: 'today' });
   const { data, isLoading, isFetching, isError, refetch } = useCommercialDashboardV2(filters);
+  const { data: leadsByInstance } = useLeadsByInstance(filters);
   const { data: filterOptions } = useCommercialFilterOptions();
   const saveSpend = useSaveMetaSpend();
   const queryClient = useQueryClient();
@@ -86,6 +90,7 @@ export function Dashboard() {
       await Promise.all([
         refetch(),
         queryClient.invalidateQueries({ queryKey: FILTER_OPTIONS_QUERY_KEY }),
+        queryClient.invalidateQueries({ queryKey: LEADS_BY_INSTANCE_QUERY_KEY }),
       ]);
     } finally {
       const elapsed = Date.now() - startedAt;
@@ -173,7 +178,7 @@ export function Dashboard() {
   const funnels = filterOptions?.funnels ?? [];
 
   return (
-    <div className="space-y-6 animate-fade-in pb-12">
+    <div className="max-w-[1700px] mx-auto px-6 2xl:px-8 space-y-6 animate-fade-in pb-12">
       {/* Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
@@ -417,6 +422,21 @@ export function Dashboard() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Resumo por Instância e Funil */}
+      <Card className="border-border bg-card shadow-sm rounded-xl">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-lg font-bold">Resumo por Instância e Funil</CardTitle>
+          <p className="text-xs text-muted-foreground">Dados consolidados conforme os filtros selecionados.</p>
+        </CardHeader>
+        <CardContent>
+          {isLoading ? (
+            <Skeleton className="h-64 w-full rounded-lg" />
+          ) : (
+            <SalesSummaryTable history={data?.history ?? []} leadsByInstance={leadsByInstance ?? new Map()} />
+          )}
+        </CardContent>
+      </Card>
 
       {/* Histórico de Vendas */}
       <Card className="border-border bg-card shadow-sm rounded-xl">
