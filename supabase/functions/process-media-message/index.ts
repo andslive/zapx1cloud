@@ -11,7 +11,14 @@
 // Audio  -> OpenAI Whisper (whisper-1) -> transcription text
 // Image  -> OpenAI gpt-4o-mini (Vision) -> short, factual description
 // Document -> PDF text extraction -> GPT-4o-mini analysis
+//             (image-only PDFs -> OpenAI Responses API with input_file)
 // Both use OPENAI_API_KEY (centralizado em uma única chave da organização).
+
+import {
+  analyzeMultimodalPdf,
+  extractPdfText,
+  PdfAnalysisError,
+} from "./pdf-analysis.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -200,131 +207,6 @@ async function describeImage(
   return text;
 }
 
-async function extractPdfText(bytes: Uint8Array): Promise<string> {
-  try {
-    console.log(`[process-media-message] extracting text from PDF, bytes: ${bytes.byteLength}`);
-    // Check if it's actually a PDF (magic bytes %PDF)
-    if (bytes[0] !== 0x25 || bytes[1] !== 0x50 || bytes[2] !== 0x44 || bytes[3] !== 0x46) {
-      console.warn(`[process-media-message] PDF magic bytes mismatch: ${Array.from(bytes.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
-    }
-
-    const { extractText, getDocumentProxy } = await import("https://esm.sh/unpdf@0.12.1");
-    const doc = await getDocumentProxy(bytes);
-    
-    // Tenta extração padrão
-    let result = "";
-    try {
-      const { text } = await extractText(doc, { mergePages: true });
-      result = Array.isArray(text) ? text.join("\n") : String(text || "");
-    } catch (e) {
-      console.warn("[process-media-message] standard extractText failed, falling back to page-by-page:", e);
-    }
-    
-    // Se a extração falhou ou retornou muito pouco texto, tenta extrair página por página de forma manual
-    if (result.trim().length < 5) {
-      console.log("[process-media-message] extraction returned empty or failed, trying per-page manual extraction...");
-      const pageTexts = [];
-      for (let i = 1; i <= Math.min(doc.numPages, 10); i++) { // Limit to 10 pages for speed
-        try {
-          const page = await doc.getPage(i);
-          const content = await page.getTextContent();
-          const items = content.items.map((item: any) => item.str);
-          pageTexts.push(items.join(" "));
-        } catch (pageErr) {
-          console.error(`[process-media-message] error on page ${i}:`, pageErr);
-        }
-      }
-      result = pageTexts.join("\n");
-    }
-
-    console.log(`[process-media-message] PDF text extracted, length: ${result.length}, pages: ${doc.numPages}`);
-    return result;
-  } catch (err) {
-    console.error("[process-media-message] PDF parse error:", err);
-    return ""; // Return empty so we fallback to multimodal
-  }
-}
-
-async function analyzeMultimodalPdf(
-  bytes: Uint8Array,
-  mime: string,
-  apiKey: string,
-  model?: string,
-): Promise<string> {
-  let bin = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  const b64 = btoa(bin);
-  const dataUrl = `data:${mime};base64,${b64}`;
-
-  // Usamos Gemini Flash via Gateway pois ele suporta PDF nativamente como multimodal
-  const isOpenAI = apiKey.startsWith("sk-");
-  const url = isOpenAI
-    ? "https://api.openai.com/v1/chat/completions"
-    : "https://ai.gateway.lovable.dev/v1/chat/completions";
-
-  // IMPORTANTE: PDF multimodal é processado sempre por um modelo Gemini suportado
-  // pelo Gateway. Configurações antigas (ex.: google/gemini-2.0-flash) quebram
-  // com 400 e impedem o comprovante de chegar ao ai_receipt.
-  let modelName = "google/gemini-2.5-flash";
-  let finalUrl = url;
-  let finalApiKey = apiKey;
-
-  if (isOpenAI) {
-    const lovableKey = Deno.env.get("LOVABLE_API_KEY");
-    if (lovableKey) {
-      finalUrl = "https://ai.gateway.lovable.dev/v1/chat/completions";
-      finalApiKey = lovableKey;
-      modelName = "google/gemini-2.5-flash";
-    } else {
-      throw new Error("PDF multimodal analysis requires Gemini (Google) or Lovable Gateway. OpenAI key detected.");
-    }
-  }
-
-  const res = await fetch(finalUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${finalApiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: modelName,
-      messages: [
-        {
-          role: "system",
-          content:
-            "Você é um especialista em análise de comprovantes bancários (Pix, Transferência, Boleto, Cartão). " +
-            "Você recebeu um arquivo PDF. Analise o conteúdo visual e textual dele em português.",
-        },
-        { 
-          role: "user", 
-          content: [
-            { 
-              type: "text", 
-              text: "Analise este comprovante e extraia: 1. Valor (ex: 15.00), 2. Nome do Pagador/Beneficiário, 3. Data. " +
-                    "Responda começando com 'COMPROVANTE IDENTIFICADO' se for um comprovante válido."
-            },
-            {
-              type: "image_url", // O Gateway Lovable traduz image_url com mime PDF para o formato correto do Gemini
-              image_url: { url: dataUrl }
-            }
-          ] 
-        },
-      ],
-      temperature: 0.1,
-    }),
-  });
-
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`multimodal pdf error ${res.status}: ${t.slice(0, 300)}`);
-  }
-  const data = await res.json();
-  return data?.choices?.[0]?.message?.content?.trim() || "";
-}
-
 async function analyzeText(
   text: string,
   apiKey: string,
@@ -510,9 +392,12 @@ Deno.serve(async (req) => {
         console.log("[process-media-message] fallback to multimodal PDF analysis");
         try {
           resultText = await analyzeMultimodalPdf(bytes, mime, apiKey, modelOverride);
-          modelUsed = "gemini-2.5-flash-multimodal";
+          modelUsed = apiKey.startsWith("sk-")
+            ? `openai-responses-pdf:${modelOverride && !modelOverride.includes("/") ? modelOverride : "gpt-4o-mini"}`
+            : "gemini-2.5-flash-multimodal";
         } catch (multimodalErr: any) {
           console.error("[process-media-message] multimodal fallback failed:", multimodalErr.message);
+          if (multimodalErr instanceof PdfAnalysisError) throw multimodalErr;
           throw new Error(`Falha ao processar PDF: ${multimodalErr.message}`);
         }
       } else {
@@ -529,6 +414,17 @@ Deno.serve(async (req) => {
     }
   } catch (e: any) {
     console.error("[process-media-message] error:", e?.message || String(e));
+    if (e instanceof PdfAnalysisError) {
+      return jsonResponse(
+        {
+          success: false,
+          error: `Falha ao processar PDF: ${e.message}`,
+          error_code: e.code,
+          request_id: e.requestId || null,
+        },
+        500,
+      );
+    }
     return jsonResponse({ success: false, error: e?.message || "unknown error" }, 500);
   }
 });
