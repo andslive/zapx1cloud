@@ -131,13 +131,21 @@ export function useCommercialDashboard(filters: CommercialFilters) {
 
       // 2) Compras aprovadas. purchase_audit não tem organization_id:
       //    o escopo vem do join com leads (além do RLS do banco).
+      // FASE 2: filtra/agrupa por event_occurred_at (horário REAL da
+      // venda), não por created_at (horário técnico de persistência).
+      // Para todo o histórico anterior à FASE 2, event_occurred_at foi
+      // backfillado igual a created_at (migration 20260727141449), então
+      // o resultado é idêntico ao comportamento anterior para vendas
+      // antigas. Só compras recuperadas (FASE 2) terão os dois horários
+      // diferentes — e devem contar no dia ORIGINAL, não no dia da
+      // recuperação.
       const { data: purchasesRaw, error: purchasesErr } = await client
         .from('purchase_audit')
-        .select('id, created_at, purchase_value, fbtrace_id, event_id, purchase_status, leads!inner(organization_id)')
+        .select('id, created_at, event_occurred_at, purchase_value, fbtrace_id, event_id, purchase_status, leads!inner(organization_id)')
         .eq('purchase_status', 'success')
         .eq('leads.organization_id', orgId)
-        .gte('created_at', startIso)
-        .lte('created_at', endIso);
+        .gte('event_occurred_at', startIso)
+        .lte('event_occurred_at', endIso);
       if (purchasesErr) throw purchasesErr;
 
       // Deduplicação: o mesmo Purchase gera múltiplas linhas (retries de
@@ -182,7 +190,7 @@ export function useCommercialDashboard(filters: CommercialFilters) {
       let salesSeries: { label: string; sales: number }[];
       if (groupedBy === 'hour') {
         const byHour = new Array(24).fill(0);
-        for (const p of purchases) byHour[spHour(new Date(p.created_at))]++;
+        for (const p of purchases) byHour[spHour(new Date(p.event_occurred_at || p.created_at))]++;
         salesSeries = byHour.map((n, h) => ({
           label: `${String(h).padStart(2, '0')}:00`,
           sales: n,
@@ -190,7 +198,7 @@ export function useCommercialDashboard(filters: CommercialFilters) {
       } else {
         const byDay = new Map<string, number>(periodDays.map((d) => [d, 0]));
         for (const p of purchases) {
-          const k = spDateKey(new Date(p.created_at));
+          const k = spDateKey(new Date(p.event_occurred_at || p.created_at));
           if (byDay.has(k)) byDay.set(k, (byDay.get(k) || 0) + 1);
         }
         salesSeries = periodDays.map((d) => ({
@@ -373,16 +381,18 @@ export function useCommercialDashboardV2(filters: CommercialFilters) {
       //    Não seleciono purchase_audit.connection_id: essa coluna está corrompida em
       //    produção (guarda o JSON da instância inteira) — a instância real e confiável
       //    vem de leads.connection_id (FK válida).
+      // FASE 2: filtro por event_occurred_at, não created_at (ver nota na
+      // query equivalente do bloco de métricas acima).
       const { data: purchasesRaw, error: purchasesErr } = await client
         .from('purchase_audit')
         .select(
-          'id, created_at, purchase_value, currency, fbtrace_id, event_id, purchase_status, ' +
+          'id, created_at, event_occurred_at, purchase_value, currency, fbtrace_id, event_id, purchase_status, ' +
           'customer_name, phone, lead_id, leads!inner(organization_id, connection_id, phone_normalized, phone, name)',
         )
         .eq('purchase_status', 'success')
         .eq('leads.organization_id', orgId)
-        .gte('created_at', startIso)
-        .lte('created_at', endIso);
+        .gte('event_occurred_at', startIso)
+        .lte('event_occurred_at', endIso);
       if (purchasesErr) throw purchasesErr;
 
       // Dedup: mesma regra da V1 (fbtrace_id > event_id; descarta sem id forte).
@@ -488,7 +498,7 @@ export function useCommercialDashboardV2(filters: CommercialFilters) {
         history.push({
           id: p.id,
           origin: 'automatic',
-          date: p.created_at,
+          date: p.event_occurred_at || p.created_at,
           instanceId,
           instanceName: fieldEdits?.get('source_label') ?? (instance?.name || 'Sem instância'),
           instanceNumber: instance?.phone_number || null,

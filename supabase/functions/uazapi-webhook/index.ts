@@ -9,6 +9,10 @@ import { normalizePhoneBR, phoneVariantsBR } from "../_shared/phone.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { resolveAIProvider } from "../_shared/ai-credentials.ts";
 import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
+import {
+  deterministicRecoveryEventId,
+  resolveOriginalEventTime,
+} from "../_shared/receipt-recovery.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -2049,6 +2053,10 @@ async function sendFacebookConversion(
     testEventCode?: string;
     actionSource?: string;
     eventId?: string;
+    // FASE 2 — recuperação: horário REAL do evento (unix seconds), usado no
+    // lugar de Date.now(). Só passado pelo caminho de recuperação; tráfego
+    // normal continua usando o horário atual (comportamento inalterado).
+    eventTimeUnixSeconds?: number;
   },
 ) {
   const url =
@@ -2089,10 +2097,11 @@ async function sendFacebookConversion(
 
   const event_id = options?.eventId || `capi_${crypto.randomUUID()}`;
   const action_source = options?.actionSource || "system_generated";
+  const event_time = options?.eventTimeUnixSeconds ?? Math.floor(Date.now() / 1000);
 
   const eventBody: any = {
     event_name: eventName,
-    event_time: Math.floor(Date.now() / 1000),
+    event_time,
     event_id,
     action_source,
     user_data,
@@ -2145,7 +2154,7 @@ async function sendFacebookConversion(
       const legacyPayload: any = {
         data: [{
           event_name: eventName,
-          event_time: Math.floor(Date.now() / 1000),
+          event_time,
           event_id,
           action_source: "chat",
           user_data: legacyUserData,
@@ -2229,6 +2238,160 @@ Deno.serve(async (req) => {
       message_type: payload.event || payload.type
     });
 
+    // ============================================================
+    // ACTION: execute_recovery — FASE 2 (recuperação controlada do
+    // incidente de crédito OpenAI, 2026-07-26/27). NÃO usado pelo tráfego
+    // normal. Só aceita `recoveryId`; toda a identidade real (message_id
+    // original, conversationId, mídia, bloco esperado) é carregada do
+    // banco (receipt_recovery_requests), nunca confiada ao payload
+    // externo. Reivindicação atômica via UPDATE...WHERE status='pending'
+    // impede que duas chamadas concorrentes (cron + manual, ou dois
+    // disparos manuais) processem o mesmo caso.
+    // ============================================================
+    if (action === "execute_recovery" && (payload as any).recoveryId) {
+      const recoveryId = (payload as any).recoveryId;
+      console.log("[uazapi-webhook] action: execute_recovery for", recoveryId);
+
+      // 1) Reivindicação atômica — compare-and-set real via UPDATE...WHERE.
+      //    Se outra chamada já reivindicou, updated retorna 0 linhas.
+      const { data: claimed, error: claimErr } = await supabase
+        .from("receipt_recovery_requests")
+        .update({ status: "claimed", claimed_at: new Date().toISOString() })
+        .eq("id", recoveryId)
+        .eq("status", "pending")
+        .select("*")
+        .maybeSingle();
+
+      if (claimErr || !claimed) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            skipped: "already_claimed_or_not_pending",
+          }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      // FASE 2.1 — lease compartilhado por conversa (migration
+      // 20260727141449): o mesmo mecanismo que funnel-resume-cron e
+      // resume_funnel manual usam. Se o cron já detém o lease desta
+      // conversa neste exato momento, esta chamada recua sem tocar em
+      // nada (devolve a linha de recovery para 'pending' — pode ser
+      // retentada depois).
+      const { data: leaseToken } = await supabase.rpc("acquire_conversation_lease", {
+        p_conversation_id: (claimed as any).conversation_id,
+        p_owner: "recovery",
+        p_lease_seconds: 600,
+      });
+      if (!leaseToken) {
+        await supabase.from("receipt_recovery_requests").update({
+          status: "pending",
+          claimed_at: null,
+        }).eq("id", recoveryId);
+        return new Response(
+          JSON.stringify({ ok: true, skipped: "conversation_lease_held_by_other_owner" }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const releaseLease = async () => {
+        await supabase.rpc("release_conversation_lease", {
+          p_conversation_id: (claimed as any).conversation_id,
+          p_token: leaseToken,
+        });
+      };
+
+      const markTerminal = async (status: "done" | "failed" | "skipped", result: Record<string, any>) => {
+        await supabase.from("receipt_recovery_requests").update({
+          status,
+          result,
+          completed_at: new Date().toISOString(),
+        }).eq("id", recoveryId);
+        await releaseLease();
+      };
+
+      // 2) Reverificar guardas a partir do estado ATUAL do banco (não do
+      //    snapshot da criação da linha de recuperação).
+      const { data: convNow } = await supabase
+        .from("webchat_conversations")
+        .select("id, status, current_block_id, current_flow_id, flow_variables, flow_completed, visitor_phone_normalized, evolution_instance_id")
+        .eq("id", (claimed as any).conversation_id)
+        .maybeSingle();
+
+      const { count: purchaseCountNow } = await supabase
+        .from("purchase_audit")
+        .select("id", { count: "exact", head: true })
+        .eq("conversation_id", (claimed as any).conversation_id)
+        .gte("created_at", (claimed as any).original_message_created_at);
+
+      const { count: terminalDecisionCountNow } = await supabase
+        .from("ai_receipt_audits")
+        .select("id", { count: "exact", head: true })
+        .eq("conversation_id", (claimed as any).conversation_id)
+        .neq("decision", "ai_receipt_enter")
+        .gte("created_at", (claimed as any).original_message_created_at);
+
+      let skipReason: string | null = null;
+      if (!convNow) skipReason = "conversation_not_found";
+      else if (convNow.status !== "bot_active") skipReason = `status_${convNow.status}`;
+      else if (convNow.flow_completed) skipReason = "flow_already_completed";
+      else if (convNow.current_block_id !== (claimed as any).expected_block_id) {
+        skipReason = "conversation_advanced_since_snapshot";
+      } else if ((purchaseCountNow || 0) > 0) skipReason = "purchase_already_exists";
+      else if ((terminalDecisionCountNow || 0) > 0) skipReason = "terminal_decision_already_exists";
+
+      if (skipReason) {
+        await markTerminal("skipped", { reason: skipReason });
+        return new Response(
+          JSON.stringify({ ok: true, skipped: skipReason }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      // 3) Tirar a conversa da janela de seleção do cron por 10min
+      //    (bot_locked_until <= now() é o critério do funnel-resume-cron).
+      const flowVarsForRecovery: any = { ...((convNow as any)?.flow_variables || {}) };
+      flowVarsForRecovery.__pending_receipt_media = {
+        url: (claimed as any).media_url,
+        mime: (claimed as any).media_mime,
+        type: (claimed as any).media_type,
+        message_id: (claimed as any).original_message_id,
+        received_at: new Date().toISOString(),
+        ocr_text: null,
+        raw_message: null,
+        original_text_preview: null,
+      };
+
+      await supabase.from("webchat_conversations").update({
+        bot_locked_until: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+        flow_variables: flowVarsForRecovery,
+      }).eq("id", (claimed as any).conversation_id);
+
+      // 4) Delegar no MESMO caminho de execução do funil que resume_funnel
+      //    já usa em produção (spoof de payload) — nenhuma lógica de bloco
+      //    nova é criada. `__recovery_context` é lido logo após
+      //    normalizePayload() para sobrescrever norm.messageId com o
+      //    original (ver abaixo) e, dentro do bloco `pixel`, para gerar
+      //    event_id/event_time determinísticos.
+      (payload as any).__is_resume = true;
+      (payload as any).__conv_override = convNow;
+      (payload as any).instance = (convNow as any).evolution_instance_id;
+      (payload as any).remoteJid = (convNow as any).visitor_phone_normalized;
+      (payload as any).__recovery_context = {
+        recoveryId,
+        originalMessageId: (claimed as any).original_message_id,
+        originalMessageCreatedAt: (claimed as any).original_message_created_at,
+        organizationId: (claimed as any).organization_id,
+        conversationId: (claimed as any).conversation_id,
+        pixelBlockId: null, // resolvido dentro do bloco pixel, no momento em que ele executa
+        incidentTag: (claimed as any).incident_tag,
+        // item 9/10 — reaproveita o event_id de uma tentativa anterior em
+        // vez de derivar um novo, quando a linha de recovery foi criada
+        // para um caso de "Purchase ausente" com tentativa prévia.
+        reuseEventId: (claimed as any).reuse_event_id || null,
+      };
+      (payload as any).__recovery_mark_terminal = markTerminal;
+    }
+
     // ACTION: resume_funnel (manual or cron)
     if (action === "resume_funnel" && payload.conversationId) {
       const conversationId = payload.conversationId;
@@ -2247,6 +2410,26 @@ Deno.serve(async (req) => {
         .single();
 
       if (!conv) return new Response("Conv not found", { status: 404 });
+
+      // FASE 2.1 — mesmo lease compartilhado usado por execute_recovery.
+      // Se uma recuperação detém o lease desta conversa agora, este
+      // resume (cron ou manual) recua sem tocar em nada — o cron tentará
+      // de novo no próximo minuto. TTL curto (90s): cobre a duração de um
+      // resume_funnel; liberado explicitamente no caminho ghost-guard, e
+      // por TTL no caminho de sucesso (a execução completa do funil pode
+      // continuar por várias etapas depois deste ponto, sem um único
+      // "fim de request" fácil de instrumentar sem tocar tráfego ao vivo).
+      const { data: _resumeLeaseToken } = await supabase.rpc("acquire_conversation_lease", {
+        p_conversation_id: conversationId,
+        p_owner: "resume_funnel", // cron e resume manual passam pelo mesmo action; não dá para distinguir a esta altura sem alterar o contrato do cron
+        p_lease_seconds: 90,
+      });
+      if (!_resumeLeaseToken) {
+        return new Response(
+          JSON.stringify({ ok: true, skipped: "conversation_lease_held_by_other_owner" }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
 
       // ============================================================
       // GHOST GUARD: detect impossible-to-resume conversations and
@@ -2310,6 +2493,10 @@ Deno.serve(async (req) => {
 
       if (ghostReason) {
         await ghostReleaseSlot(ghostReason);
+        await supabase.rpc("release_conversation_lease", {
+          p_conversation_id: conversationId,
+          p_token: _resumeLeaseToken,
+        });
         return new Response(
           JSON.stringify({
             ok: true,
@@ -2327,6 +2514,14 @@ Deno.serve(async (req) => {
     }
 
     norm = normalizePayload(payload);
+    // FASE 2 — recuperação: substitui o messageId sintético (resume-<ts>)
+    // pelo message_id ORIGINAL carregado do banco em execute_recovery,
+    // ANTES de qualquer uso downstream (_auditReceipt, dedup por 60s,
+    // norm.media.messageId). Único ponto de mutação — nenhuma outra lógica
+    // de norm é alterada.
+    if ((payload as any).__recovery_context?.originalMessageId) {
+      (norm as any).messageId = (payload as any).__recovery_context.originalMessageId;
+    }
     console.log("[uazapi-webhook] normalized:", JSON.stringify(norm));
 
     // [WEBHOOK_HEALTH_TRACKING] Update last_webhook_event_at for the instance
@@ -6508,6 +6703,48 @@ Mensagem do lead:
 
                       console.log(`[pixel_attribution_resolved] ctwa_clid=${ctwa_clid || "-"} ad_source_id=${ad_source_id || "-"} action_source=${action_source} sources={fv:${!!fv.ctwa_clid},conv:${!!convCtwa.ctwa_clid},lt:${!!lt?.ctwa_clid},lead:${!!leadRow?.ctwa_clid}}`);
 
+                      // ─────────────────────────────────────────────────
+                      // FASE 2 — recuperação: event_id/event_time
+                      // determinísticos, derivados do message_id e do
+                      // horário ORIGINAIS (nunca de Date.now()/UUID
+                      // aleatório). Só ativa quando a execução veio de
+                      // execute_recovery (__recovery_context presente).
+                      // Tráfego normal (recoveryCtx undefined) segue 100%
+                      // inalterado: event_id aleatório, event_time = agora.
+                      // ─────────────────────────────────────────────────
+                      const recoveryCtx = (payload as any).__recovery_context;
+                      let recoveryEventId: string | undefined;
+                      let recoveryEventTimeSeconds: number | undefined;
+                      if (recoveryCtx) {
+                        // item 9/10 — reaproveita o event_id de uma
+                        // tentativa anterior quando presente; nunca gera um
+                        // novo event_id para um caso que já teve tentativa.
+                        recoveryEventId = recoveryCtx.reuseEventId ||
+                          await deterministicRecoveryEventId({
+                            organizationId: recoveryCtx.organizationId,
+                            conversationId: recoveryCtx.conversationId,
+                            pixelBlockId: b.id,
+                            originalMessageId: recoveryCtx.originalMessageId,
+                          });
+                        const evt = resolveOriginalEventTime(recoveryCtx.originalMessageCreatedAt);
+                        if (!evt.ok) {
+                          console.error("[RECOVERY_EVENT_TIME_REJECTED]", JSON.stringify({
+                            conversation_id: conversationId,
+                            recovery_id: recoveryCtx.recoveryId,
+                            reason: evt.reason,
+                          }));
+                          if ((payload as any).__recovery_mark_terminal) {
+                            await (payload as any).__recovery_mark_terminal("failed", {
+                              reason: `event_time_rejected_${evt.reason}`,
+                            });
+                          }
+                          nextBlockId = b.next_block_id || null;
+                          currentBlock = findBlock(nextBlockId);
+                          break;
+                        }
+                        recoveryEventTimeSeconds = evt.eventTimeUnixSeconds;
+                      }
+
                       const result = await sendFacebookConversion(
                         integ.pixel_id,
                         integ.pixel_access_token,
@@ -6542,7 +6779,15 @@ Mensagem do lead:
                           entry_point_conversion_source,
                           entry_point_conversion_app,
                         },
-                        { actionSource: action_source },
+                        {
+                          actionSource: action_source,
+                          ...(recoveryCtx
+                            ? {
+                              eventId: recoveryEventId,
+                              eventTimeUnixSeconds: recoveryEventTimeSeconds,
+                            }
+                            : {}),
+                        },
                       );
 
                       if (healthId) {
@@ -6554,50 +6799,71 @@ Mensagem do lead:
                       console.log(`[pixel_payload_final] ${JSON.stringify(result.payload)}`);
                       console.log(`[pixel_meta_response] ${JSON.stringify(result.response)}`);
 
-                      // Phase 2: Purchase Audit (now includes resolved attribution)
-                      await supabase.from("purchase_audit").insert({
-                        lead_id: external_id,
-                        conversation_id: conversationId,
-                        flow_execution_id: flowVariables["__flow_execution_id"],
-                        connection_id: instance,
-                        phone: leadPhone,
-                        customer_name: leadName,
-                        purchase_value: isNaN(numericValue) ? null : numericValue,
-                        currency,
-                        campaign_id,
-                        campaign_name,
-                        adset_id,
-                        adset_name,
-                        ad_id,
-                        ad_name,
-                        ctwa_clid,
-                        ad_source_id,
-                        ad_source_type,
-                        entry_point_conversion_source,
-                        action_source,
-                        pixel_id: integ.pixel_id,
-                        event_id: result.payload?.data?.[0]?.event_id,
-                        fbtrace_id: result.response?.fbtrace_id,
-                        meta_status: result.success ? "success" : "failed",
-                        purchase_status: result.success ? "success" : "failed",
-                        purchase_source: "webhook",
-                        pixel_block_id: b.id,
-                        raw_payload: result.payload,
-                        raw_response: result.response,
-                        error_details: result.success ? null : result.response,
+                      // FASE 2.1 — writer único: uma única chamada RPC
+                      // (record_purchase_result, migration 20260727141449)
+                      // grava purchase_audit (1 linha por event_id, sucesso
+                      // nunca regride) E pixel_event_logs (histórico de toda
+                      // tentativa) atomicamente. Tráfego normal e
+                      // recuperação chamam exatamente a mesma função — não
+                      // existe mais um segundo caminho de escrita (antes:
+                      // insert direto + trigger).
+                      const _eventOccurredAtIso = recoveryCtx
+                        ? new Date((recoveryEventTimeSeconds || 0) * 1000).toISOString()
+                        : new Date().toISOString();
+                      const { error: _recordErr } = await supabase.rpc("record_purchase_result", {
+                        p_conversation_id: conversationId,
+                        p_lead_id: external_id,
+                        p_pixel_block_id: b.id,
+                        p_pixel_id: integ.pixel_id,
+                        p_event_name: eventName,
+                        p_event_id: result.payload?.data?.[0]?.event_id,
+                        p_event_occurred_at: _eventOccurredAtIso,
+                        p_meta_success: result.success,
+                        p_fbtrace_id: result.response?.fbtrace_id,
+                        p_purchase_value: isNaN(numericValue) ? null : numericValue,
+                        p_currency: currency,
+                        p_action_source: action_source,
+                        p_campaign_id: campaign_id,
+                        p_campaign_name: campaign_name,
+                        p_adset_id: adset_id,
+                        p_adset_name: adset_name,
+                        p_ad_id: ad_id,
+                        p_ad_name: ad_name,
+                        p_ctwa_clid: ctwa_clid,
+                        p_ad_source_id: ad_source_id,
+                        p_ad_source_type: ad_source_type,
+                        p_entry_point_conversion_source: entry_point_conversion_source,
+                        p_connection_id: instance,
+                        p_flow_execution_id: flowVariables["__flow_execution_id"],
+                        p_phone: leadPhone,
+                        p_customer_name: leadName,
+                        p_raw_payload: result.payload,
+                        p_raw_response: result.response,
+                        p_recovery_metadata: recoveryCtx
+                          ? {
+                            recovery_id: recoveryCtx.recoveryId,
+                            source_message_id: recoveryCtx.originalMessageId,
+                            recovered_from_openai_credit_incident: true,
+                          }
+                          : null,
                       });
+                      if (_recordErr) {
+                        console.error("[RECORD_PURCHASE_RESULT_FAILED]", JSON.stringify({
+                          conversation_id: conversationId,
+                          error: _recordErr.message,
+                        }));
+                      }
 
-                      // Keep legacy log for backward compatibility
-                      await supabase.from("pixel_event_logs").insert({
-                        conversation_id: conversationId,
-                        lead_id: external_id,
-                        block_id: b.id,
-                        event_name: eventName,
-                        pixel_id: integ.pixel_id,
-                        payload: result.payload,
-                        response: result.response,
-                        success: result.success,
-                      });
+                      if (recoveryCtx && (payload as any).__recovery_mark_terminal) {
+                        await (payload as any).__recovery_mark_terminal(
+                          result.success ? "done" : "failed",
+                          {
+                            meta_success: result.success,
+                            event_id: recoveryEventId,
+                            value: isNaN(numericValue) ? null : numericValue,
+                          },
+                        );
+                      }
                     }
                   } catch (e) {
                     console.error("[facebook-pixel] exception:", e);
@@ -7660,7 +7926,11 @@ Mensagem do lead:
                 // bloco/funil/produto, segue rota verde SEM chamar IA.
                 // Não interfere em mídia/IA quando os critérios não baterem.
                 // ───────────────────────────────────────────────────────────
-                const _auditReceipt = async (payload: Record<string, any>) => {
+                // FASE 2 — captura ANTES da definição de _auditReceipt, cujo
+                // parâmetro se chama `payload` e sombrearia o `payload` do
+                // request externo (o que carrega __recovery_context).
+                const _outerRecoveryCtx = (payload as any).__recovery_context;
+                const _auditReceipt = async (auditPayload: Record<string, any>) => {
                   try {
                     await supabase.from("ai_receipt_audits").insert({
                       conversation_id: conversationId,
@@ -7670,7 +7940,16 @@ Mensagem do lead:
                       block_id: b.id,
                       message_id: norm.messageId || null,
                       ocr_text_preview: String(deterministicOcrText || "").slice(0, 500),
-                      ...payload,
+                      ...(_outerRecoveryCtx
+                        ? {
+                          recovery_metadata: {
+                            recovery_id: _outerRecoveryCtx.recoveryId,
+                            source_message_id: _outerRecoveryCtx.originalMessageId,
+                            recovered_from_openai_credit_incident: true,
+                          },
+                        }
+                        : {}),
+                      ...auditPayload,
                     });
                   } catch (_auditErr) { /* best-effort */ }
                 };

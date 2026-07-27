@@ -108,12 +108,15 @@ export function useAdminDashboardData(filters: DashboardFilters) {
          leadsData = leadsData.filter(l => (l.source || '').toLowerCase().includes(filters.source!.toLowerCase()));
       }
 
+      // FASE 2: filtra por event_occurred_at (horário real da venda),
+      // não created_at (horário técnico de persistência) — ver
+      // useCommercialDashboard.ts para o mesmo padrão e a justificativa.
       const { data: allPurchasesRaw } = await client
         .from('purchase_audit')
         .select('*')
         .eq('purchase_status', 'success')
-        .gte('created_at', startIso)
-        .lte('created_at', endIso);
+        .gte('event_occurred_at', startIso)
+        .lte('event_occurred_at', endIso);
       
       let allPurchases = (allPurchasesRaw || []) as any[];
       if (filters.offerId) {
@@ -178,7 +181,7 @@ export function useAdminDashboardData(filters: DashboardFilters) {
         const hours = eachHourOfInterval({ start: startDate, end: endDate });
         chartData = hours.map(hour => {
           const hourRevenue = uniquePurchases
-            .filter(p => isSameHour(parseISO(p.created_at), hour))
+            .filter(p => isSameHour(parseISO(p.event_occurred_at || p.created_at), hour))
             .reduce((acc, p) => acc + Number(p.purchase_value || 0), 0);
           return { label: format(hour, 'HH:mm'), revenue: hourRevenue };
         });
@@ -186,7 +189,7 @@ export function useAdminDashboardData(filters: DashboardFilters) {
         const days = eachDayOfInterval({ start: startDate, end: endDate });
         chartData = days.map(day => {
           const dayRevenue = uniquePurchases
-            .filter(p => isSameDay(parseISO(p.created_at), day))
+            .filter(p => isSameDay(parseISO(p.event_occurred_at || p.created_at), day))
             .reduce((acc, p) => acc + Number(p.purchase_value || 0), 0);
           return { label: format(day, 'dd/MM'), revenue: dayRevenue };
         });
