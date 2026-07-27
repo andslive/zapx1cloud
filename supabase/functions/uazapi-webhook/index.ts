@@ -10,7 +10,10 @@ import { startTyping } from "../_shared/presence.ts";
 import { resolveAIProvider } from "../_shared/ai-credentials.ts";
 import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
 import {
+  classifyReceiptMediaReadOnly,
+  conversationUnchanged,
   deterministicRecoveryEventId,
+  outboundCountUnchanged,
   resolveOriginalEventTime,
 } from "../_shared/receipt-recovery.ts";
 
@@ -2303,11 +2306,39 @@ Deno.serve(async (req) => {
       const markTerminal = async (status: "done" | "failed" | "skipped", result: Record<string, any>) => {
         await supabase.from("receipt_recovery_requests").update({
           status,
-          result,
+          result: { ...(traceState as any), ...result },
           completed_at: new Date().toISOString(),
         }).eq("id", recoveryId);
         await releaseLease();
       };
+
+      // FASE 2.3 — instrumentação de diagnóstico. Como os logs da Edge
+      // Function têm retenção curta (~1min neste ambiente), gravamos
+      // checkpoints direto em receipt_recovery_requests.result — sobrevive
+      // à execução. `traceId` correlaciona todos os checkpoints de uma
+      // mesma tentativa. Nunca grava mídia, URL assinada, JWT, chave ou
+      // payload bancário — só nomes de checkpoint e ids técnicos.
+      const traceId = crypto.randomUUID();
+      const traceState: Record<string, any> = {
+        trace_id: traceId,
+        last_checkpoint: "execute_recovery_entered",
+        reached_ai_receipt: false,
+        pending_media_found: false,
+        decision_created: false,
+        purchase_persisted: false,
+        meta_status: null,
+      };
+      const checkpoint = async (name: string, extra?: Record<string, any>) => {
+        traceState.last_checkpoint = name;
+        if (extra) Object.assign(traceState, extra);
+        try {
+          await supabase.from("receipt_recovery_requests").update({
+            result: { ...traceState },
+          }).eq("id", recoveryId);
+        } catch { /* best-effort, não pode quebrar o fluxo real */ }
+      };
+      (payload as any).__recovery_checkpoint = checkpoint;
+      await checkpoint("lease_acquired", { trace_id: traceId });
 
       // 2) Reverificar guardas a partir do estado ATUAL do banco (não do
       //    snapshot da criação da linha de recuperação).
@@ -2346,9 +2377,25 @@ Deno.serve(async (req) => {
           { headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
+      await checkpoint("guards_passed", {
+        expected_block_id: (claimed as any).expected_block_id,
+        conv_current_block_id: convNow?.current_block_id,
+      });
 
-      // 3) Tirar a conversa da janela de seleção do cron por 10min
-      //    (bot_locked_until <= now() é o critério do funnel-resume-cron).
+      // 3) FASE 2.3 — CORRIGIDO (causa-raiz do 2º piloto): NÃO tocar em
+      //    bot_locked_until aqui. `ai_receipt` está em `inputTypes`
+      //    (linha ~5472/5572), então blocos de resume tratam esse campo
+      //    como o timeout de uma pergunta em espera (`isAtInputBlock &&
+      //    isResume`, ~linha 6078-6280): se `bot_locked_until`/
+      //    `waitingInput.timeout_at` está no FUTURO, o código conclui
+      //    "ainda não é hora do timeout" e força `currentBlock = null`
+      //    (~linha 6280), pulando o loop de blocos inteiro — foi
+      //    exatamente isso que fez o 2º piloto retornar
+      //    {"ok":true,"funnel":true} sem nunca alcançar `case
+      //    "ai_receipt"`. O isolamento contra o cron já é feito de forma
+      //    atômica e correta por `conversation_processing_leases`
+      //    (acquire_conversation_lease) — não precisa (e não pode) também
+      //    usar bot_locked_until para isso.
       const flowVarsForRecovery: any = { ...((convNow as any)?.flow_variables || {}) };
       flowVarsForRecovery.__pending_receipt_media = {
         url: (claimed as any).media_url,
@@ -2362,7 +2409,6 @@ Deno.serve(async (req) => {
       };
 
       await supabase.from("webchat_conversations").update({
-        bot_locked_until: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
         flow_variables: flowVarsForRecovery,
       }).eq("id", (claimed as any).conversation_id);
 
@@ -2390,6 +2436,411 @@ Deno.serve(async (req) => {
         reuseEventId: (claimed as any).reuse_event_id || null,
       };
       (payload as any).__recovery_mark_terminal = markTerminal;
+      await checkpoint("delegating_to_funnel_loop");
+    }
+
+    // ============================================================
+    // ACTION: execute_silent_recovery — FASE 2.4. Único caminho que
+    // pode gerar uma venda para o backlog histórico do incidente de
+    // crédito OpenAI SEM reexecutar o funil (o 3º piloto provou que
+    // reexecutar o funil funciona, mas envia mensagens reais ao cliente
+    // — inaceitável para recuperação retroativa de casos de ~1 dia
+    // atrás). Este bloco NUNCA chama normalizePayload, NUNCA entra no
+    // loop de blocos, NUNCA empurra em chunksToSend, NUNCA chama
+    // uazapi-send, NUNCA toca flow_variables/current_block_id/
+    // bot_locked_until da conversa. Só lê o necessário, classifica via
+    // OCR (mesma função read-only do receipt-classify-admin), persiste
+    // a venda canônica via record_purchase_result e envia à Meta.
+    // ============================================================
+    if (action === "execute_silent_recovery" && (payload as any).recoveryId) {
+      const recoveryId = (payload as any).recoveryId;
+      const outboundBaselineErr: string[] = [];
+      console.log("[uazapi-webhook] action: execute_silent_recovery for", recoveryId);
+
+      const { data: flagRow } = await supabase
+        .from("recovery_feature_flags")
+        .select("enabled")
+        .eq("key", "silent_purchase_recovery_enabled")
+        .maybeSingle();
+      if (!flagRow?.enabled) {
+        return new Response(
+          JSON.stringify({ ok: true, skipped: "silent_recovery_feature_flag_disabled" }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const { data: claimed, error: claimErr } = await supabase
+        .from("receipt_recovery_requests")
+        .update({ status: "claimed", claimed_at: new Date().toISOString() })
+        .eq("id", recoveryId)
+        .eq("status", "pending")
+        .eq("retry_blocked", false)
+        .eq("silent_mode_enabled", true)
+        .select("*")
+        .maybeSingle();
+
+      if (claimErr || !claimed) {
+        return new Response(
+          JSON.stringify({ ok: true, skipped: "already_claimed_not_pending_or_silent_mode_not_enabled" }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const traceId = crypto.randomUUID();
+      const traceState: Record<string, any> = {
+        trace_id: traceId,
+        mode: "silent_purchase_recovery",
+        last_checkpoint: "claimed",
+        outbound_attempted: false,
+        ocr_confirmed: false,
+        duplicate_check_passed: false,
+        purchase_persisted: false,
+        meta_status: null,
+      };
+      const checkpoint = async (name: string, extra?: Record<string, any>) => {
+        traceState.last_checkpoint = name;
+        if (extra) Object.assign(traceState, extra);
+        try {
+          await supabase.from("receipt_recovery_requests").update({ result: { ...traceState } }).eq("id", recoveryId);
+        } catch { /* best-effort */ }
+      };
+
+      const { data: leaseToken } = await supabase.rpc("acquire_conversation_lease", {
+        p_conversation_id: (claimed as any).conversation_id,
+        p_owner: "silent_recovery",
+        p_lease_seconds: 300,
+      });
+      if (!leaseToken) {
+        await supabase.from("receipt_recovery_requests").update({ status: "pending", claimed_at: null }).eq("id", recoveryId);
+        return new Response(
+          JSON.stringify({ ok: true, skipped: "conversation_lease_held_by_other_owner" }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const releaseLease = async () => {
+        await supabase.rpc("release_conversation_lease", {
+          p_conversation_id: (claimed as any).conversation_id,
+          p_token: leaseToken,
+        });
+      };
+      const markTerminal = async (status: "done" | "failed" | "skipped", extra: Record<string, any>) => {
+        await supabase.from("receipt_recovery_requests").update({
+          status,
+          result: { ...traceState, ...extra },
+          completed_at: new Date().toISOString(),
+        }).eq("id", recoveryId);
+        await releaseLease();
+      };
+      // Guarda final explícita: qualquer código que tentasse enfileirar
+      // outbound chamaria isto primeiro. Não é usada em lugar nenhum do
+      // fluxo abaixo — a prova de "zero outbound" é estrutural (nenhuma
+      // chamada a chunksToSend/uazapi-send existe neste bloco), e esta
+      // função é o backstop caso um humano adicione uma no futuro.
+      const forbidOutbound = async (where: string) => {
+        await checkpoint("outbound_blocked", { outbound_attempted: true, blocked_at: where });
+        await markTerminal("failed", { reason: `outbound_attempted_at_${where}` });
+        throw new Error(`FASE 2.4 VIOLATION: outbound attempted in silent recovery at ${where}`);
+      };
+      void forbidOutbound; // referenciado só para não ser tree-shaken/linted como não usado
+
+      await checkpoint("lease_acquired");
+
+      // 2) Guardas — mesmas de execute_recovery, relidas do estado ATUAL.
+      const { data: convNow } = await supabase
+        .from("webchat_conversations")
+        .select("id, status, current_block_id, current_flow_id, flow_completed, lead_id, organization_id")
+        .eq("id", (claimed as any).conversation_id)
+        .maybeSingle();
+      const { count: purchaseCountNow } = await supabase
+        .from("purchase_audit")
+        .select("id", { count: "exact", head: true })
+        .eq("conversation_id", (claimed as any).conversation_id)
+        .gte("created_at", (claimed as any).original_message_created_at);
+
+      let skipReason: string | null = null;
+      if (!convNow) skipReason = "conversation_not_found";
+      else if (convNow.current_block_id !== (claimed as any).expected_block_id) skipReason = "conversation_advanced_since_snapshot";
+      else if ((purchaseCountNow || 0) > 0) skipReason = "purchase_already_exists";
+
+      if (skipReason) {
+        await markTerminal("skipped", { reason: skipReason });
+        return new Response(JSON.stringify({ ok: true, skipped: skipReason }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      await checkpoint("guards_passed");
+
+      // Snapshot ANTES — usado na validação pós-execução (conversa e
+      // contadores de outbound devem ficar bit-a-bit idênticos).
+      const { data: convBefore } = await supabase
+        .from("webchat_conversations")
+        .select("current_block_id, flow_variables, bot_locked_until, updated_at")
+        .eq("id", (claimed as any).conversation_id)
+        .maybeSingle();
+      const { count: outboundBefore } = await supabase
+        .from("webchat_messages")
+        .select("id", { count: "exact", head: true })
+        .eq("conversation_id", (claimed as any).conversation_id)
+        .eq("direction", "outbound");
+
+      // 3) Reclassificação OCR/E2E — mesma função read-only usada no
+      //    piloto de auditoria (receipt-classify-admin), chamada aqui
+      //    diretamente (sem HTTP, mesma Edge Function já tem o secret).
+      const openaiKey = Deno.env.get("OPENAI_API_KEY");
+      if (!openaiKey) {
+        await markTerminal("failed", { reason: "openai_key_missing" });
+        return new Response(JSON.stringify({ ok: true, failed: "openai_key_missing" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      const classification = await classifyReceiptMediaReadOnly(
+        (claimed as any).media_url,
+        (claimed as any).media_type,
+        openaiKey,
+      );
+      if ("error" in classification) {
+        await markTerminal("failed", { reason: `classification_error_${classification.error}` });
+        return new Response(JSON.stringify({ ok: true, failed: "classification_error" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      await checkpoint("ocr_completed", {
+        is_receipt: classification.is_provavel_comprovante,
+        confidence: classification.confidence,
+        value: classification.valor,
+      });
+      if (!classification.is_provavel_comprovante || classification.confidence !== "alta") {
+        await markTerminal("failed", { reason: "ocr_not_confident_receipt" });
+        return new Response(JSON.stringify({ ok: true, failed: "ocr_not_confident_receipt" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      const numericValue = typeof classification.valor === "number" ? classification.valor : NaN;
+      if (isNaN(numericValue) || numericValue <= 0) {
+        await markTerminal("failed", { reason: "ocr_value_invalid" });
+        return new Response(JSON.stringify({ ok: true, failed: "ocr_value_invalid" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      await checkpoint("ocr_confirmed", { ocr_confirmed: true });
+
+      // 4) event_id/event_time determinísticos + janela da Meta.
+      const recoveryEventId = (claimed as any).reuse_event_id || await deterministicRecoveryEventId({
+        organizationId: (claimed as any).organization_id,
+        conversationId: (claimed as any).conversation_id,
+        pixelBlockId: "silent_recovery",
+        originalMessageId: (claimed as any).original_message_id,
+      });
+      const evt = resolveOriginalEventTime((claimed as any).original_message_created_at);
+      if (!evt.ok) {
+        await markTerminal("failed", { reason: `event_time_rejected_${evt.reason}` });
+        return new Response(JSON.stringify({ ok: true, failed: "event_time_rejected" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      const eventOccurredAtIso = new Date(evt.eventTimeUnixSeconds * 1000).toISOString();
+
+      // 5) Duplicidade / sucesso anterior — checagem amigável antes do
+      //    índice único (que ainda é a trava real de banco).
+      const { data: existingByEventId } = await supabase
+        .from("purchase_audit")
+        .select("id, meta_status")
+        .eq("event_id", recoveryEventId)
+        .eq("meta_status", "success")
+        .maybeSingle();
+      if (existingByEventId) {
+        await markTerminal("skipped", { reason: "event_id_already_succeeded_no_resend" });
+        return new Response(JSON.stringify({ ok: true, skipped: "event_id_already_succeeded" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      await checkpoint("duplicate_check_passed", { duplicate_check_passed: true });
+
+      // 6) Resolver bloco pixel a jusante (sem executar o funil) e
+      //    integração ativa — mesma lógica do bloco `pixel` em produção,
+      //    só que lida diretamente do flow_blocks em vez de via loop.
+      const { data: flowRow } = await supabase
+        .from("capture_funnels")
+        .select("flow_blocks")
+        .eq("id", (convNow as any).current_flow_id)
+        .maybeSingle();
+      const flowBlocksArr: any[] = ((flowRow as any)?.flow_blocks || []) as any[];
+      const findBlockSilent = (id: string | null) => id ? flowBlocksArr.find((bl) => bl.id === id) : null;
+      const aiReceiptBlock = findBlockSilent((claimed as any).expected_block_id);
+      let pixelBlock: any = null;
+      {
+        let hopId = aiReceiptBlock?.data?.true_next_block_id || aiReceiptBlock?.next_block_id || null;
+        for (let hop = 0; hop < 5 && hopId; hop++) {
+          const b = findBlockSilent(hopId);
+          if (!b) break;
+          if (b.type === "pixel") { pixelBlock = b; break; }
+          hopId = b.data?.true_next_block_id || b.next_block_id || null;
+        }
+      }
+      if (!pixelBlock) {
+        await markTerminal("failed", { reason: "downstream_pixel_block_not_found" });
+        return new Response(JSON.stringify({ ok: true, failed: "downstream_pixel_block_not_found" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      const pageId = pixelBlock.data?.pixel_page_id;
+      const blockPixelId = pixelBlock.data?.pixel_name || pixelBlock.data?.pixel_id;
+      let integQuery = supabase.from("facebook_lead_integrations").select("pixel_id, pixel_access_token, page_id").eq("is_active", true);
+      integQuery = pageId ? integQuery.eq("page_id", pageId) : integQuery.eq("pixel_id", blockPixelId);
+      const { data: integ } = await integQuery.maybeSingle();
+      if (!integ?.pixel_id || !integ?.pixel_access_token) {
+        await markTerminal("failed", { reason: "pixel_integration_not_found" });
+        return new Response(JSON.stringify({ ok: true, failed: "pixel_integration_not_found" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+
+      // 7) Atribuição — mesma cadeia de fallback do bloco pixel ao vivo,
+      //    sem flow_variables (não existem fora do funil): conv.ctwa_data
+      //    → lead_tracking → leads.
+      const leadId = (convNow as any).lead_id;
+      const { data: leadRow } = leadId ? await supabase
+        .from("leads")
+        .select("phone, email, name, fbclid, ctwa_clid, campaign_id, campaign_name, adset_id, adset_name, ad_id, ad_name, ad_source_app, ad_source_url, entry_point_conversion_source, ctwa_detected, created_at")
+        .eq("id", leadId).maybeSingle() : { data: null };
+      const { data: lt } = leadId ? await supabase
+        .from("lead_tracking")
+        .select("fbclid, ctwa_clid, campaign_id, campaign_name, adset_id, adset_name, ad_source_id, ad_source_type, ad_source_url, ad_headline, entry_point_conversion_source, entry_point_conversion_app, created_at")
+        .eq("lead_id", leadId).order("created_at", { ascending: false }).limit(1).maybeSingle() : { data: null };
+      const pick = (...vals: any[]): string | undefined => {
+        for (const v of vals) if (v !== undefined && v !== null && String(v).trim() !== "") return String(v);
+        return undefined;
+      };
+      const ctwa_clid = pick(lt?.ctwa_clid, leadRow?.ctwa_clid);
+      const fbclid = pick(lt?.fbclid, leadRow?.fbclid);
+      const isCtwa = !!(ctwa_clid || leadRow?.ctwa_detected);
+      const action_source = ctwa_clid ? "business_messaging" : (isCtwa ? "chat" : "system_generated");
+      const leadCreatedAt = leadRow?.created_at;
+      const fbc = fbclid ? `fb.1.${leadCreatedAt ? new Date(leadCreatedAt).getTime() : Date.now()}.${fbclid}` : undefined;
+
+      await checkpoint("attribution_resolved", { action_source });
+
+      // 8) Envio real à Meta — mesma função usada pelo tráfego normal.
+      const currency = pixelBlock.data?.pixel_currency || "BRL";
+      const result = await sendFacebookConversion(
+        integ.pixel_id,
+        integ.pixel_access_token,
+        "Purchase",
+        {
+          phone: leadRow?.phone || undefined,
+          email: leadRow?.email || undefined,
+          fn: leadRow?.name || undefined,
+          external_id: leadId,
+          fbc,
+          ctwa_clid,
+          page_id: (integ as any)?.page_id || undefined,
+        },
+        {
+          value: numericValue,
+          currency,
+          campaign_id: pick(lt?.campaign_id, leadRow?.campaign_id),
+          campaign_name: pick(lt?.campaign_name, leadRow?.campaign_name),
+          adset_id: pick(lt?.adset_id, leadRow?.adset_id),
+          adset_name: pick(lt?.adset_name, leadRow?.adset_name),
+          ctwa_clid,
+          ad_source_id: lt?.ad_source_id,
+          ad_source_type: lt?.ad_source_type,
+          ad_source_url: pick(lt?.ad_source_url, leadRow?.ad_source_url),
+          entry_point_conversion_source: pick(lt?.entry_point_conversion_source, leadRow?.entry_point_conversion_source),
+        },
+        {
+          actionSource: action_source,
+          eventId: recoveryEventId,
+          eventTimeUnixSeconds: evt.eventTimeUnixSeconds,
+        },
+      );
+      await checkpoint("meta_call_completed", { meta_status: result.success ? "success" : "failed" });
+
+      // 9) Persistência canônica — mesma RPC usada pelo tráfego normal.
+      const { error: recordErr } = await supabase.rpc("record_purchase_result", {
+        p_conversation_id: (claimed as any).conversation_id,
+        p_lead_id: leadId,
+        p_pixel_block_id: pixelBlock.id,
+        p_pixel_id: integ.pixel_id,
+        p_event_name: "Purchase",
+        p_event_id: result.payload?.data?.[0]?.event_id || recoveryEventId,
+        p_event_occurred_at: eventOccurredAtIso,
+        p_meta_success: result.success,
+        p_fbtrace_id: result.response?.fbtrace_id,
+        p_purchase_value: numericValue,
+        p_currency: currency,
+        p_action_source: action_source,
+        p_campaign_id: pick(lt?.campaign_id, leadRow?.campaign_id),
+        p_campaign_name: pick(lt?.campaign_name, leadRow?.campaign_name),
+        p_adset_id: pick(lt?.adset_id, leadRow?.adset_id),
+        p_adset_name: pick(lt?.adset_name, leadRow?.adset_name),
+        p_ctwa_clid: ctwa_clid,
+        p_ad_source_id: lt?.ad_source_id,
+        p_ad_source_type: lt?.ad_source_type,
+        p_entry_point_conversion_source: pick(lt?.entry_point_conversion_source, leadRow?.entry_point_conversion_source),
+        p_phone: leadRow?.phone,
+        p_customer_name: leadRow?.name,
+        p_raw_payload: result.payload,
+        p_raw_response: result.response,
+        p_recovery_metadata: {
+          recovery_id: recoveryId,
+          source_message_id: (claimed as any).original_message_id,
+          recovered_from_openai_credit_incident: true,
+          mode: "silent_purchase_recovery",
+        },
+      });
+      if (recordErr) {
+        await markTerminal("failed", { reason: `record_purchase_result_error_${recordErr.message}` });
+        return new Response(JSON.stringify({ ok: true, failed: "record_purchase_result_error" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+      await checkpoint("purchase_persist_attempted", { purchase_persisted: true });
+
+      // 10) Validação pós-execução: conversa e contador de outbound
+      //     precisam estar EXATAMENTE iguais ao snapshot de antes.
+      const { data: convAfter } = await supabase
+        .from("webchat_conversations")
+        .select("current_block_id, flow_variables, bot_locked_until")
+        .eq("id", (claimed as any).conversation_id)
+        .maybeSingle();
+      const { count: outboundAfter } = await supabase
+        .from("webchat_messages")
+        .select("id", { count: "exact", head: true })
+        .eq("conversation_id", (claimed as any).conversation_id)
+        .eq("direction", "outbound");
+
+      const conversationUnchangedResult = conversationUnchanged(
+        {
+          currentBlockId: convBefore?.current_block_id,
+          flowVariables: convBefore?.flow_variables,
+          botLockedUntil: convBefore?.bot_locked_until,
+        },
+        {
+          currentBlockId: convAfter?.current_block_id,
+          flowVariables: convAfter?.flow_variables,
+          botLockedUntil: convAfter?.bot_locked_until,
+        },
+      );
+      const outboundUnchanged = outboundCountUnchanged(outboundBefore || 0, outboundAfter || 0);
+
+      if (!conversationUnchangedResult || !outboundUnchanged) {
+        // Não deveria ser possível chegar aqui (nada neste bloco escreve em
+        // webchat_conversations/webchat_messages) — se acontecer, é sinal
+        // de regressão externa concorrente, não deste código. Reportado,
+        // não silenciado.
+        await markTerminal("failed", {
+          reason: "post_execution_invariant_violated",
+          conversation_unchanged: conversationUnchangedResult,
+          outbound_unchanged: outboundUnchanged,
+          outbound_before: outboundBefore,
+          outbound_after: outboundAfter,
+        });
+        return new Response(JSON.stringify({ ok: true, failed: "post_execution_invariant_violated" }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+
+      await markTerminal(result.success ? "done" : "failed", {
+        meta_success: result.success,
+        event_id: result.payload?.data?.[0]?.event_id || recoveryEventId,
+        value: numericValue,
+        conversation_unchanged: true,
+        outbound_unchanged: true,
+        outbound_before: outboundBefore,
+        outbound_after: outboundAfter,
+      });
+
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          mode: "silent_purchase_recovery",
+          trace_id: traceId,
+          purchase_persisted: true,
+          meta_status: result.success ? "success" : "failed",
+          outbound_attempted: false,
+          conversation_unchanged: true,
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
     }
 
     // ACTION: resume_funnel (manual or cron)
@@ -2514,14 +2965,18 @@ Deno.serve(async (req) => {
     }
 
     norm = normalizePayload(payload);
-    // FASE 2 — recuperação: substitui o messageId sintético (resume-<ts>)
-    // pelo message_id ORIGINAL carregado do banco em execute_recovery,
-    // ANTES de qualquer uso downstream (_auditReceipt, dedup por 60s,
-    // norm.media.messageId). Único ponto de mutação — nenhuma outra lógica
-    // de norm é alterada.
-    if ((payload as any).__recovery_context?.originalMessageId) {
-      (norm as any).messageId = (payload as any).__recovery_context.originalMessageId;
-    }
+    // FASE 2.1 — CORRIGIDO após teste real em produção (piloto):
+    // sobrescrever norm.messageId AQUI, antes do guard INBOUND DEDUP
+    // (processed_messages, ~10 linhas abaixo), faz o guard enxergar o
+    // message_id ORIGINAL — que já está em processed_messages desde a 1ª
+    // tentativa (a que falhou silenciosamente) — e abortar com
+    // "duplicate_message_id" antes de chegar em qualquer lógica de
+    // recuperação. O guard não tem exceção para __is_resume (é
+    // incondicional). Correção: a substituição some daqui e passa a
+    // acontecer só imediatamente antes do bloco `ai_receipt` processar o
+    // replay (ver `[AI_RECEIPT_PENDING_MEDIA_REPLAY]`), depois que os
+    // guards de dedup de mensagem NOVA já rodaram com o id sintético do
+    // resume (que nunca colide, por ser gerado na hora).
     console.log("[uazapi-webhook] normalized:", JSON.stringify(norm));
 
     // [WEBHOOK_HEALTH_TRACKING] Update last_webhook_event_at for the instance
@@ -6073,7 +6528,23 @@ Mensagem do lead:
                 "[uazapi-webhook] input_answer_rejected: too early (before question_sent_at)",
               );
             }
-          } else if (isAtInputBlock && isResume) {
+          } else if (
+            isAtInputBlock && isResume &&
+            !(payload as any).__recovery_context
+          ) {
+            // FASE 2.3 — causa-raiz do 2º piloto: este bloco de
+            // pré-checagem (question/timeout) existe para o ciclo real de
+            // "pergunta em espera" do funil, e sua lógica de timeout pode
+            // desviar `currentBlock` para o `false_next_block_id`/
+            // `timeout_next_block_id` configurado no bloco — que para
+            // este `ai_receipt` específico é um bloco tipo `message`, não
+            // outro `ai_receipt`. Chamadas de recuperação (`execute_recovery`)
+            // reusam `__is_resume=true` para reaproveitar o restante do
+            // caminho oficial, mas NÃO devem entrar nesta pré-checagem —
+            // elas precisam cair direto no loop de blocos abaixo, onde
+            // `case "ai_receipt"` já tem sua própria lógica de replay do
+            // pending-media, independente de qualquer estado de
+            // `__waiting_input`/timeout.
             console.log("[uazapi-webhook] resume_input_block_check:", {
               block_id: currentBlock?.id,
               waiting_input: waitingInput,
@@ -6853,6 +7324,16 @@ Mensagem do lead:
                           error: _recordErr.message,
                         }));
                       }
+                      if (recoveryCtx && (payload as any).__recovery_checkpoint) {
+                        await (payload as any).__recovery_checkpoint(
+                          "purchase_persist_attempted",
+                          {
+                            purchase_persisted: !_recordErr,
+                            meta_status: result.success ? "success" : "failed",
+                            event_id: recoveryEventId,
+                          },
+                        );
+                      }
 
                       if (recoveryCtx && (payload as any).__recovery_mark_terminal) {
                         await (payload as any).__recovery_mark_terminal(
@@ -7483,11 +7964,38 @@ Mensagem do lead:
                 // texto do gatilho e o comprovante nunca era lido
                 // ([FASE 23.2]: replays com OCR = "Vc recebeu?").
                 // ───────────────────────────────────────────────────────
+                // FASE 2.1 — override do messageId original acontece SÓ
+                // aqui, depois de todos os guards de dedup de mensagem NOVA
+                // (que já rodaram com sucesso usando o id sintético do
+                // resume). A partir daqui, _auditReceipt e o bloco `pixel`
+                // (via norm.messageId) usam o id original.
+                if ((payload as any).__recovery_context?.originalMessageId) {
+                  (norm as any).messageId =
+                    (payload as any).__recovery_context.originalMessageId;
+                  if ((payload as any).__recovery_checkpoint) {
+                    await (payload as any).__recovery_checkpoint(
+                      "reached_ai_receipt_case",
+                      { reached_ai_receipt: true, block_id: b.id },
+                    );
+                  }
+                }
                 let _replayedFromPending = false;
                 try {
                   const pending: any =
                     (flowVariables as any).__pending_receipt_media;
                   const hasIncomingMedia = !!(norm as any)?.media;
+                  if (
+                    (payload as any).__recovery_checkpoint &&
+                    (payload as any).__recovery_context
+                  ) {
+                    await (payload as any).__recovery_checkpoint(
+                      "pending_media_lookup",
+                      {
+                        pending_media_found: !!(pending && pending.url && !hasIncomingMedia),
+                        has_incoming_media: hasIncomingMedia,
+                      },
+                    );
+                  }
                   if (pending && pending.url && !hasIncomingMedia) {
                     const ageMs = Date.now() -
                       new Date(pending.received_at || 0).getTime();
@@ -7951,6 +8459,15 @@ Mensagem do lead:
                         : {}),
                       ...auditPayload,
                     });
+                    if (
+                      _outerRecoveryCtx && (payload as any).__recovery_checkpoint &&
+                      auditPayload?.decision && auditPayload.decision !== "ai_receipt_enter"
+                    ) {
+                      await (payload as any).__recovery_checkpoint(
+                        "terminal_decision_created",
+                        { decision_created: true, decision: auditPayload.decision, route: auditPayload.route },
+                      );
+                    }
                   } catch (_auditErr) { /* best-effort */ }
                 };
 

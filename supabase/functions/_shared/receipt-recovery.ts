@@ -286,3 +286,37 @@ export function mergePurchaseStatus(
   if (existing === "success") return "success";
   return incoming;
 }
+
+export interface ConversationSnapshot {
+  currentBlockId: string | null | undefined;
+  flowVariables: unknown;
+  botLockedUntil: string | null | undefined;
+}
+
+/**
+ * FASE 2.4 — regra usada pelo modo `silent_purchase_recovery` para provar
+ * (não apenas afirmar) que a conversa não foi tocada: compara um snapshot
+ * de antes e depois campo a campo. Usada de verdade em
+ * uazapi-webhook/index.ts (a lógica real, não esta função em si, roda lá —
+ * esta é a mesma regra extraída para ser testável sem rede/banco).
+ */
+export function conversationUnchanged(
+  before: ConversationSnapshot,
+  after: ConversationSnapshot,
+): boolean {
+  return (
+    before.currentBlockId === after.currentBlockId &&
+    JSON.stringify(before.flowVariables) === JSON.stringify(after.flowVariables) &&
+    before.botLockedUntil === after.botLockedUntil
+  );
+}
+
+/**
+ * FASE 2.4 — prova de "zero outbound": compara a contagem de mensagens
+ * outbound antes/depois. Combinada com a garantia estrutural (nenhuma
+ * chamada a chunksToSend/uazapi-send existe no código do modo silencioso),
+ * mas verificada aqui numericamente, não só por ausência de chamada.
+ */
+export function outboundCountUnchanged(before: number, after: number): boolean {
+  return before === after;
+}

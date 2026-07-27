@@ -4,9 +4,11 @@
 // chama a OpenAI, o Supabase ou a Meta — todos rodam sem rede.
 
 import {
+  conversationUnchanged,
   deterministicRecoveryEventId,
   isSameTransaction,
   mergePurchaseStatus,
+  outboundCountUnchanged,
   resolveOriginalEventTime,
 } from "./receipt-recovery.ts";
 import { assert, assertEquals } from "https://deno.land/std@0.208.0/assert/mod.ts";
@@ -141,4 +143,40 @@ Deno.test("mergePurchaseStatus: no prior row (null) then failed => failed", () =
 
 Deno.test("mergePurchaseStatus: no prior row (null) then success => success", () => {
   assertEquals(mergePurchaseStatus(null, "success"), "success");
+});
+
+// FASE 2.4 — silent_purchase_recovery: prova de "conversa inalterada" e
+// "zero outbound", extraída para ser testável sem rede/banco. A garantia
+// REAL vem de uazapi-webhook/index.ts chamando exatamente esta lógica
+// contra um snapshot antes/depois lido do banco — não testável aqui sem
+// Postgres real (ver relatório FASE 2.4, seção de testes).
+Deno.test("conversationUnchanged: identical snapshots => true", () => {
+  const snap = { currentBlockId: "block-1", flowVariables: { a: 1 }, botLockedUntil: null };
+  assertEquals(conversationUnchanged(snap, { ...snap }), true);
+});
+
+Deno.test("conversationUnchanged: different current_block_id => false", () => {
+  const before = { currentBlockId: "block-1", flowVariables: {}, botLockedUntil: null };
+  const after = { currentBlockId: "block-2", flowVariables: {}, botLockedUntil: null };
+  assertEquals(conversationUnchanged(before, after), false);
+});
+
+Deno.test("conversationUnchanged: different flow_variables (deep) => false", () => {
+  const before = { currentBlockId: "b1", flowVariables: { x: 1 }, botLockedUntil: null };
+  const after = { currentBlockId: "b1", flowVariables: { x: 2 }, botLockedUntil: null };
+  assertEquals(conversationUnchanged(before, after), false);
+});
+
+Deno.test("conversationUnchanged: different bot_locked_until => false", () => {
+  const before = { currentBlockId: "b1", flowVariables: {}, botLockedUntil: null };
+  const after = { currentBlockId: "b1", flowVariables: {}, botLockedUntil: "2026-07-27T18:00:00Z" };
+  assertEquals(conversationUnchanged(before, after), false);
+});
+
+Deno.test("outboundCountUnchanged: same count => true (zero outbound attempts)", () => {
+  assertEquals(outboundCountUnchanged(15, 15), true);
+});
+
+Deno.test("outboundCountUnchanged: count increased => false (outbound was attempted/sent)", () => {
+  assertEquals(outboundCountUnchanged(15, 20), false);
 });
