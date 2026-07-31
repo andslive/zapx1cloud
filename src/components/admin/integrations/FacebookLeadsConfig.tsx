@@ -97,16 +97,16 @@ export function FacebookLeadsConfig() {
   };
   
   const handleCreateOrUpdate = async () => {
-    if (!productId || !pageId || !accessToken) {
+    if (!productId || !pageId || !pixelId || !pixelAccessToken) {
       toast.error('Preencha todos os campos obrigatórios');
       return;
     }
-    
+
     const payload = {
       product_id: productId,
       page_id: pageId,
       page_name: pageName || undefined,
-      page_access_token: accessToken,
+      page_access_token: accessToken || undefined,
       field_mapping: fieldMapping,
       distribution_rule: distributionRule,
       assigned_user_id: distributionRule === 'user' ? assignedUserId : undefined,
@@ -151,7 +151,7 @@ export function FacebookLeadsConfig() {
     setProductId(integration.product_id);
     setPageId(integration.page_id);
     setPageName(integration.page_name || '');
-    setAccessToken(integration.page_access_token);
+    setAccessToken(integration.page_access_token || '');
     setFieldMapping(integration.field_mapping || DEFAULT_FIELD_MAPPING);
     setDistributionRule(integration.distribution_rule);
     setAssignedUserId(integration.assigned_user_id || '');
@@ -448,43 +448,30 @@ export function FacebookLeadsConfig() {
                 />
               </div>
               
-              <div>
-                <Label>Page Access Token *</Label>
-                <Input 
-                  type="password"
-                  placeholder="EAAxxxxxx..." 
-                  value={accessToken}
-                  onChange={e => setAccessToken(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground mt-1">
-                  Obtenha em Facebook Developers → Seu App → Ferramentas → Graph API Explorer
-                </p>
-              </div>
-
               <div className="pt-4 border-t">
                 <h4 className="text-sm font-medium mb-3">Facebook Pixel (Conversões WhatsApp)</h4>
                 <div className="space-y-4">
                   <div>
                     <Label>Nome do Pixel</Label>
-                    <Input 
-                      placeholder="Ex: Meu Pixel Principal" 
+                    <Input
+                      placeholder="Ex: Meu Pixel Principal"
                       value={pixelName}
                       onChange={e => setPixelName(e.target.value)}
                     />
                   </div>
                   <div>
-                    <Label>ID do Pixel</Label>
-                    <Input 
-                      placeholder="Ex: 1234567890" 
+                    <Label>ID do Pixel *</Label>
+                    <Input
+                      placeholder="Ex: 1234567890"
                       value={pixelId}
                       onChange={e => setPixelId(e.target.value)}
                     />
                   </div>
                   <div>
-                    <Label>Access Token PIXEL</Label>
-                    <Input 
+                    <Label>Access Token PIXEL *</Label>
+                    <Input
                       type="password"
-                      placeholder="EAAYxxxxxx..." 
+                      placeholder="EAAYxxxxxx..."
                       value={pixelAccessToken}
                       onChange={e => setPixelAccessToken(e.target.value)}
                     />
