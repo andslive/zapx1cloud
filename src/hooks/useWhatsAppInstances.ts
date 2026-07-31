@@ -20,6 +20,7 @@ export interface WhatsAppInstance {
   qr_code_updated_at: string | null;
   webhook_subscribed: boolean;
   is_default: boolean;
+  default_funnel_id: string | null;
   last_connected_at: string | null;
   last_health_at: string | null;
   last_real_whatsapp_state?: string | null;
@@ -437,6 +438,35 @@ export function useUpdateWhatsAppInstanceOffer() {
       toast.success('Oferta atualizada com sucesso');
     },
     onError: (e: any) => toast.error('Erro ao atualizar oferta: ' + e.message),
+  });
+}
+
+// Funil padrão da conexão: só afeta novas conversas (conversas já em
+// andamento continuam presas ao current_flow_id fixado quando começaram).
+// Usa RPC (set_connection_default_funnel) em vez de update direto porque a
+// troca precisa registrar auditoria em platform_audit_logs (mesma organização
+// + funil anterior/novo/usuário/data), e a escrita nessa tabela é restrita a
+// super_admin via RLS — a função SECURITY DEFINER valida a permissão real
+// (admin/manager da mesma org, ou super_admin) no backend.
+export function useSetConnectionDefaultFunnel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { connectionId: string; funnelId: string | null }) => {
+      const { data, error } = await supabase.rpc('set_connection_default_funnel', {
+        _connection_id: vars.connectionId,
+        _funnel_id: vars.funnelId,
+      });
+      if (error) throw error;
+      return data;
+    },
+    onSuccess: async () => {
+      // Refetch explícito (não otimista) para confirmar o valor realmente
+      // persistido, em vez de assumir que a UI já está certa.
+      await qc.invalidateQueries({ queryKey: ['whatsapp-instances'] });
+      await qc.invalidateQueries({ queryKey: ['whatsapp-instances-all'] });
+      toast.success('Funil da conexão atualizado');
+    },
+    onError: (e: any) => toast.error('Erro ao atualizar funil: ' + (e?.message || 'erro desconhecido')),
   });
 }
 
