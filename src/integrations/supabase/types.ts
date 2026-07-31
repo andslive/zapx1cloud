@@ -4128,7 +4128,7 @@ export type Database = {
           last_lead_received_at: string | null
           leads_count: number | null
           organization_id: string
-          page_access_token: string
+          page_access_token: string | null
           page_id: string
           page_name: string | null
           pixel_access_token: string | null
@@ -4152,7 +4152,7 @@ export type Database = {
           last_lead_received_at?: string | null
           leads_count?: number | null
           organization_id: string
-          page_access_token: string
+          page_access_token?: string | null
           page_id: string
           page_name?: string | null
           pixel_access_token?: string | null
@@ -4176,7 +4176,7 @@ export type Database = {
           last_lead_received_at?: string | null
           leads_count?: number | null
           organization_id?: string
-          page_access_token?: string
+          page_access_token?: string | null
           page_id?: string
           page_name?: string | null
           pixel_access_token?: string | null

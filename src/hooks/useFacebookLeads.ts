@@ -9,7 +9,7 @@ export interface FacebookLeadIntegration {
   product_id: string;
   page_id: string;
   page_name: string | null;
-  page_access_token: string;
+  page_access_token: string | null;
   app_secret: string | null;
   pixel_name: string | null;
   pixel_id: string | null;
@@ -104,7 +104,7 @@ export function useCreateFacebookIntegration() {
       product_id: string;
       page_id: string;
       page_name?: string;
-      page_access_token: string;
+      page_access_token?: string;
       app_secret?: string;
       field_mapping?: Record<string, string>;
       distribution_rule?: string;
@@ -123,7 +123,7 @@ export function useCreateFacebookIntegration() {
           product_id: data.product_id,
           page_id: data.page_id,
           page_name: data.page_name || null,
-          page_access_token: data.page_access_token,
+          page_access_token: data.page_access_token || null,
           app_secret: data.app_secret || null,
           pixel_name: data.pixel_name || null,
           pixel_id: data.pixel_id || null,
