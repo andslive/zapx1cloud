@@ -177,11 +177,19 @@ Deno.serve(async (req) => {
         return new Response(JSON.stringify({ ok: false, error: "UazAPI retornou dados inválidos" }), { status: 500, headers: corsHeaders });
       }
 
-      // [WEBHOOK_AUTO_REPAIR] Set webhook immediately after creation
-      await waFetch(config, `/webhook/set`, {
+      // [WEBHOOK_AUTO_REPAIR] Set webhook immediately after creation.
+      // Endpoint primário /webhook (uazapiGO aceita apenas POST /webhook; /webhook/set é GET-only);
+      // fallback para /webhook/set para outras versões.
+      let whSet = await waFetch(config, `/webhook`, {
         method: "POST",
         body: JSON.stringify({ url: webhookUrl, enabled: true, events: defaultEvents })
       }, instanceData.token);
+      if (!whSet.ok) {
+        await waFetch(config, `/webhook/set`, {
+          method: "POST",
+          body: JSON.stringify({ url: webhookUrl, enabled: true, events: defaultEvents })
+        }, instanceData.token);
+      }
 
 
       // [PROFILE_SYNC_START]
@@ -237,17 +245,19 @@ Deno.serve(async (req) => {
       if (!instance) return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: corsHeaders });
 
       if (action === "repair_webhook") {
-        const res = await waFetch(config, `/webhook/set`, {
+        // Endpoint primário /webhook (uazapiGO aceita apenas POST /webhook; /webhook/set é GET-only).
+        let res = await waFetch(config, `/webhook`, {
           method: "POST",
           body: JSON.stringify({ url: webhookUrl, enabled: true, events: defaultEvents })
         }, instance.instance_token);
 
-        // Retry with /webhook if /webhook/set fails
+        // Fallback para /webhook/set em versões que usem esse endpoint.
         if (!res.ok) {
-           await waFetch(config, `/webhook`, {
+           const alt = await waFetch(config, `/webhook/set`, {
             method: "POST",
             body: JSON.stringify({ url: webhookUrl, enabled: true, events: defaultEvents })
           }, instance.instance_token);
+           if (alt.ok) res = alt;
         }
 
 
@@ -319,18 +329,60 @@ Deno.serve(async (req) => {
 
     if (action === "delete_instance_self") {
       const id = body.id;
-      const { data: instance } = await supabase.from("evolution_instances").select("*").eq("id", id).single();
-      if (instance) {
-        // 1) Remove do banco primeiro (fonte da verdade do painel)
-        const { error: dbErr } = await supabase.from("evolution_instances").delete().eq("id", id);
-        if (dbErr) {
-          console.error(`[${requestId}] [DELETE_SELF] DB delete failed:`, dbErr);
-          return new Response(JSON.stringify({ ok: false, error: dbErr.message }), { status: 500, headers: corsHeaders });
-        }
-        console.log(`[${requestId}] [DELETE_SELF] DB row deleted: ${id} (${instance.name})`);
+      if (!id) {
+        return new Response(JSON.stringify({ ok: false, error: "ID is required" }), { status: 400, headers: corsHeaders });
+      }
 
-        // 2) Remoção remota na UazAPI: best-effort com timeout de 10s (não bloqueia a limpeza)
-        let remote: { ok: boolean; status?: number; message?: string } = { ok: false };
+      // Autorização: exclusão limitada à organização do usuário autenticado.
+      // Service role (chamadas internas/admin) passa direto; usuário comum
+      // precisa pertencer à mesma organização da conexão — nunca confiar só
+      // no frontend para isso.
+      let callerOrgId: string | null = null;
+      if (!isServiceRole) {
+        if (!user) {
+          return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), { status: 401, headers: corsHeaders });
+        }
+        const { data: callerProfile } = await supabase.from("profiles").select("organization_id").eq("id", user.id).single();
+        callerOrgId = callerProfile?.organization_id ?? null;
+        if (!callerOrgId) {
+          return new Response(JSON.stringify({ ok: false, error: "No organization found for user" }), { status: 403, headers: corsHeaders });
+        }
+      }
+
+      const { data: instance, error: fetchErr } = await supabase.from("evolution_instances").select("*").eq("id", id).maybeSingle();
+      if (fetchErr) {
+        console.error(`[${requestId}] [DELETE_SELF] fetch failed:`, JSON.stringify({ connection_id: id, message: fetchErr.message }));
+        return new Response(JSON.stringify({ ok: false, error: "Falha ao localizar a conexão" }), { status: 500, headers: corsHeaders });
+      }
+      if (!instance) {
+        // Já não existe localmente — idempotente, sem tentar identificar nada por nome.
+        return new Response(JSON.stringify({ ok: true, alreadyGone: true }), { headers: corsHeaders });
+      }
+
+      if (!isServiceRole && instance.organization_id !== callerOrgId) {
+        console.warn(`[${requestId}] [DELETE_SELF] cross-org attempt blocked:`, JSON.stringify({ connection_id: id, instanceOrg: instance.organization_id, callerOrgId }));
+        return new Response(JSON.stringify({ ok: false, error: "Não autorizado a excluir esta conexão" }), { status: 403, headers: corsHeaders });
+      }
+
+      // Verifica histórico real de atendimento (não apenas logs operacionais)
+      // antes de decidir entre arquivar e excluir fisicamente. evolution_instances
+      // tem FK ON DELETE SET NULL em webchat_conversations/leads — um DELETE
+      // físico aqui removeria silenciosamente a atribuição de canal do
+      // histórico dessas conversas/leads, o que não é aceitável por padrão.
+      const [{ count: convCount, error: convCountErr }, { count: leadCount, error: leadCountErr }] = await Promise.all([
+        supabase.from("webchat_conversations").select("id", { count: "exact", head: true }).eq("evolution_instance_id", id),
+        supabase.from("leads").select("id", { count: "exact", head: true }).eq("connection_id", id),
+      ]);
+      if (convCountErr || leadCountErr) {
+        console.error(`[${requestId}] [DELETE_SELF] history count failed:`, JSON.stringify({ connection_id: id, convCountErr: convCountErr?.message, leadCountErr: leadCountErr?.message }));
+        return new Response(JSON.stringify({ ok: false, error: "Falha ao verificar histórico da conexão" }), { status: 500, headers: corsHeaders });
+      }
+      const hasHistory = (convCount ?? 0) > 0 || (leadCount ?? 0) > 0;
+
+      // Remoção remota best-effort (mesma para os dois caminhos): não bloqueia
+      // a operação local, e um 404 do provedor (instância já removida lá) é
+      // tratado como estado idempotente, não como erro.
+      const removeRemote = async (): Promise<{ ok: boolean; status?: number; message?: string }> => {
         try {
           const res = await waFetch(
             config,
@@ -339,15 +391,56 @@ Deno.serve(async (req) => {
             instance.instance_token,
             true
           );
-          remote = { ok: res.ok, status: res.status, message: res.message };
+          return { ok: res.ok || res.status === 404, status: res.status, message: res.message };
         } catch (err: any) {
-          console.error(`[${requestId}] [DELETE_SELF] Remote remove failed/timeout:`, err?.message);
-          remote = { ok: false, message: err?.message || "timeout" };
+          console.error(`[${requestId}] [DELETE_SELF] Remote remove failed/timeout:`, JSON.stringify({ connection_id: id, message: err?.message }));
+          return { ok: false, message: err?.message || "timeout" };
         }
-        console.log(`[${requestId}] [DELETE_SELF] Remote result:`, JSON.stringify(remote));
-        return new Response(JSON.stringify({ ok: true, remote }), { headers: corsHeaders });
+      };
+
+      if (hasHistory) {
+        // Arquiva: desativa (para de rotear webhooks/funis para esta conexão,
+        // mesmo mecanismo já usado pelo gate is_active do webhook) e preserva
+        // a linha e todo o histórico vinculado. Nunca DELETE físico aqui.
+        const { error: archiveErr } = await supabase
+          .from("evolution_instances")
+          .update({ is_active: false, status: "disconnected" })
+          .eq("id", id);
+        if (archiveErr) {
+          console.error(`[${requestId}] [DELETE_SELF] archive failed:`, JSON.stringify({ connection_id: id, message: archiveErr.message }));
+          return new Response(JSON.stringify({ ok: false, error: "Falha ao arquivar a conexão" }), { status: 500, headers: corsHeaders });
+        }
+        const remote = await removeRemote();
+        console.log(`[${requestId}] [DELETE_SELF] archived (has history):`, JSON.stringify({ connection_id: id, name: instance.name, conversations: convCount, leads: leadCount, remote }));
+        return new Response(JSON.stringify({
+          ok: true,
+          archived: true,
+          historyCounts: { conversations: convCount ?? 0, leads: leadCount ?? 0 },
+          remote,
+        }), { headers: corsHeaders });
       }
-      return new Response(JSON.stringify({ ok: true, alreadyGone: true }), { headers: corsHeaders });
+
+      // Sem histórico de negócio: exclusão física é segura. Logs puramente
+      // operacionais (admin_notification_logs) têm FK ON DELETE NO ACTION —
+      // desvincula-os primeiro (preserva os registros, só solta a referência)
+      // em vez de deixar a exclusão falhar com um erro de integridade opaco.
+      const { error: unlinkLogsErr } = await supabase
+        .from("admin_notification_logs")
+        .update({ connection_id: null })
+        .eq("connection_id", id);
+      if (unlinkLogsErr) {
+        console.error(`[${requestId}] [DELETE_SELF] unlink notification logs failed:`, JSON.stringify({ connection_id: id, message: unlinkLogsErr.message }));
+        return new Response(JSON.stringify({ ok: false, error: "Falha ao preparar exclusão da conexão" }), { status: 500, headers: corsHeaders });
+      }
+
+      const { error: dbErr } = await supabase.from("evolution_instances").delete().eq("id", id);
+      if (dbErr) {
+        console.error(`[${requestId}] [DELETE_SELF] DB delete failed:`, JSON.stringify({ connection_id: id, message: dbErr.message, code: (dbErr as any).code }));
+        return new Response(JSON.stringify({ ok: false, error: "Falha ao excluir a conexão (restrição de integridade)" }), { status: 500, headers: corsHeaders });
+      }
+      const remote = await removeRemote();
+      console.log(`[${requestId}] [DELETE_SELF] deleted (no history):`, JSON.stringify({ connection_id: id, name: instance.name, remote }));
+      return new Response(JSON.stringify({ ok: true, archived: false, remote }), { headers: corsHeaders });
     }
 
     if (action === "sync_instances") {

@@ -283,7 +283,31 @@ export function useDeleteWhatsAppInstance() {
   });
 }
 
-// Self-service: org admin/manager pode excluir a própria conexão
+// Somente leitura: quantas conversas/leads reais estão vinculados a uma
+// conexão. Usado para decidir/explicar se a exclusão vai arquivar (preserva
+// histórico) ou excluir fisicamente — a mesma regra que a Edge Function usa
+// para decidir de fato, então isto é só para informar o usuário antes de
+// confirmar (a decisão canônica continua sendo feita no backend).
+export function useConnectionHistoryCounts(connectionId: string | null) {
+  return useQuery({
+    queryKey: ['connection-history-counts', connectionId],
+    queryFn: async () => {
+      const [conv, leads] = await Promise.all([
+        supabase.from('webchat_conversations').select('id', { count: 'exact', head: true }).eq('evolution_instance_id', connectionId!),
+        supabase.from('leads').select('id', { count: 'exact', head: true }).eq('connection_id', connectionId!),
+      ]);
+      if (conv.error) throw conv.error;
+      if (leads.error) throw leads.error;
+      return { conversations: conv.count ?? 0, leads: leads.count ?? 0 };
+    },
+    enabled: !!connectionId,
+  });
+}
+
+// Self-service: org admin/manager pode excluir a própria conexão. O backend
+// decide arquivar (is_active=false, preserva histórico) em vez de excluir
+// fisicamente quando há conversas/leads vinculados — nunca confiar no
+// frontend para essa decisão.
 export function useDeleteWhatsAppInstanceSelf() {
   const qc = useQueryClient();
   const proxy = useProxyAction();
@@ -295,16 +319,20 @@ export function useDeleteWhatsAppInstanceSelf() {
       try {
         const res = await proxy(payload);
         console.log('[DELETE_UAZ_RESPONSE]', { id, res });
-        return res;
+        return res as { ok: boolean; archived?: boolean; alreadyGone?: boolean; historyCounts?: { conversations: number; leads: number } };
       } catch (err: any) {
         console.log('[DELETE_UAZ_ERROR]', { id, message: err?.message, err });
         throw err;
       }
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['whatsapp-instances'] });
       qc.invalidateQueries({ queryKey: ['whatsapp-instances-all'] });
-      toast.success('Conexão excluída');
+      if (data?.archived) {
+        toast.success('Conexão arquivada — o histórico de conversas e leads foi preservado.');
+      } else {
+        toast.success('Conexão excluída');
+      }
     },
     onError: (e: any) => toast.error('Erro ao excluir: ' + e.message),
   });

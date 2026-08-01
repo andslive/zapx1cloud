@@ -19,6 +19,7 @@ import {
   useDeleteWhatsAppInstanceSelf,
   useUpdateWhatsAppInstanceOffer,
   useSetConnectionDefaultFunnel,
+  useConnectionHistoryCounts,
   WhatsAppInstance
 } from '@/hooks/useWhatsAppInstances';
 import { useFunnels } from '@/hooks/useFunnels';
@@ -203,6 +204,110 @@ function ConnectionFunnelSelect({
   );
 }
 
+// Diálogo de confirmação de exclusão. Não usa window.confirm() (bloqueia a
+// thread principal e é a causa mais provável do alerta de INP relatado — o
+// alerta de responsividade é distinto da falha da Edge Function, que tinha
+// causa própria: violação de FK). Mostra o histórico real antes de confirmar;
+// a decisão de arquivar vs excluir fisicamente é sempre feita no backend.
+function DeleteConnectionDialog({
+  conn,
+  onClose,
+  deleteUazMut,
+  deleteChromiumMut,
+  refetchUaz,
+  refetchChromium,
+}: {
+  conn: any;
+  onClose: () => void;
+  deleteUazMut: ReturnType<typeof useDeleteWhatsAppInstanceSelf>;
+  deleteChromiumMut: ReturnType<typeof useDeleteConnection>;
+  refetchUaz: () => void;
+  refetchChromium: () => void;
+}) {
+  const { data: counts, isLoading: isLoadingCounts } = useConnectionHistoryCounts(conn?.uaz?.id ?? null);
+  const isPending = deleteUazMut.isPending || deleteChromiumMut.isPending;
+  const name = conn?.uaz?.custom_name || conn?.uaz?.name || conn?.name;
+
+  const willArchive = !isLoadingCounts && ((counts?.conversations ?? 0) > 0 || (counts?.leads ?? 0) > 0);
+
+  const handleConfirm = () => {
+    if (isPending) return;
+    if (conn.chromium) {
+      deleteChromiumMut.mutate(conn.chromium.id, {
+        onSuccess: () => refetchChromium(),
+      });
+    }
+    if (conn.uaz) {
+      deleteUazMut.mutate(conn.uaz.id, {
+        onSuccess: () => {
+          refetchUaz();
+          onClose();
+        },
+      });
+    } else {
+      onClose();
+    }
+  };
+
+  return (
+    <AlertDialog open={!!conn} onOpenChange={(open) => { if (!open && !isPending) onClose(); }}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Excluir "{name}"?</AlertDialogTitle>
+          <AlertDialogDescription asChild>
+            <div className="space-y-2 text-sm text-left">
+              {isLoadingCounts ? (
+                <p className="flex items-center gap-1.5 text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" /> Verificando histórico vinculado...
+                </p>
+              ) : willArchive ? (
+                <>
+                  <p>
+                    Esta conexão tem <strong>{counts?.conversations ?? 0} conversa(s)</strong> e{' '}
+                    <strong>{counts?.leads ?? 0} lead(s)</strong> vinculados.
+                  </p>
+                  <p className="text-amber-600 dark:text-amber-400">
+                    Por isso, ela será <strong>arquivada</strong> (desativada e desconectada), não excluída —
+                    todo o histórico de conversas, leads e vendas continua preservado. Ela deixa de receber
+                    novas mensagens.
+                  </p>
+                </>
+              ) : (
+                <p className="text-destructive">
+                  Esta conexão não tem conversas nem leads vinculados. Ela será <strong>excluída permanentemente</strong>,
+                  incluindo a tentativa de remoção no provedor.
+                </p>
+              )}
+              {(deleteUazMut.isError || deleteChromiumMut.isError) && (
+                <p className="text-destructive text-xs">
+                  Erro ao excluir: {
+                    (deleteUazMut.error instanceof Error && deleteUazMut.error.message) ||
+                    (deleteChromiumMut.error instanceof Error && deleteChromiumMut.error.message) ||
+                    'tente novamente'
+                  }
+                </p>
+              )}
+            </div>
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={isPending} onClick={() => !isPending && onClose()}>
+            Cancelar
+          </AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            disabled={isPending || isLoadingCounts}
+            onClick={handleConfirm}
+          >
+            {isPending && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
+            {willArchive ? 'Confirmar arquivamento' : 'Confirmar exclusão'}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
 function UazConnectDialog({ instance, onClose }: { instance: WhatsAppInstance; onClose: () => void }) {
   const connectMut = useConnectWhatsAppInstance();
   const [qr, setQr] = useState<string | null>(instance.qr_code);
@@ -353,6 +458,7 @@ export default function ConnectionsManager() {
   const [connectingUaz, setConnectingUaz] = useState<WhatsAppInstance | null>(null);
   const [editingUaz, setEditingUaz] = useState<WhatsAppInstance | null>(null);
   const [editingOfferUaz, setEditingOfferUaz] = useState<WhatsAppInstance | null>(null);
+  const [deletingConn, setDeletingConn] = useState<any | null>(null);
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [selectedChromiumId, setSelectedChromiumId] = useState<string | null>(null);
 
@@ -697,6 +803,9 @@ export default function ConnectionsManager() {
   };
 
   const getGeneralStatus = (conn: any) => {
+    if (conn.uaz && conn.uaz.is_active === false) {
+      return <Badge variant="outline" className="text-muted-foreground">Arquivada</Badge>;
+    }
     const realWaState = conn.uaz?.last_real_whatsapp_state;
     const isUazOnline = realWaState === 'CONNECTED';
     const isWebOnline = isChromiumConnected(conn.chromium);
@@ -1097,36 +1206,14 @@ export default function ConnectionsManager() {
                           >
                             <Trash2 className="h-4 w-4 mr-2" /> Excluir Sessão Web
                           </DropdownMenuItem>
-                          <DropdownMenuItem className="text-destructive" onClick={() => {
-                             console.group('[DELETE_HANDLER_START]', { ts: new Date().toISOString(), connName: conn.name });
-                             console.log('[DELETE_INSTANCE_RAW]', conn);
-                             console.log('[DELETE_CHROMIUM_TARGET]', conn.chromium ?? null);
-                             console.log('[DELETE_UAZ_TARGET]', conn.uaz ?? null);
-                             console.log('[DELETE_CHROMIUM_ID]', conn.chromium?.id ?? null);
-                             console.log('[DELETE_UAZ_ID]', conn.uaz?.id ?? null);
-                             console.log('[DELETE_CHROMIUM_NAME]', conn.chromium?.name ?? conn.chromium?.chromium_pushname ?? null);
-                             console.log('[DELETE_UAZ_NAME]', conn.uaz?.custom_name ?? conn.uaz?.name ?? null);
-                             console.log('[DELETE_REQUEST_PLAN]', {
-                               willCallChromium: !!conn.chromium,
-                               chromiumEndpoint: conn.chromium ? `DELETE https://api.x1zap.cloud/connections/${conn.chromium.id}` : null,
-                               willCallUaz: !!conn.uaz,
-                               uazAction: conn.uaz ? { fn: 'whatsapp-proxy', action: 'delete_instance_self', id: conn.uaz.id } : null,
-                             });
-                             if (confirm('Deseja realmente excluir esta conexão permanentemente?')) {
-                               if (conn.chromium) deleteChromiumMut.mutate(conn.chromium.id, {
-                                 onSuccess: (data) => console.log('[DELETE_CHROMIUM_RESULT]', { ok: true, data }),
-                                 onError: (err: any) => console.log('[DELETE_CHROMIUM_RESULT]', { ok: false, status: err?.status, message: err?.message, body: err?.body }),
-                               });
-                               if (conn.uaz) deleteUazMut.mutate(conn.uaz.id, {
-                                 onSuccess: (data) => { console.log('[DELETE_UAZ_RESULT]', { ok: true, data }); refetchUaz(); },
-                                 onError: (err: any) => console.log('[DELETE_UAZ_RESULT]', { ok: false, message: err?.message, err }),
-                               });
-                             } else {
-                               console.log('[DELETE_HANDLER_END]', { cancelled: true });
-                             }
-                             console.log('[DELETE_HANDLER_END]', { dispatched: true });
-                             console.groupEnd();
-                          }}>
+                          <DropdownMenuItem
+                            className="text-destructive"
+                            disabled={
+                              (!!conn.uaz && deleteUazMut.isPending && deleteUazMut.variables === conn.uaz.id) ||
+                              (!!conn.chromium && deleteChromiumMut.isPending && deleteChromiumMut.variables === conn.chromium.id)
+                            }
+                            onClick={() => setDeletingConn(conn)}
+                          >
                             <Trash2 className="h-4 w-4 mr-2" /> Excluir
                           </DropdownMenuItem>
                         </DropdownMenuContent>
@@ -1347,6 +1434,17 @@ export default function ConnectionsManager() {
           </form>
         </DialogContent>
       </Dialog>
+
+      {deletingConn && (
+        <DeleteConnectionDialog
+          conn={deletingConn}
+          onClose={() => setDeletingConn(null)}
+          deleteUazMut={deleteUazMut}
+          deleteChromiumMut={deleteChromiumMut}
+          refetchUaz={refetchUaz}
+          refetchChromium={refetchChromium}
+        />
+      )}
 
       {/* Modal: Simular Queda */}
       <SimulateOutageModal
