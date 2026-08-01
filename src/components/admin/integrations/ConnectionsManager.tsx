@@ -226,6 +226,7 @@ function ArchiveConnectionDialog({
   const { data: impact, isLoading: isLoadingImpact } = useConnectionDeletionImpact(conn?.uaz?.id ?? null);
   const isPending = archiveMut.isPending || deleteChromiumMut.isPending;
   const name = conn?.uaz?.custom_name || conn?.uaz?.name || conn?.name;
+  const [removeFromProvider, setRemoveFromProvider] = useState(false);
 
   const handleConfirm = () => {
     if (isPending) return;
@@ -236,7 +237,7 @@ function ArchiveConnectionDialog({
     }
     if (conn.uaz) {
       archiveMut.mutate(
-        { id: conn.uaz.id, reason: 'WhatsApp banido — conexão sem possibilidade de retorno.' },
+        { id: conn.uaz.id, reason: 'WhatsApp banido — conexão sem possibilidade de retorno.', removeFromProvider },
         { onSuccess: () => onClose() },
       );
     } else {
@@ -265,9 +266,20 @@ function ArchiveConnectionDialog({
               <p className="text-amber-600 dark:text-amber-400">
                 Ela vai parar de receber mensagens e sair da lista de conexões operacionais, mas o UUID, o
                 nome e <strong>todo o histórico</strong> (conversas, leads, mensagens e vendas) continuam
-                preservados e consultáveis em "Conexões arquivadas". Isto não pode ser desfeito
-                automaticamente — reative manualmente se o chip voltar a operar.
+                preservados e consultáveis em "Conexões arquivadas".
               </p>
+              <label className="flex items-start gap-2 text-xs cursor-pointer pt-1 border-t">
+                <Checkbox
+                  checked={removeFromProvider}
+                  onCheckedChange={(v) => setRemoveFromProvider(v === true)}
+                  className="mt-0.5"
+                />
+                <span>
+                  Também remover definitivamente esta instância da UazAPI.{' '}
+                  <strong className="text-destructive">Isso pode ser irreversível</strong> — deixe desmarcado
+                  se quiser só pausar a conexão sem apagar nada no provedor.
+                </span>
+              </label>
               {(archiveMut.isError || deleteChromiumMut.isError) && (
                 <p className="text-destructive text-xs">
                   Erro: {

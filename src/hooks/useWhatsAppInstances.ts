@@ -314,21 +314,55 @@ export function useConnectionDeletionImpact(connectionId: string | null) {
   });
 }
 
-// Operação padrão para um chip banido/sem retorno: arquiva (is_active=false,
-// archived_at/by/reason preenchidos), nunca exclui fisicamente — preserva
-// integralmente conversas, leads, mensagens e vendas vinculados. Idempotente.
+export interface RemoteOpResult {
+  attempted: boolean;
+  ok?: boolean;
+  status?: number;
+  message?: string;
+  uncertain?: boolean;
+  providerDeletedAtRecordFailed?: boolean;
+}
+export interface LocalRemoteOpResponse {
+  ok: boolean;
+  archived?: boolean;
+  alreadyArchived?: boolean;
+  alreadyGone?: boolean;
+  local?: { ok: boolean };
+  remote?: RemoteOpResult;
+}
+
+// Operação padrão para um chip banido/sem retorno: arquiva LOCALMENTE
+// (is_active=false, archived_at/by/reason preenchidos), nunca exclui
+// fisicamente — preserva integralmente conversas, leads, mensagens e vendas
+// vinculados. Idempotente. Por padrão NÃO mexe na UazAPI — arquivar pode ser
+// engano ou temporário, e ainda não existe ação de "restaurar", então
+// presumir a remoção remota tornaria um engano potencialmente irreversível.
+// Passe removeFromProvider:true só quando o usuário pedir isso explicitamente.
 export function useArchiveConnection() {
   const qc = useQueryClient();
   const proxy = useProxyAction();
   return useMutation({
-    mutationFn: async (vars: { id: string; reason?: string }) => {
-      const res = await proxy({ action: 'archive_instance_self', id: vars.id, reason: vars.reason });
-      return res as { ok: boolean; archived?: boolean; alreadyArchived?: boolean };
+    mutationFn: async (vars: { id: string; reason?: string; removeFromProvider?: boolean }) => {
+      const res = await proxy({
+        action: 'archive_instance_self',
+        id: vars.id,
+        reason: vars.reason,
+        removeFromProvider: vars.removeFromProvider === true,
+      });
+      return res as LocalRemoteOpResponse;
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['whatsapp-instances'] });
       qc.invalidateQueries({ queryKey: ['whatsapp-instances-all'] });
-      toast.success('Conexão arquivada — todo o histórico foi preservado.');
+      if (!data.remote?.attempted) {
+        toast.success('Conexão arquivada — todo o histórico foi preservado. A instância continua ativa na UazAPI.');
+      } else if (data.remote.ok) {
+        toast.success('Conexão arquivada e removida da UazAPI. Todo o histórico foi preservado.');
+      } else if (data.remote.uncertain) {
+        toast.warning('Conexão arquivada localmente. Não foi possível confirmar a remoção na UazAPI (timeout) — verifique manualmente.');
+      } else {
+        toast.warning(`Conexão arquivada localmente, mas a remoção na UazAPI falhou: ${data.remote.message || 'erro desconhecido'}`);
+      }
     },
     onError: (e: any) => toast.error('Erro ao arquivar: ' + e.message),
   });
@@ -336,19 +370,28 @@ export function useArchiveConnection() {
 
 // Operação EXCEPCIONAL e separada da padrão: exclui fisicamente a linha de
 // evolution_instances. Exige confirmName === nome exato da conexão — o
-// backend reconfere isso, nunca confia só na validação do frontend.
+// backend reconfere isso, nunca confia só na validação do frontend. Aqui a
+// remoção na UazAPI é sempre tentada (a intenção já é definitiva).
 export function useDeleteConnectionPermanently() {
   const qc = useQueryClient();
   const proxy = useProxyAction();
   return useMutation({
     mutationFn: async (vars: { id: string; confirmName: string }) => {
       const res = await proxy({ action: 'delete_instance_permanently', id: vars.id, confirmName: vars.confirmName });
-      return res as { ok: boolean; archived?: boolean; alreadyGone?: boolean };
+      return res as LocalRemoteOpResponse;
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['whatsapp-instances'] });
       qc.invalidateQueries({ queryKey: ['whatsapp-instances-all'] });
-      toast.success('Conexão excluída permanentemente');
+      if (data.alreadyGone) {
+        toast.success('Conexão já não existia');
+      } else if (data.remote?.ok) {
+        toast.success('Conexão excluída permanentemente (local e UazAPI)');
+      } else if (data.remote?.uncertain) {
+        toast.warning('Conexão excluída localmente. Não foi possível confirmar a remoção na UazAPI (timeout) — verifique manualmente.');
+      } else {
+        toast.warning(`Conexão excluída localmente, mas a remoção na UazAPI falhou: ${data.remote?.message || 'erro desconhecido'}`);
+      }
     },
     onError: (e: any) => toast.error('Erro ao excluir: ' + e.message),
   });

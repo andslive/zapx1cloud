@@ -366,10 +366,13 @@ Deno.serve(async (req) => {
         return new Response(JSON.stringify({ ok: false, error: "Não autorizado a operar nesta conexão" }), { status: 403, headers: corsHeaders });
       }
 
-      // Remoção remota best-effort (mesma para os dois caminhos): não bloqueia
-      // a operação local, e um 404 do provedor (instância já removida lá) é
-      // tratado como estado idempotente, não como erro.
-      const removeRemote = async (): Promise<{ ok: boolean; status?: number; message?: string }> => {
+      // Remoção remota best-effort: nunca bloqueia a operação local. Um 404
+      // do provedor (instância já removida lá) é tratado como sucesso
+      // idempotente. `uncertain: true` marca os casos em que não sabemos se o
+      // provedor processou (timeout/erro de rede) — diferente de uma
+      // resposta HTTP explícita de falha (401/403/500), que é `uncertain: false`.
+      type RemoteResult = { ok: boolean; status?: number; message?: string; uncertain: boolean };
+      const removeRemote = async (): Promise<RemoteResult> => {
         try {
           const res = await waFetch(
             config,
@@ -378,10 +381,10 @@ Deno.serve(async (req) => {
             instance.instance_token,
             true
           );
-          return { ok: res.ok || res.status === 404, status: res.status, message: res.message };
+          return { ok: res.ok || res.status === 404, status: res.status, message: res.message, uncertain: false };
         } catch (err: any) {
           console.error(`[${requestId}] [${action}] Remote remove failed/timeout:`, JSON.stringify({ connection_id: id, message: err?.message }));
-          return { ok: false, message: err?.message || "timeout" };
+          return { ok: false, message: err?.message || "timeout", uncertain: true };
         }
       };
 
@@ -389,8 +392,22 @@ Deno.serve(async (req) => {
         // Operação padrão para um chip banido/sem retorno: nunca DELETE
         // físico aqui, independente de ter ou não histórico. Idempotente —
         // arquivar de novo só reafirma o estado, não duplica nada.
+        //
+        // Arquivar é LOCAL e não-destrutivo por padrão: is_active=false +
+        // metadados de arquivamento, sem tocar o provedor. Uma conexão pode
+        // ser arquivada por engano ou temporariamente, e não existe ação de
+        // "restaurar" ainda — presumir a remoção remota tornaria essa engano
+        // potencialmente irreversível. A remoção na UazAPI só acontece se o
+        // chamador pedir explicitamente via removeFromProvider === true
+        // (opt-in, desmarcado por padrão na UI).
         if (instance.archived_at) {
-          return new Response(JSON.stringify({ ok: true, alreadyArchived: true, archived_at: instance.archived_at }), { headers: corsHeaders });
+          return new Response(JSON.stringify({
+            ok: true,
+            alreadyArchived: true,
+            archived_at: instance.archived_at,
+            local: { ok: true },
+            remote: { attempted: false },
+          }), { headers: corsHeaders });
         }
 
         const nowIso = new Date().toISOString();
@@ -406,20 +423,36 @@ Deno.serve(async (req) => {
           .eq("id", id);
         if (archiveErr) {
           console.error(`[${requestId}] [archive_instance_self] archive failed:`, JSON.stringify({ connection_id: id, message: archiveErr.message }));
-          return new Response(JSON.stringify({ ok: false, error: "Falha ao arquivar a conexão" }), { status: 500, headers: corsHeaders });
+          return new Response(JSON.stringify({ ok: false, error: "Falha ao arquivar a conexão", local: { ok: false }, remote: { attempted: false } }), { status: 500, headers: corsHeaders });
+        }
+        console.log(`[${requestId}] [archive_instance_self] archived locally:`, JSON.stringify({ connection_id: id, name: instance.name }));
+
+        const removeFromProvider = body.removeFromProvider === true;
+        let remote: RemoteResult & { attempted: boolean; providerDeletedAtRecordFailed?: boolean } = { attempted: false, ok: false, uncertain: false };
+        if (removeFromProvider) {
+          const remoteResult = await removeRemote();
+          remote = { attempted: true, ...remoteResult };
+          if (remoteResult.ok) {
+            const { error: markErr } = await supabase.from("evolution_instances").update({ provider_deleted_at: nowIso }).eq("id", id);
+            if (markErr) {
+              console.error(`[${requestId}] [archive_instance_self] failed to record provider_deleted_at after successful remote removal:`, JSON.stringify({ connection_id: id, message: markErr.message }));
+              remote.providerDeletedAtRecordFailed = true;
+            }
+          }
+          console.log(`[${requestId}] [archive_instance_self] remote removal requested:`, JSON.stringify({ connection_id: id, name: instance.name, remote }));
         }
 
-        const remote = await removeRemote();
-        if (remote.ok) {
-          await supabase.from("evolution_instances").update({ provider_deleted_at: nowIso }).eq("id", id);
-        }
-        console.log(`[${requestId}] [archive_instance_self] archived:`, JSON.stringify({ connection_id: id, name: instance.name, remote }));
-        return new Response(JSON.stringify({ ok: true, archived: true, remote }), { headers: corsHeaders });
+        // ok:true reflete o resultado LOCAL (o que importa para "arquivar").
+        // O resultado remoto, quando solicitado, vem sempre separado em
+        // `remote` — nunca misturado no `ok` geral, para a UI nunca dizer
+        // "tudo certo" quando a remoção no provedor falhou ou ficou incerta.
+        return new Response(JSON.stringify({ ok: true, archived: true, local: { ok: true }, remote }), { headers: corsHeaders });
       }
 
       // action === "delete_instance_permanently": operação excepcional,
       // separada da padrão. Exige confirmação do nome exato — reconferida
-      // aqui no backend, nunca só no frontend.
+      // aqui no backend, nunca só no frontend. Aqui a remoção no provedor
+      // é sempre tentada (best-effort) porque a intenção já é definitiva.
       const confirmName = typeof body.confirmName === "string" ? body.confirmName.trim() : "";
       if (confirmName !== instance.name) {
         return new Response(JSON.stringify({ ok: false, error: "Confirmação não corresponde ao nome exato da conexão" }), { status: 400, headers: corsHeaders });
@@ -437,17 +470,22 @@ Deno.serve(async (req) => {
         .eq("connection_id", id);
       if (unlinkLogsErr) {
         console.error(`[${requestId}] [delete_instance_permanently] unlink notification logs failed:`, JSON.stringify({ connection_id: id, message: unlinkLogsErr.message }));
-        return new Response(JSON.stringify({ ok: false, error: "Falha ao preparar exclusão da conexão" }), { status: 500, headers: corsHeaders });
+        return new Response(JSON.stringify({ ok: false, error: "Falha ao preparar exclusão da conexão", local: { ok: false }, remote: { attempted: false } }), { status: 500, headers: corsHeaders });
       }
 
       const { error: dbErr } = await supabase.from("evolution_instances").delete().eq("id", id);
       if (dbErr) {
         console.error(`[${requestId}] [delete_instance_permanently] DB delete failed:`, JSON.stringify({ connection_id: id, message: dbErr.message, code: (dbErr as any).code }));
-        return new Response(JSON.stringify({ ok: false, error: "Falha ao excluir a conexão (restrição de integridade)" }), { status: 500, headers: corsHeaders });
+        return new Response(JSON.stringify({ ok: false, error: "Falha ao excluir a conexão (restrição de integridade)", local: { ok: false }, remote: { attempted: false } }), { status: 500, headers: corsHeaders });
       }
-      const remote = await removeRemote();
-      console.log(`[${requestId}] [delete_instance_permanently] deleted:`, JSON.stringify({ connection_id: id, name: instance.name, remote }));
-      return new Response(JSON.stringify({ ok: true, archived: false, remote }), { headers: corsHeaders });
+      // Local já está commitado neste ponto (a linha já não existe mais) —
+      // uma falha remota agora não pode mais reverter o local; é reportada
+      // separadamente para a UI nunca esconder que a UazAPI pode ainda ter
+      // a instância viva do lado dela.
+      const remoteResult = await removeRemote();
+      const remote = { attempted: true, ...remoteResult };
+      console.log(`[${requestId}] [delete_instance_permanently] deleted locally, remote attempted:`, JSON.stringify({ connection_id: id, name: instance.name, remote }));
+      return new Response(JSON.stringify({ ok: true, archived: false, local: { ok: true }, remote }), { headers: corsHeaders });
     }
 
     if (action === "sync_instances") {
@@ -471,9 +509,10 @@ Deno.serve(async (req) => {
     }
 
     return new Response(JSON.stringify({ error: "Action not found" }), { status: 404, headers: corsHeaders });
-  } catch (err) {
+  } catch (err: unknown) {
     console.error(`[${requestId}] Error:`, err);
-    return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+    const message = err instanceof Error ? err.message : String(err);
+    return new Response(JSON.stringify({ error: message }), { status: 500, headers: corsHeaders });
   }
 });
 
