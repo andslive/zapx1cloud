@@ -21,7 +21,7 @@ import {
   useDisconnectWhatsAppInstance,
   useLogoutWhatsAppInstance,
   useCreateWhatsAppInstanceSelf,
-  useDeleteWhatsAppInstanceSelf,
+  useArchiveConnection,
   useRenameWhatsAppInstanceSelf,
   useSyncWhatsAppInstances,
   useRepairWhatsAppWebhook,
@@ -305,7 +305,7 @@ export function WhatsAppInstancesPanel() {
   const setDefaultMut = useSetDefaultWhatsAppInstance();
   const disconnectMut = useDisconnectWhatsAppInstance();
   const logoutMut = useLogoutWhatsAppInstance();
-  const deleteMut = useDeleteWhatsAppInstanceSelf();
+  const archiveMut = useArchiveConnection();
   const syncMut = useSyncWhatsAppInstances();
   const repairWebhookMut = useRepairWhatsAppWebhook();
   const checkWebhookMut = useCheckWhatsAppWebhook();
@@ -571,7 +571,7 @@ export function WhatsAppInstancesPanel() {
                       size="sm"
                       onClick={() => setDeleting(inst)}
                       className="text-destructive hover:text-destructive"
-                      title="Excluir conexão"
+                      title="Arquivar conexão"
                     >
                       <Trash2 className="h-4 w-4" />
                     </Button>
@@ -644,28 +644,31 @@ export function WhatsAppInstancesPanel() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Excluir conexão (apaga local + UazAPI) */}
+      {/* Arquivar conexão (chip banido/sem retorno) — preserva todo o histórico,
+          nunca exclui fisicamente. Exclusão definitiva (irreversível) só está
+          disponível na tela avançada de Conexões, com confirmação reforçada. */}
       <AlertDialog open={!!deleting} onOpenChange={(o) => !o && setDeleting(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Excluir esta conexão?</AlertDialogTitle>
+            <AlertDialogTitle>Arquivar esta conexão?</AlertDialogTitle>
             <AlertDialogDescription>
-              A conexão <strong>{deleting ? displayName(deleting) : ''}</strong> será removida
-              permanentemente, junto com a instância no servidor UazAPI. Esta ação não pode ser desfeita.
+              A conexão <strong>{deleting ? displayName(deleting) : ''}</strong> será arquivada: para de
+              receber mensagens e sai da lista de conexões ativas, mas todo o histórico de conversas, leads
+              e vendas continua preservado. Use isto para chips banidos ou sem possibilidade de retorno.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancelar</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                if (deleting) deleteMut.mutate(deleting.id);
+                if (deleting) archiveMut.mutate({ id: deleting.id, reason: 'WhatsApp banido — conexão sem possibilidade de retorno.' });
                 setDeleting(null);
               }}
-              disabled={deleteMut.isPending}
+              disabled={archiveMut.isPending}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {deleteMut.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-              Excluir conexão
+              {archiveMut.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              Arquivar conexão
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

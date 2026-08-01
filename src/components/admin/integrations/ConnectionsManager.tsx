@@ -16,10 +16,11 @@ import {
   useCreateWhatsAppInstanceSelf,
   useConnectWhatsAppInstance,
   useRenameWhatsAppInstanceSelf,
-  useDeleteWhatsAppInstanceSelf,
+  useArchiveConnection,
+  useDeleteConnectionPermanently,
+  useConnectionDeletionImpact,
   useUpdateWhatsAppInstanceOffer,
   useSetConnectionDefaultFunnel,
-  useConnectionHistoryCounts,
   WhatsAppInstance
 } from '@/hooks/useWhatsAppInstances';
 import { useFunnels } from '@/hooks/useFunnels';
@@ -43,7 +44,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Plus, RefreshCw, MoreVertical, QrCode, Trash2, Info, Loader2, Sparkles, Square, Play, AlertTriangle, User, Search, ArrowUp, ArrowDown, Filter, Pencil, Beaker, Ghost } from 'lucide-react';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useAuth } from '@/hooks/useAuth';
 import { useOrganizationEffectivePlan } from '@/hooks/useOrganizationPlan';
 import { toast } from 'sonner';
@@ -204,46 +205,40 @@ function ConnectionFunnelSelect({
   );
 }
 
-// Diálogo de confirmação de exclusão. Não usa window.confirm() (bloqueia a
-// thread principal e é a causa mais provável do alerta de INP relatado — o
-// alerta de responsividade é distinto da falha da Edge Function, que tinha
-// causa própria: violação de FK). Mostra o histórico real antes de confirmar;
-// a decisão de arquivar vs excluir fisicamente é sempre feita no backend.
-function DeleteConnectionDialog({
+// Diálogo de arquivamento — a operação PADRÃO para um chip banido/sem
+// possibilidade de retorno. Não usa window.confirm() (bloqueia a thread
+// principal — causa mais provável do alerta de INP relatado; a falha da
+// Edge Function era um problema à parte: violação de FK). Nunca exclui
+// fisicamente nada — is_active=false, preserva 100% do histórico vinculado.
+function ArchiveConnectionDialog({
   conn,
   onClose,
-  deleteUazMut,
+  archiveMut,
   deleteChromiumMut,
-  refetchUaz,
   refetchChromium,
 }: {
   conn: any;
   onClose: () => void;
-  deleteUazMut: ReturnType<typeof useDeleteWhatsAppInstanceSelf>;
+  archiveMut: ReturnType<typeof useArchiveConnection>;
   deleteChromiumMut: ReturnType<typeof useDeleteConnection>;
-  refetchUaz: () => void;
   refetchChromium: () => void;
 }) {
-  const { data: counts, isLoading: isLoadingCounts } = useConnectionHistoryCounts(conn?.uaz?.id ?? null);
-  const isPending = deleteUazMut.isPending || deleteChromiumMut.isPending;
+  const { data: impact, isLoading: isLoadingImpact } = useConnectionDeletionImpact(conn?.uaz?.id ?? null);
+  const isPending = archiveMut.isPending || deleteChromiumMut.isPending;
   const name = conn?.uaz?.custom_name || conn?.uaz?.name || conn?.name;
-
-  const willArchive = !isLoadingCounts && ((counts?.conversations ?? 0) > 0 || (counts?.leads ?? 0) > 0);
 
   const handleConfirm = () => {
     if (isPending) return;
+    // Sessão Web (Chromium) não guarda histórico próprio — pode ser
+    // encerrada junto, é independente da decisão de arquivar/excluir.
     if (conn.chromium) {
-      deleteChromiumMut.mutate(conn.chromium.id, {
-        onSuccess: () => refetchChromium(),
-      });
+      deleteChromiumMut.mutate(conn.chromium.id, { onSuccess: () => refetchChromium() });
     }
     if (conn.uaz) {
-      deleteUazMut.mutate(conn.uaz.id, {
-        onSuccess: () => {
-          refetchUaz();
-          onClose();
-        },
-      });
+      archiveMut.mutate(
+        { id: conn.uaz.id, reason: 'WhatsApp banido — conexão sem possibilidade de retorno.' },
+        { onSuccess: () => onClose() },
+      );
     } else {
       onClose();
     }
@@ -253,35 +248,30 @@ function DeleteConnectionDialog({
     <AlertDialog open={!!conn} onOpenChange={(open) => { if (!open && !isPending) onClose(); }}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>Excluir "{name}"?</AlertDialogTitle>
+          <AlertDialogTitle>Arquivar "{name}"?</AlertDialogTitle>
           <AlertDialogDescription asChild>
             <div className="space-y-2 text-sm text-left">
-              {isLoadingCounts ? (
+              {isLoadingImpact ? (
                 <p className="flex items-center gap-1.5 text-muted-foreground">
                   <Loader2 className="h-3 w-3 animate-spin" /> Verificando histórico vinculado...
                 </p>
-              ) : willArchive ? (
-                <>
-                  <p>
-                    Esta conexão tem <strong>{counts?.conversations ?? 0} conversa(s)</strong> e{' '}
-                    <strong>{counts?.leads ?? 0} lead(s)</strong> vinculados.
-                  </p>
-                  <p className="text-amber-600 dark:text-amber-400">
-                    Por isso, ela será <strong>arquivada</strong> (desativada e desconectada), não excluída —
-                    todo o histórico de conversas, leads e vendas continua preservado. Ela deixa de receber
-                    novas mensagens.
-                  </p>
-                </>
               ) : (
-                <p className="text-destructive">
-                  Esta conexão não tem conversas nem leads vinculados. Ela será <strong>excluída permanentemente</strong>,
-                  incluindo a tentativa de remoção no provedor.
+                <p>
+                  Esta conexão tem <strong>{impact?.conversations ?? 0} conversa(s)</strong>,{' '}
+                  <strong>{impact?.leads ?? 0} lead(s)</strong> e{' '}
+                  <strong>{impact?.messages ?? 0} mensagem(ns)</strong> vinculados.
                 </p>
               )}
-              {(deleteUazMut.isError || deleteChromiumMut.isError) && (
+              <p className="text-amber-600 dark:text-amber-400">
+                Ela vai parar de receber mensagens e sair da lista de conexões operacionais, mas o UUID, o
+                nome e <strong>todo o histórico</strong> (conversas, leads, mensagens e vendas) continuam
+                preservados e consultáveis em "Conexões arquivadas". Isto não pode ser desfeito
+                automaticamente — reative manualmente se o chip voltar a operar.
+              </p>
+              {(archiveMut.isError || deleteChromiumMut.isError) && (
                 <p className="text-destructive text-xs">
-                  Erro ao excluir: {
-                    (deleteUazMut.error instanceof Error && deleteUazMut.error.message) ||
+                  Erro: {
+                    (archiveMut.error instanceof Error && archiveMut.error.message) ||
                     (deleteChromiumMut.error instanceof Error && deleteChromiumMut.error.message) ||
                     'tente novamente'
                   }
@@ -296,11 +286,100 @@ function DeleteConnectionDialog({
           </AlertDialogCancel>
           <AlertDialogAction
             className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            disabled={isPending || isLoadingCounts}
+            disabled={isPending || isLoadingImpact}
             onClick={handleConfirm}
           >
             {isPending && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
-            {willArchive ? 'Confirmar arquivamento' : 'Confirmar exclusão'}
+            Confirmar arquivamento
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+// Diálogo de exclusão DEFINITIVA — operação excepcional, separada da
+// padrão. Mostra o impacto real (via RPC, mesma fonte que o backend usa
+// para decidir) e exige digitar o nome exato da conexão; o backend reconfere
+// essa mesma condição antes de excluir fisicamente qualquer coisa.
+function PermanentDeleteConnectionDialog({
+  conn,
+  onClose,
+  deleteMut,
+}: {
+  conn: any;
+  onClose: () => void;
+  deleteMut: ReturnType<typeof useDeleteConnectionPermanently>;
+}) {
+  const { data: impact, isLoading: isLoadingImpact } = useConnectionDeletionImpact(conn?.uaz?.id ?? null);
+  const [typedName, setTypedName] = useState('');
+  const name = conn?.uaz?.name || '';
+  const nameMatches = typedName.trim() === name && name.length > 0;
+
+  const handleConfirm = () => {
+    if (!nameMatches || deleteMut.isPending || !conn?.uaz) return;
+    deleteMut.mutate(
+      { id: conn.uaz.id, confirmName: typedName.trim() },
+      { onSuccess: () => onClose() },
+    );
+  };
+
+  return (
+    <AlertDialog open={!!conn} onOpenChange={(open) => { if (!open && !deleteMut.isPending) { setTypedName(''); onClose(); } }}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Excluir "{name}" definitivamente?</AlertDialogTitle>
+          <AlertDialogDescription asChild>
+            <div className="space-y-3 text-sm text-left">
+              <p className="text-destructive font-medium">
+                Esta ação é irreversível e diferente de arquivar. Ela apaga a linha da conexão e, por causa
+                das regras de integridade do banco, os seguintes vínculos ficarão sem essa conexão associada
+                (NÃO serão apagados, só perdem a referência):
+              </p>
+              {isLoadingImpact ? (
+                <p className="flex items-center gap-1.5 text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" /> Calculando impacto real...
+                </p>
+              ) : (
+                <ul className="list-disc list-inside space-y-0.5">
+                  <li><strong>{impact?.conversations ?? 0}</strong> conversa(s) — perdem a atribuição a este chip</li>
+                  <li><strong>{impact?.leads ?? 0}</strong> lead(s) — perdem a atribuição a este chip</li>
+                  <li><strong>{impact?.messages ?? 0}</strong> mensagem(ns) — permanecem, mas sem vínculo com o chip</li>
+                  <li><strong>{impact?.purchases ?? 0}</strong> registro(s) de Purchase/auditoria — permanecem, mas sem vínculo com o chip</li>
+                  <li><strong>{impact?.notification_logs ?? 0}</strong> log(s) administrativo(s) — preservados, só desvinculados</li>
+                </ul>
+              )}
+              <p>Nenhum dado é apagado por esta operação além da própria linha da conexão — mas a atribuição histórica por chip é perdida para os itens acima.</p>
+              <div className="space-y-1 pt-1">
+                <Label htmlFor="confirmDeleteName">Digite exatamente <strong>{name}</strong> para confirmar</Label>
+                <Input
+                  id="confirmDeleteName"
+                  value={typedName}
+                  onChange={(e) => setTypedName(e.target.value)}
+                  placeholder={name}
+                  autoComplete="off"
+                  disabled={deleteMut.isPending}
+                />
+              </div>
+              {deleteMut.isError && (
+                <p className="text-destructive text-xs">
+                  Erro: {deleteMut.error instanceof Error ? deleteMut.error.message : 'tente novamente'}
+                </p>
+              )}
+            </div>
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleteMut.isPending} onClick={() => { setTypedName(''); onClose(); }}>
+            Cancelar
+          </AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            disabled={!nameMatches || deleteMut.isPending || isLoadingImpact}
+            onClick={handleConfirm}
+          >
+            {deleteMut.isPending && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
+            Excluir definitivamente
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -436,7 +515,8 @@ export default function ConnectionsManager() {
   const syncUazMut = useSyncWhatsAppInstances();
   const createUazMut = useCreateWhatsAppInstanceSelf();
   const renameUazMut = useRenameWhatsAppInstanceSelf();
-  const deleteUazMut = useDeleteWhatsAppInstanceSelf();
+  const archiveMut = useArchiveConnection();
+  const permanentDeleteMut = useDeleteConnectionPermanently();
   const updateOfferMut = useUpdateWhatsAppInstanceOffer();
   const { data: allFunnels, isLoading: isLoadingFunnels } = useFunnels();
   const eligibleFunnels = useMemo(
@@ -458,7 +538,9 @@ export default function ConnectionsManager() {
   const [connectingUaz, setConnectingUaz] = useState<WhatsAppInstance | null>(null);
   const [editingUaz, setEditingUaz] = useState<WhatsAppInstance | null>(null);
   const [editingOfferUaz, setEditingOfferUaz] = useState<WhatsAppInstance | null>(null);
-  const [deletingConn, setDeletingConn] = useState<any | null>(null);
+  const [archivingConn, setArchivingConn] = useState<any | null>(null);
+  const [permanentlyDeletingConn, setPermanentlyDeletingConn] = useState<any | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [selectedChromiumId, setSelectedChromiumId] = useState<string | null>(null);
 
@@ -640,6 +722,10 @@ export default function ConnectionsManager() {
       });
     }
 
+    // Arquivadas ficam fora da visão operacional padrão — só aparecem com
+    // "Mostrar arquivadas" ligado, para consulta administrativa.
+    results = results.filter(c => showArchived ? true : !c.uaz || !c.uaz.archived_at);
+
     // Apply Sorting
     if (sortConfig.key && sortConfig.direction) {
       results.sort((a, b) => {
@@ -671,7 +757,12 @@ export default function ConnectionsManager() {
 
     console.log('[AUDIT] FINAL TABLE', { count: results.length, items: results });
     return results;
-  }, [uazInstances, chromiumInstances, searchTerm, filterOffer, filterStatus, filterApi, filterSession, sortConfig]);
+  }, [uazInstances, chromiumInstances, searchTerm, filterOffer, filterStatus, filterApi, filterSession, sortConfig, showArchived]);
+
+  const archivedCount = useMemo(
+    () => (uazInstances || []).filter((u: any) => !!u.archived_at).length,
+    [uazInstances]
+  );
 
 
   const handleSyncAll = async () => {
@@ -804,7 +895,17 @@ export default function ConnectionsManager() {
 
   const getGeneralStatus = (conn: any) => {
     if (conn.uaz && conn.uaz.is_active === false) {
-      return <Badge variant="outline" className="text-muted-foreground">Arquivada</Badge>;
+      const badge = <Badge variant="outline" className="text-muted-foreground">Arquivada</Badge>;
+      if (!conn.uaz.archived_at) return badge;
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>{badge}</TooltipTrigger>
+          <TooltipContent>
+            {conn.uaz.archive_reason || 'Arquivada'}
+            {conn.uaz.archived_at ? ` — ${new Date(conn.uaz.archived_at).toLocaleDateString('pt-BR')}` : ''}
+          </TooltipContent>
+        </Tooltip>
+      );
     }
     const realWaState = conn.uaz?.last_real_whatsapp_state;
     const isUazOnline = realWaState === 'CONNECTED';
@@ -993,6 +1094,15 @@ export default function ConnectionsManager() {
               <SelectItem value="offline">Não conectada</SelectItem>
             </SelectContent>
           </Select>
+
+          <Button
+            type="button"
+            variant={showArchived ? 'secondary' : 'outline'}
+            className="w-full md:w-auto"
+            onClick={() => setShowArchived(v => !v)}
+          >
+            {showArchived ? 'Ocultar arquivadas' : `Conexões arquivadas${archivedCount > 0 ? ` (${archivedCount})` : ''}`}
+          </Button>
         </div>
       </div>
 
@@ -1206,15 +1316,25 @@ export default function ConnectionsManager() {
                           >
                             <Trash2 className="h-4 w-4 mr-2" /> Excluir Sessão Web
                           </DropdownMenuItem>
+                          {!conn.uaz?.archived_at && (
+                            <DropdownMenuItem
+                              className="text-destructive"
+                              disabled={
+                                (!!conn.uaz && archiveMut.isPending && archiveMut.variables?.id === conn.uaz.id) ||
+                                (!!conn.chromium && deleteChromiumMut.isPending && deleteChromiumMut.variables === conn.chromium.id)
+                              }
+                              onClick={() => setArchivingConn(conn)}
+                            >
+                              <Trash2 className="h-4 w-4 mr-2" /> Arquivar conexão
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-destructive"
-                            disabled={
-                              (!!conn.uaz && deleteUazMut.isPending && deleteUazMut.variables === conn.uaz.id) ||
-                              (!!conn.chromium && deleteChromiumMut.isPending && deleteChromiumMut.variables === conn.chromium.id)
-                            }
-                            onClick={() => setDeletingConn(conn)}
+                            disabled={permanentDeleteMut.isPending && permanentDeleteMut.variables?.id === conn.uaz?.id}
+                            onClick={() => setPermanentlyDeletingConn(conn)}
                           >
-                            <Trash2 className="h-4 w-4 mr-2" /> Excluir
+                            <Trash2 className="h-4 w-4 mr-2" /> Excluir definitivamente
                           </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>
@@ -1435,14 +1555,21 @@ export default function ConnectionsManager() {
         </DialogContent>
       </Dialog>
 
-      {deletingConn && (
-        <DeleteConnectionDialog
-          conn={deletingConn}
-          onClose={() => setDeletingConn(null)}
-          deleteUazMut={deleteUazMut}
+      {archivingConn && (
+        <ArchiveConnectionDialog
+          conn={archivingConn}
+          onClose={() => setArchivingConn(null)}
+          archiveMut={archiveMut}
           deleteChromiumMut={deleteChromiumMut}
-          refetchUaz={refetchUaz}
           refetchChromium={refetchChromium}
+        />
+      )}
+
+      {permanentlyDeletingConn && (
+        <PermanentDeleteConnectionDialog
+          conn={permanentlyDeletingConn}
+          onClose={() => setPermanentlyDeletingConn(null)}
+          deleteMut={permanentDeleteMut}
         />
       )}
 

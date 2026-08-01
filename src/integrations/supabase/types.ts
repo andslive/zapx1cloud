@@ -3967,6 +3967,9 @@ export type Database = {
       evolution_instances: {
         Row: {
           always_online: boolean | null
+          archive_reason: string | null
+          archived_at: string | null
+          archived_by: string | null
           channel: string | null
           created_at: string
           created_by_super_admin: boolean
@@ -4001,6 +4004,7 @@ export type Database = {
           phone_number: string | null
           profile_picture_url: string | null
           provider: string | null
+          provider_deleted_at: string | null
           push_name: string | null
           qr_code: string | null
           qr_code_updated_at: string | null
@@ -4014,6 +4018,9 @@ export type Database = {
         }
         Insert: {
           always_online?: boolean | null
+          archive_reason?: string | null
+          archived_at?: string | null
+          archived_by?: string | null
           channel?: string | null
           created_at?: string
           created_by_super_admin?: boolean
@@ -4048,6 +4055,7 @@ export type Database = {
           phone_number?: string | null
           profile_picture_url?: string | null
           provider?: string | null
+          provider_deleted_at?: string | null
           push_name?: string | null
           qr_code?: string | null
           qr_code_updated_at?: string | null
@@ -4061,6 +4069,9 @@ export type Database = {
         }
         Update: {
           always_online?: boolean | null
+          archive_reason?: string | null
+          archived_at?: string | null
+          archived_by?: string | null
           channel?: string | null
           created_at?: string
           created_by_super_admin?: boolean
@@ -4095,6 +4106,7 @@ export type Database = {
           phone_number?: string | null
           profile_picture_url?: string | null
           provider?: string | null
+          provider_deleted_at?: string | null
           push_name?: string | null
           qr_code?: string | null
           qr_code_updated_at?: string | null
@@ -4119,6 +4131,13 @@ export type Database = {
             columns: ["default_funnel_id"]
             isOneToOne: false
             referencedRelation: "capture_funnels"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "evolution_instances_archived_by_fkey"
+            columns: ["archived_by"]
+            isOneToOne: false
+            referencedRelation: "profiles"
             referencedColumns: ["id"]
           },
         ]
@@ -12091,6 +12110,10 @@ export type Database = {
           status: string
           timezone: string
         }[]
+      }
+      get_connection_deletion_impact: {
+        Args: { _connection_id: string }
+        Returns: Json
       }
       get_organization_effective_limits: {
         Args: { p_org_id: string }

@@ -21,6 +21,10 @@ export interface WhatsAppInstance {
   webhook_subscribed: boolean;
   is_default: boolean;
   default_funnel_id: string | null;
+  archived_at: string | null;
+  archived_by: string | null;
+  archive_reason: string | null;
+  provider_deleted_at: string | null;
   last_connected_at: string | null;
   last_health_at: string | null;
   last_real_whatsapp_state?: string | null;
@@ -283,56 +287,68 @@ export function useDeleteWhatsAppInstance() {
   });
 }
 
-// Somente leitura: quantas conversas/leads reais estão vinculados a uma
-// conexão. Usado para decidir/explicar se a exclusão vai arquivar (preserva
-// histórico) ou excluir fisicamente — a mesma regra que a Edge Function usa
-// para decidir de fato, então isto é só para informar o usuário antes de
-// confirmar (a decisão canônica continua sendo feita no backend).
-export function useConnectionHistoryCounts(connectionId: string | null) {
+export interface ConnectionDeletionImpact {
+  connection_id: string;
+  name: string;
+  is_active: boolean;
+  archived_at: string | null;
+  conversations: number;
+  leads: number;
+  messages: number;
+  purchases: number;
+  notification_logs: number;
+}
+
+// Somente leitura: impacto real de excluir/arquivar uma conexão (via RPC —
+// a mesma checagem de autorização e a mesma contagem que o backend usa antes
+// de decidir de fato; isto é só para informar o usuário antes de confirmar).
+export function useConnectionDeletionImpact(connectionId: string | null) {
   return useQuery({
-    queryKey: ['connection-history-counts', connectionId],
-    queryFn: async () => {
-      const [conv, leads] = await Promise.all([
-        supabase.from('webchat_conversations').select('id', { count: 'exact', head: true }).eq('evolution_instance_id', connectionId!),
-        supabase.from('leads').select('id', { count: 'exact', head: true }).eq('connection_id', connectionId!),
-      ]);
-      if (conv.error) throw conv.error;
-      if (leads.error) throw leads.error;
-      return { conversations: conv.count ?? 0, leads: leads.count ?? 0 };
+    queryKey: ['connection-deletion-impact', connectionId],
+    queryFn: async (): Promise<ConnectionDeletionImpact> => {
+      const { data, error } = await supabase.rpc('get_connection_deletion_impact', { _connection_id: connectionId! });
+      if (error) throw error;
+      return data as unknown as ConnectionDeletionImpact;
     },
     enabled: !!connectionId,
   });
 }
 
-// Self-service: org admin/manager pode excluir a própria conexão. O backend
-// decide arquivar (is_active=false, preserva histórico) em vez de excluir
-// fisicamente quando há conversas/leads vinculados — nunca confiar no
-// frontend para essa decisão.
-export function useDeleteWhatsAppInstanceSelf() {
+// Operação padrão para um chip banido/sem retorno: arquiva (is_active=false,
+// archived_at/by/reason preenchidos), nunca exclui fisicamente — preserva
+// integralmente conversas, leads, mensagens e vendas vinculados. Idempotente.
+export function useArchiveConnection() {
   const qc = useQueryClient();
   const proxy = useProxyAction();
   return useMutation({
-    mutationFn: async (id: string) => {
-      console.log('[DELETE_UAZ_START]', { id, ts: new Date().toISOString() });
-      const payload = { action: 'delete_instance_self', id };
-      console.log('[DELETE_UAZ_PAYLOAD]', payload);
-      try {
-        const res = await proxy(payload);
-        console.log('[DELETE_UAZ_RESPONSE]', { id, res });
-        return res as { ok: boolean; archived?: boolean; alreadyGone?: boolean; historyCounts?: { conversations: number; leads: number } };
-      } catch (err: any) {
-        console.log('[DELETE_UAZ_ERROR]', { id, message: err?.message, err });
-        throw err;
-      }
+    mutationFn: async (vars: { id: string; reason?: string }) => {
+      const res = await proxy({ action: 'archive_instance_self', id: vars.id, reason: vars.reason });
+      return res as { ok: boolean; archived?: boolean; alreadyArchived?: boolean };
     },
-    onSuccess: (data) => {
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['whatsapp-instances'] });
       qc.invalidateQueries({ queryKey: ['whatsapp-instances-all'] });
-      if (data?.archived) {
-        toast.success('Conexão arquivada — o histórico de conversas e leads foi preservado.');
-      } else {
-        toast.success('Conexão excluída');
-      }
+      toast.success('Conexão arquivada — todo o histórico foi preservado.');
+    },
+    onError: (e: any) => toast.error('Erro ao arquivar: ' + e.message),
+  });
+}
+
+// Operação EXCEPCIONAL e separada da padrão: exclui fisicamente a linha de
+// evolution_instances. Exige confirmName === nome exato da conexão — o
+// backend reconfere isso, nunca confia só na validação do frontend.
+export function useDeleteConnectionPermanently() {
+  const qc = useQueryClient();
+  const proxy = useProxyAction();
+  return useMutation({
+    mutationFn: async (vars: { id: string; confirmName: string }) => {
+      const res = await proxy({ action: 'delete_instance_permanently', id: vars.id, confirmName: vars.confirmName });
+      return res as { ok: boolean; archived?: boolean; alreadyGone?: boolean };
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['whatsapp-instances'] });
+      qc.invalidateQueries({ queryKey: ['whatsapp-instances-all'] });
+      toast.success('Conexão excluída permanentemente');
     },
     onError: (e: any) => toast.error('Erro ao excluir: ' + e.message),
   });

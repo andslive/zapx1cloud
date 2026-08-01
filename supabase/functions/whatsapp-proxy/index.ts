@@ -327,23 +327,25 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ ok: res.ok, error: res.message }), { headers: corsHeaders });
     }
 
-    if (action === "delete_instance_self") {
+    if (action === "archive_instance_self" || action === "delete_instance_permanently") {
       const id = body.id;
       if (!id) {
         return new Response(JSON.stringify({ ok: false, error: "ID is required" }), { status: 400, headers: corsHeaders });
       }
 
-      // Autorização: exclusão limitada à organização do usuário autenticado.
+      // Autorização: operação limitada à organização do usuário autenticado.
       // Service role (chamadas internas/admin) passa direto; usuário comum
       // precisa pertencer à mesma organização da conexão — nunca confiar só
       // no frontend para isso.
       let callerOrgId: string | null = null;
+      let callerProfileId: string | null = null;
       if (!isServiceRole) {
         if (!user) {
           return new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), { status: 401, headers: corsHeaders });
         }
-        const { data: callerProfile } = await supabase.from("profiles").select("organization_id").eq("id", user.id).single();
+        const { data: callerProfile } = await supabase.from("profiles").select("id, organization_id").eq("id", user.id).single();
         callerOrgId = callerProfile?.organization_id ?? null;
+        callerProfileId = callerProfile?.id ?? null;
         if (!callerOrgId) {
           return new Response(JSON.stringify({ ok: false, error: "No organization found for user" }), { status: 403, headers: corsHeaders });
         }
@@ -351,7 +353,7 @@ Deno.serve(async (req) => {
 
       const { data: instance, error: fetchErr } = await supabase.from("evolution_instances").select("*").eq("id", id).maybeSingle();
       if (fetchErr) {
-        console.error(`[${requestId}] [DELETE_SELF] fetch failed:`, JSON.stringify({ connection_id: id, message: fetchErr.message }));
+        console.error(`[${requestId}] [${action}] fetch failed:`, JSON.stringify({ connection_id: id, message: fetchErr.message }));
         return new Response(JSON.stringify({ ok: false, error: "Falha ao localizar a conexão" }), { status: 500, headers: corsHeaders });
       }
       if (!instance) {
@@ -360,24 +362,9 @@ Deno.serve(async (req) => {
       }
 
       if (!isServiceRole && instance.organization_id !== callerOrgId) {
-        console.warn(`[${requestId}] [DELETE_SELF] cross-org attempt blocked:`, JSON.stringify({ connection_id: id, instanceOrg: instance.organization_id, callerOrgId }));
-        return new Response(JSON.stringify({ ok: false, error: "Não autorizado a excluir esta conexão" }), { status: 403, headers: corsHeaders });
+        console.warn(`[${requestId}] [${action}] cross-org attempt blocked:`, JSON.stringify({ connection_id: id, instanceOrg: instance.organization_id, callerOrgId }));
+        return new Response(JSON.stringify({ ok: false, error: "Não autorizado a operar nesta conexão" }), { status: 403, headers: corsHeaders });
       }
-
-      // Verifica histórico real de atendimento (não apenas logs operacionais)
-      // antes de decidir entre arquivar e excluir fisicamente. evolution_instances
-      // tem FK ON DELETE SET NULL em webchat_conversations/leads — um DELETE
-      // físico aqui removeria silenciosamente a atribuição de canal do
-      // histórico dessas conversas/leads, o que não é aceitável por padrão.
-      const [{ count: convCount, error: convCountErr }, { count: leadCount, error: leadCountErr }] = await Promise.all([
-        supabase.from("webchat_conversations").select("id", { count: "exact", head: true }).eq("evolution_instance_id", id),
-        supabase.from("leads").select("id", { count: "exact", head: true }).eq("connection_id", id),
-      ]);
-      if (convCountErr || leadCountErr) {
-        console.error(`[${requestId}] [DELETE_SELF] history count failed:`, JSON.stringify({ connection_id: id, convCountErr: convCountErr?.message, leadCountErr: leadCountErr?.message }));
-        return new Response(JSON.stringify({ ok: false, error: "Falha ao verificar histórico da conexão" }), { status: 500, headers: corsHeaders });
-      }
-      const hasHistory = (convCount ?? 0) > 0 || (leadCount ?? 0) > 0;
 
       // Remoção remota best-effort (mesma para os dois caminhos): não bloqueia
       // a operação local, e um 404 do provedor (instância já removida lá) é
@@ -393,53 +380,73 @@ Deno.serve(async (req) => {
           );
           return { ok: res.ok || res.status === 404, status: res.status, message: res.message };
         } catch (err: any) {
-          console.error(`[${requestId}] [DELETE_SELF] Remote remove failed/timeout:`, JSON.stringify({ connection_id: id, message: err?.message }));
+          console.error(`[${requestId}] [${action}] Remote remove failed/timeout:`, JSON.stringify({ connection_id: id, message: err?.message }));
           return { ok: false, message: err?.message || "timeout" };
         }
       };
 
-      if (hasHistory) {
-        // Arquiva: desativa (para de rotear webhooks/funis para esta conexão,
-        // mesmo mecanismo já usado pelo gate is_active do webhook) e preserva
-        // a linha e todo o histórico vinculado. Nunca DELETE físico aqui.
+      if (action === "archive_instance_self") {
+        // Operação padrão para um chip banido/sem retorno: nunca DELETE
+        // físico aqui, independente de ter ou não histórico. Idempotente —
+        // arquivar de novo só reafirma o estado, não duplica nada.
+        if (instance.archived_at) {
+          return new Response(JSON.stringify({ ok: true, alreadyArchived: true, archived_at: instance.archived_at }), { headers: corsHeaders });
+        }
+
+        const nowIso = new Date().toISOString();
         const { error: archiveErr } = await supabase
           .from("evolution_instances")
-          .update({ is_active: false, status: "disconnected" })
+          .update({
+            is_active: false,
+            status: "disconnected",
+            archived_at: nowIso,
+            archived_by: callerProfileId,
+            archive_reason: body.reason || "WhatsApp banido — conexão sem possibilidade de retorno.",
+          })
           .eq("id", id);
         if (archiveErr) {
-          console.error(`[${requestId}] [DELETE_SELF] archive failed:`, JSON.stringify({ connection_id: id, message: archiveErr.message }));
+          console.error(`[${requestId}] [archive_instance_self] archive failed:`, JSON.stringify({ connection_id: id, message: archiveErr.message }));
           return new Response(JSON.stringify({ ok: false, error: "Falha ao arquivar a conexão" }), { status: 500, headers: corsHeaders });
         }
+
         const remote = await removeRemote();
-        console.log(`[${requestId}] [DELETE_SELF] archived (has history):`, JSON.stringify({ connection_id: id, name: instance.name, conversations: convCount, leads: leadCount, remote }));
-        return new Response(JSON.stringify({
-          ok: true,
-          archived: true,
-          historyCounts: { conversations: convCount ?? 0, leads: leadCount ?? 0 },
-          remote,
-        }), { headers: corsHeaders });
+        if (remote.ok) {
+          await supabase.from("evolution_instances").update({ provider_deleted_at: nowIso }).eq("id", id);
+        }
+        console.log(`[${requestId}] [archive_instance_self] archived:`, JSON.stringify({ connection_id: id, name: instance.name, remote }));
+        return new Response(JSON.stringify({ ok: true, archived: true, remote }), { headers: corsHeaders });
       }
 
-      // Sem histórico de negócio: exclusão física é segura. Logs puramente
-      // operacionais (admin_notification_logs) têm FK ON DELETE NO ACTION —
-      // desvincula-os primeiro (preserva os registros, só solta a referência)
-      // em vez de deixar a exclusão falhar com um erro de integridade opaco.
+      // action === "delete_instance_permanently": operação excepcional,
+      // separada da padrão. Exige confirmação do nome exato — reconferida
+      // aqui no backend, nunca só no frontend.
+      const confirmName = typeof body.confirmName === "string" ? body.confirmName.trim() : "";
+      if (confirmName !== instance.name) {
+        return new Response(JSON.stringify({ ok: false, error: "Confirmação não corresponde ao nome exato da conexão" }), { status: 400, headers: corsHeaders });
+      }
+
+      // Logs puramente operacionais (admin_notification_logs) têm FK
+      // ON DELETE NO ACTION — desvincula-os primeiro (preserva os registros,
+      // só solta a referência) em vez de deixar a exclusão falhar com um
+      // erro de integridade opaco. webchat_conversations/leads têm
+      // ON DELETE SET NULL — o chamador já viu o impacto via
+      // get_connection_deletion_impact antes de digitar a confirmação.
       const { error: unlinkLogsErr } = await supabase
         .from("admin_notification_logs")
         .update({ connection_id: null })
         .eq("connection_id", id);
       if (unlinkLogsErr) {
-        console.error(`[${requestId}] [DELETE_SELF] unlink notification logs failed:`, JSON.stringify({ connection_id: id, message: unlinkLogsErr.message }));
+        console.error(`[${requestId}] [delete_instance_permanently] unlink notification logs failed:`, JSON.stringify({ connection_id: id, message: unlinkLogsErr.message }));
         return new Response(JSON.stringify({ ok: false, error: "Falha ao preparar exclusão da conexão" }), { status: 500, headers: corsHeaders });
       }
 
       const { error: dbErr } = await supabase.from("evolution_instances").delete().eq("id", id);
       if (dbErr) {
-        console.error(`[${requestId}] [DELETE_SELF] DB delete failed:`, JSON.stringify({ connection_id: id, message: dbErr.message, code: (dbErr as any).code }));
+        console.error(`[${requestId}] [delete_instance_permanently] DB delete failed:`, JSON.stringify({ connection_id: id, message: dbErr.message, code: (dbErr as any).code }));
         return new Response(JSON.stringify({ ok: false, error: "Falha ao excluir a conexão (restrição de integridade)" }), { status: 500, headers: corsHeaders });
       }
       const remote = await removeRemote();
-      console.log(`[${requestId}] [DELETE_SELF] deleted (no history):`, JSON.stringify({ connection_id: id, name: instance.name, remote }));
+      console.log(`[${requestId}] [delete_instance_permanently] deleted:`, JSON.stringify({ connection_id: id, name: instance.name, remote }));
       return new Response(JSON.stringify({ ok: true, archived: false, remote }), { headers: corsHeaders });
     }
 
