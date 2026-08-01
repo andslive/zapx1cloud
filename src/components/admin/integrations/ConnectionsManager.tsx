@@ -27,6 +27,17 @@ import { Card } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -41,8 +52,156 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { AdminStatusNotificationConfig } from './AdminStatusNotificationConfig';
 import { SimulateOutageModal } from './SimulateOutageModal';
 import { supabase } from '@/integrations/supabase/client';
+import type { Funnel } from '@/types/funnel';
 
 
+
+const NONE_FUNNEL_VALUE = '__none__';
+
+// Seletor de funil padrão, um por linha/instância — controla exclusivamente
+// a evolution_instance passada em `connection`. Nunca resolve por nome: só
+// usa connection.id / funnel.id / organization_id.
+function ConnectionFunnelSelect({
+  connection,
+  eligibleFunnels,
+  allFunnelsById,
+}: {
+  connection: WhatsAppInstance;
+  eligibleFunnels: Funnel[];
+  allFunnelsById: Map<string, Funnel>;
+}) {
+  const setDefaultFunnelMut = useSetConnectionDefaultFunnel();
+  const [pendingValue, setPendingValue] = useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const isSavingThisRow =
+    setDefaultFunnelMut.isPending &&
+    setDefaultFunnelMut.variables?.connectionId === connection.id;
+
+  const currentFunnelId = connection.default_funnel_id;
+  const currentFunnel = currentFunnelId ? allFunnelsById.get(currentFunnelId) : null;
+  const isCurrentInactive = !!currentFunnelId && (!currentFunnel || currentFunnel.status !== 'active');
+  const currentValue = currentFunnelId || NONE_FUNNEL_VALUE;
+  const currentLabel = currentFunnelId
+    ? (currentFunnel ? currentFunnel.name.trim() : 'Funil removido')
+    : 'Sem funil configurado';
+
+  // Lista de escolha: só funis elegíveis (ativos, mesma organização, já
+  // filtrados pelo caller). Se o funil atual estiver inativo/excluído, ele
+  // entra como item extra desabilitado só para não esconder o estado
+  // persistido — não pode ser escolhido de novo (nem por esta nem por outra
+  // conexão, já que não está em eligibleFunnels).
+  const extraCurrentOption =
+    currentFunnelId && !eligibleFunnels.some(f => f.id === currentFunnelId)
+      ? { id: currentFunnelId, name: currentLabel, inactive: true }
+      : null;
+
+  const handleChange = (value: string) => {
+    if (isSavingThisRow) return;
+    setPendingValue(value);
+    setConfirmOpen(true);
+  };
+
+  const handleCancelConfirm = () => {
+    setConfirmOpen(false);
+    setPendingValue(null);
+  };
+
+  const handleConfirm = () => {
+    const newFunnelId = pendingValue === NONE_FUNNEL_VALUE ? null : pendingValue;
+    setDefaultFunnelMut.mutate(
+      { connectionId: connection.id, funnelId: newFunnelId },
+      {
+        onSuccess: () => {
+          setConfirmOpen(false);
+          setPendingValue(null);
+        },
+        // onError: dialog fica aberto mostrando o erro; Select continua
+        // vinculado ao valor persistido (currentValue), então visualmente
+        // volta sozinho ao funil anterior — nada de reversão manual/otimista.
+      }
+    );
+  };
+
+  const pendingLabel = pendingValue === NONE_FUNNEL_VALUE
+    ? 'Sem funil configurado'
+    : (eligibleFunnels.find(f => f.id === pendingValue)?.name.trim()
+      || extraCurrentOption?.name
+      || pendingValue);
+
+  return (
+    <>
+      <Select value={currentValue} onValueChange={handleChange} disabled={isSavingThisRow}>
+        <SelectTrigger className="h-8 w-full min-w-[180px] max-w-[220px] text-xs">
+          {isSavingThisRow ? (
+            <span className="flex items-center gap-1.5 text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" /> Salvando...
+            </span>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="truncate block text-left">
+                  {currentLabel}
+                  {isCurrentInactive && <span className="text-amber-500 ml-1">(Inativo)</span>}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>{currentLabel}</TooltipContent>
+            </Tooltip>
+          )}
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={NONE_FUNNEL_VALUE}>Sem funil configurado</SelectItem>
+          {extraCurrentOption && (
+            <SelectItem value={extraCurrentOption.id} disabled>
+              {extraCurrentOption.name} (Inativo)
+            </SelectItem>
+          )}
+          {eligibleFunnels.map(f => (
+            <SelectItem key={f.id} value={f.id}>{f.name.trim()}</SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      <AlertDialog open={confirmOpen} onOpenChange={(open) => { if (!open) handleCancelConfirm(); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Alterar funil de {connection.custom_name || connection.name}?
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2 text-sm text-left">
+                <p><strong>Funil atual:</strong> {currentLabel}</p>
+                <p><strong>Novo funil:</strong> {pendingLabel}</p>
+                <p className="text-amber-600 dark:text-amber-400">
+                  A alteração será aplicada somente a novas conversas. Conversas em andamento continuarão no funil atual.
+                </p>
+                {pendingValue === NONE_FUNNEL_VALUE && (
+                  <p className="text-destructive font-medium">
+                    Sem funil configurado, esta conexão passará a usar o fallback legado de Funil &gt; Canais para novas conversas.
+                  </p>
+                )}
+                {setDefaultFunnelMut.isError && (
+                  <p className="text-destructive text-xs">
+                    Erro ao salvar: {setDefaultFunnelMut.error instanceof Error ? setDefaultFunnelMut.error.message : 'tente novamente'}
+                  </p>
+                )}
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={handleCancelConfirm} disabled={setDefaultFunnelMut.isPending}>
+              Cancelar
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirm} disabled={setDefaultFunnelMut.isPending}>
+              {setDefaultFunnelMut.isPending && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
+              Confirmar alteração
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
 
 function UazConnectDialog({ instance, onClose }: { instance: WhatsAppInstance; onClose: () => void }) {
   const connectMut = useConnectWhatsAppInstance();
@@ -174,10 +333,13 @@ export default function ConnectionsManager() {
   const renameUazMut = useRenameWhatsAppInstanceSelf();
   const deleteUazMut = useDeleteWhatsAppInstanceSelf();
   const updateOfferMut = useUpdateWhatsAppInstanceOffer();
-  const setDefaultFunnelMut = useSetConnectionDefaultFunnel();
-  const { data: allFunnels } = useFunnels();
+  const { data: allFunnels, isLoading: isLoadingFunnels } = useFunnels();
   const eligibleFunnels = useMemo(
     () => (allFunnels || []).filter(f => f.status === 'active'),
+    [allFunnels]
+  );
+  const allFunnelsById = useMemo(
+    () => new Map((allFunnels || []).map(f => [f.id, f])),
     [allFunnels]
   );
 
@@ -187,14 +349,10 @@ export default function ConnectionsManager() {
   const [isQrModalOpen, setIsQrModalOpen] = useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isOfferModalOpen, setIsOfferModalOpen] = useState(false);
-  const [isFunnelModalOpen, setIsFunnelModalOpen] = useState(false);
   const [isSimulateModalOpen, setIsSimulateModalOpen] = useState(false);
   const [connectingUaz, setConnectingUaz] = useState<WhatsAppInstance | null>(null);
   const [editingUaz, setEditingUaz] = useState<WhatsAppInstance | null>(null);
   const [editingOfferUaz, setEditingOfferUaz] = useState<WhatsAppInstance | null>(null);
-  const [editingFunnelUaz, setEditingFunnelUaz] = useState<WhatsAppInstance | null>(null);
-  const [selectedFunnelId, setSelectedFunnelId] = useState<string>('');
-  const [confirmFunnelChange, setConfirmFunnelChange] = useState(false);
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [selectedChromiumId, setSelectedChromiumId] = useState<string | null>(null);
 
@@ -758,13 +916,13 @@ export default function ConnectionsManager() {
           <TableBody>
             {isLoading ? (
               <TableRow>
-                <TableCell colSpan={9} className="text-center py-10">
+                <TableCell colSpan={10} className="text-center py-10">
                   <Loader2 className="h-8 w-8 animate-spin mx-auto text-muted-foreground" />
                 </TableCell>
               </TableRow>
             ) : mergedConnections.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={9} className="text-center py-10 text-muted-foreground">
+                <TableCell colSpan={10} className="text-center py-10 text-muted-foreground">
                   Nenhuma conexão encontrada.
                 </TableCell>
               </TableRow>
@@ -864,12 +1022,20 @@ export default function ConnectionsManager() {
                     </TableCell>
                     <TableCell>{getGeneralStatus(conn)}</TableCell>
                     <TableCell>
-                      {conn.uaz?.default_funnel_id ? (
-                        eligibleFunnels.find(f => f.id === conn.uaz.default_funnel_id)?.name
-                          || allFunnels?.find(f => f.id === conn.uaz.default_funnel_id)?.name
-                          || 'Funil não encontrado'
+                      {conn.uaz ? (
+                        isLoadingFunnels ? (
+                          <span className="flex items-center gap-1.5 text-muted-foreground text-xs">
+                            <Loader2 className="h-3 w-3 animate-spin" /> Carregando funis...
+                          </span>
+                        ) : (
+                          <ConnectionFunnelSelect
+                            connection={conn.uaz}
+                            eligibleFunnels={eligibleFunnels}
+                            allFunnelsById={allFunnelsById}
+                          />
+                        )
                       ) : (
-                        <span className="text-muted-foreground text-xs">Sem funil configurado</span>
+                        <span className="text-muted-foreground text-xs">—</span>
                       )}
                     </TableCell>
                     <TableCell className="text-right">
@@ -895,14 +1061,6 @@ export default function ConnectionsManager() {
                                 setIsOfferModalOpen(true);
                               }}>
                                 <Pencil className="h-4 w-4 mr-2" /> Editar Oferta
-                              </DropdownMenuItem>
-                              <DropdownMenuItem onClick={() => {
-                                setEditingFunnelUaz(conn.uaz);
-                                setSelectedFunnelId(conn.uaz.default_funnel_id || '');
-                                setConfirmFunnelChange(false);
-                                setIsFunnelModalOpen(true);
-                              }}>
-                                <Sparkles className="h-4 w-4 mr-2" /> Alterar Funil
                               </DropdownMenuItem>
                             </>
                           )}
@@ -1183,80 +1341,6 @@ export default function ConnectionsManager() {
                 disabled={updateOfferMut.isPending}
               >
                 {updateOfferMut.isPending && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
-                Salvar Alterações
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-
-      {/* Modal: Alterar Funil da Conexão */}
-      <Dialog open={isFunnelModalOpen} onOpenChange={(open) => {
-        setIsFunnelModalOpen(open);
-        if (!open) setConfirmFunnelChange(false);
-      }}>
-        <DialogContent className="max-w-md">
-          <form onSubmit={(e) => {
-            e.preventDefault();
-            if (!editingFunnelUaz || !confirmFunnelChange) return;
-            setDefaultFunnelMut.mutate(
-              { connectionId: editingFunnelUaz.id, funnelId: selectedFunnelId || null },
-              {
-                onSuccess: () => {
-                  setIsFunnelModalOpen(false);
-                  setConfirmFunnelChange(false);
-                  refetchUaz();
-                },
-              }
-            );
-          }}>
-            <DialogHeader>
-              <DialogTitle>Alterar Funil</DialogTitle>
-              <DialogDescription>
-                Escolha o funil padrão desta conexão. Novos leads que chegarem por ela entrarão neste funil.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4 py-4">
-              <div className="space-y-2">
-                <Label htmlFor="editFunnel">Funil ativo</Label>
-                <Select value={selectedFunnelId || '__none__'} onValueChange={(v) => setSelectedFunnelId(v === '__none__' ? '' : v)}>
-                  <SelectTrigger id="editFunnel">
-                    <SelectValue placeholder="Sem funil configurado" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__none__">Sem funil configurado (usar regra legada de Funil &gt; Canais)</SelectItem>
-                    {eligibleFunnels.map(f => (
-                      <SelectItem key={f.id} value={f.id}>{f.name}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3">
-                <AlertTriangle className="h-4 w-4 text-amber-500 mt-0.5 shrink-0" />
-                <p className="text-xs text-muted-foreground">
-                  A alteração será aplicada somente a novas conversas. Conversas em andamento continuarão no funil atual.
-                </p>
-              </div>
-              <label className="flex items-start gap-2 text-xs cursor-pointer">
-                <Checkbox
-                  checked={confirmFunnelChange}
-                  onCheckedChange={(v) => setConfirmFunnelChange(v === true)}
-                />
-                <span>Entendo que essa mudança só vale para novas conversas.</span>
-              </label>
-              {setDefaultFunnelMut.isError && (
-                <p className="text-xs text-destructive">
-                  Erro ao salvar: {(setDefaultFunnelMut.error instanceof Error ? setDefaultFunnelMut.error.message : null) || 'tente novamente'}
-                </p>
-              )}
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setIsFunnelModalOpen(false)}>Cancelar</Button>
-              <Button
-                type="submit"
-                disabled={!confirmFunnelChange || setDefaultFunnelMut.isPending}
-              >
-                {setDefaultFunnelMut.isPending && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
                 Salvar Alterações
               </Button>
             </DialogFooter>
