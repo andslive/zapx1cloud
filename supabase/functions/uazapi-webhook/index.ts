@@ -242,6 +242,16 @@ type FunnelCandidate = {
 };
 type FunnelResolutionOrigin = "connection_assignment" | "legacy_fallback";
 
+// Acesso seguro ao messageId só para os logs [FUNNEL_RESOLUTION] abaixo:
+// `norm` é `Normalized | null` e `messageId` só existe nas variantes
+// "message"/"message_delete" da união. Nesses 3 pontos já estamos dentro do
+// processamento de uma mensagem real (norm.content/norm.remoteJid já foram
+// usados antes), mas o compilador não consegue provar isso aqui — em vez de
+// non-null assertion, checamos a propriedade e usamos fallback explícito.
+function normMessageIdForLog(n: Normalized | null): string | null {
+  return n && "messageId" in n ? n.messageId : null;
+}
+
 async function resolveFunnelCandidates(
   supabase: any,
   { organizationId, connectionId }: { organizationId: string; connectionId: string | null },
@@ -4037,7 +4047,7 @@ Deno.serve(async (req) => {
                 connection_id: instance.id,
                 conversation_id: existingByPhone.id,
                 funnel_id: funnelToRunReopen.id,
-                message_id: norm.messageId,
+                message_id: normMessageIdForLog(norm),
                 ctx: "reopen",
               }),
             );
@@ -4275,7 +4285,7 @@ Deno.serve(async (req) => {
                 connection_id: instance.id,
                 conversation_id: existing.id,
                 funnel_id: finalFunnelId,
-                message_id: norm.messageId,
+                message_id: normMessageIdForLog(norm),
                 ctx: "existing",
                 won_pinning_race: wonPinning,
               }),
@@ -4948,7 +4958,7 @@ Deno.serve(async (req) => {
               organization_id: instance.organization_id,
               connection_id: instance.id,
               funnel_id: funnelToRun.id,
-              message_id: norm.messageId,
+              message_id: normMessageIdForLog(norm),
               ctx: "new",
             }),
           );
