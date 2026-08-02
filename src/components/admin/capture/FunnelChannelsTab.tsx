@@ -221,6 +221,9 @@ export function FunnelChannelsTab({ funnel }: FunnelChannelsTabProps) {
                   Nenhuma instância encontrada. Cadastre em Integrações → WhatsApp & Mensageria.
                 </p>
               )}
+              <p className="text-xs text-muted-foreground">
+                O funil padrão de cada instância do WhatsApp é configurado em Conexões. Essa configuração aqui só é usada quando a conexão não tem um funil padrão definido.
+              </p>
             </div>
 
             <div className="bg-amber-50 dark:bg-amber-950/30 rounded-lg p-3 text-xs text-amber-900 dark:text-amber-200">
