@@ -215,6 +215,158 @@ async function isDuplicateInboundMessage(
   return false;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Roteamento de funil por conexão (decisão canônica única).
+//
+// Precedência: (1) funil já fixado na conversa/execução — NÃO passa por aqui,
+// os call sites só chamam isto quando vão decidir um funil NOVO; (2) funil
+// padrão configurado em evolution_instances.default_funnel_id; (3) fallback
+// legado (capture_funnels.channels->whatsapp, "Funil > Canais").
+//
+// Deixa preparado (sem implementar) um degrau futuro de precedência por
+// origem/oferta/anúncio ANTES do padrão da conexão — ver FUTURE_AD_OFFER_RULE.
+// ─────────────────────────────────────────────────────────────────────────
+type FunnelCandidate = {
+  id: string;
+  start_block_id: string | null;
+  channels?: any;
+  allow_reentry?: boolean;
+  status?: string;
+};
+type FunnelResolutionOrigin = "connection_assignment" | "legacy_fallback";
+
+async function resolveFunnelCandidates(
+  supabase: any,
+  { organizationId, connectionId }: { organizationId: string; connectionId: string | null },
+): Promise<{ candidates: FunnelCandidate[]; origin: FunnelResolutionOrigin }> {
+  // FUTURE_AD_OFFER_RULE: um resolvedor por origem/oferta/anúncio específico
+  // (ctwa_clid, campanha etc.) entraria aqui, ANTES do default da conexão.
+  // Não implementado nesta fase — sem evidência/escopo aprovado.
+
+  if (connectionId) {
+    const { data: conn } = await supabase
+      .from("evolution_instances")
+      .select("default_funnel_id")
+      .eq("id", connectionId)
+      .maybeSingle();
+
+    if (conn?.default_funnel_id) {
+      const { data: funnel } = await supabase
+        .from("capture_funnels")
+        .select("id, start_block_id, channels, allow_reentry, status")
+        .eq("id", conn.default_funnel_id)
+        .eq("organization_id", organizationId)
+        .maybeSingle();
+
+      if (funnel && funnel.status === "active") {
+        return { candidates: [funnel as FunnelCandidate], origin: "connection_assignment" };
+      }
+      console.warn(
+        "[FUNNEL_RESOLUTION] connection has default_funnel_id but funnel is missing/inactive — falling back to legacy channel routing:",
+        JSON.stringify({ connectionId, defaultFunnelId: conn.default_funnel_id, found: !!funnel, status: funnel?.status }),
+      );
+    }
+  }
+
+  const { data: legacyCandidates } = await supabase
+    .from("capture_funnels")
+    .select("id, start_block_id, channels, allow_reentry, status")
+    .eq("organization_id", organizationId)
+    .eq("status", "active");
+
+  return { candidates: (legacyCandidates || []) as FunnelCandidate[], origin: "legacy_fallback" };
+}
+
+/**
+ * Fixa current_flow_id/current_block_id de forma atômica via compare-and-swap:
+ * o UPDATE só é aplicado se o valor atual de current_flow_id ainda bater com o
+ * que foi lido no snapshot (expectedPriorFlowId). Se outra requisição venceu a
+ * corrida, retorna won=false com o valor já persistido — o chamador deve usar
+ * esse valor em vez de tentar sobrescrever.
+ */
+async function pinConversationFunnelCAS(
+  supabase: any,
+  conversationId: string,
+  expectedPriorFlowId: string | null,
+  updateData: Record<string, unknown>,
+): Promise<{
+  won: boolean;
+  current_flow_id: string | null;
+  current_block_id: string | null;
+}> {
+  let q = supabase.from("webchat_conversations").update(updateData).eq("id", conversationId);
+  q = expectedPriorFlowId === null
+    ? q.is("current_flow_id", null)
+    : q.eq("current_flow_id", expectedPriorFlowId);
+
+  const { data, error } = await q.select("current_flow_id, current_block_id").maybeSingle();
+  if (error) throw error;
+
+  if (data) {
+    return { won: true, current_flow_id: data.current_flow_id, current_block_id: data.current_block_id };
+  }
+
+  console.warn(
+    "[FUNNEL_RESOLUTION] lost pinning race for conversation, adopting persisted value:",
+    JSON.stringify({ conversationId, expectedPriorFlowId }),
+  );
+  const { data: latest } = await supabase
+    .from("webchat_conversations")
+    .select("current_flow_id, current_block_id")
+    .eq("id", conversationId)
+    .maybeSingle();
+  return {
+    won: false,
+    current_flow_id: latest?.current_flow_id ?? null,
+    current_block_id: latest?.current_block_id ?? null,
+  };
+}
+
+/**
+ * Fixa current_flow_id/current_block_id via compare-and-swap na coluna status
+ * (usado ao reabrir uma conversa fechada, onde current_flow_id é
+ * intencionalmente sobrescrito — o guard é "ainda está closed?").
+ */
+async function pinConversationFunnelOnReopenCAS(
+  supabase: any,
+  conversationId: string,
+  updateData: Record<string, unknown>,
+): Promise<{
+  won: boolean;
+  current_flow_id: string | null;
+  current_block_id: string | null;
+  status: string | null;
+}> {
+  const { data, error } = await supabase
+    .from("webchat_conversations")
+    .update(updateData)
+    .eq("id", conversationId)
+    .eq("status", "closed")
+    .select("current_flow_id, current_block_id, status")
+    .maybeSingle();
+  if (error) throw error;
+
+  if (data) {
+    return { won: true, current_flow_id: data.current_flow_id, current_block_id: data.current_block_id, status: data.status };
+  }
+
+  console.warn(
+    "[FUNNEL_RESOLUTION] lost reopen-pinning race for conversation, adopting persisted value:",
+    JSON.stringify({ conversationId }),
+  );
+  const { data: latest } = await supabase
+    .from("webchat_conversations")
+    .select("current_flow_id, current_block_id, status")
+    .eq("id", conversationId)
+    .maybeSingle();
+  return {
+    won: false,
+    current_flow_id: latest?.current_flow_id ?? null,
+    current_block_id: latest?.current_block_id ?? null,
+    status: latest?.status ?? null,
+  };
+}
+
 // [FASE 23.2] TTL do buffer de comprovante pendente (__pending_receipt_media).
 // Era 10 min hardcoded no replay; comprovante real chegou 52 min antes do bloco
 // e expirou. 60 min cobre os casos observados sem reter mídia indefinidamente.
@@ -3136,22 +3288,27 @@ Deno.serve(async (req) => {
           let funnelToRunReopen:
             | { id: string; start_block_id: string | null }
             | null = null;
+          let funnelResolutionOriginReopen: FunnelResolutionOrigin = "legacy_fallback";
           try {
-            const { data: candidates } = await supabase
-              .from("capture_funnels")
-              .select("id, start_block_id, channels, allow_reentry")
-              .eq("organization_id", instance.organization_id)
-              .eq("status", "active");
+            const { candidates, origin } = await resolveFunnelCandidates(supabase, {
+              organizationId: instance.organization_id,
+              connectionId: instance.id,
+            });
+            funnelResolutionOriginReopen = origin;
 
             const normMsgReopen = normalizeForMatch(norm.content || "");
             for (const cand of candidates || []) {
               const wa = (cand as any).channels?.whatsapp;
-              if (!wa?.enabled) continue;
-              const boundInstance = wa.evolution_instance_id;
-              if (boundInstance && boundInstance !== instance.id) continue;
+              // Config de canal ("Funil > Canais") só é exigida no fallback legado —
+              // o funil padrão da conexão já é a decisão explícita, não depende dela.
+              if (origin === "legacy_fallback") {
+                if (!wa?.enabled) continue;
+                const boundInstance = wa.evolution_instance_id;
+                if (boundInstance && boundInstance !== instance.id) continue;
+              }
 
               // Detect ad-trigger keyword match for this candidate
-              const kw = wa.trigger_keywords || wa.keywords || "";
+              const kw = wa?.trigger_keywords || wa?.keywords || "";
               const kwList = typeof kw === "string"
                 ? kw.split(",").map((k: string) => normalizeForMatch(k)).filter((k: string) => k.length > 0)
                 : (Array.isArray(kw) ? kw.map((k: any) => normalizeForMatch(String(k))) : []);
@@ -3223,16 +3380,33 @@ Deno.serve(async (req) => {
             updatePayload.current_agent_id = null;
             (payload as any).__is_new_funnel = true;
             console.log(
-              "[uazapi-webhook] reopened closed conversation matched funnel → starting funnel run",
-              funnelToRunReopen.id,
+              "[FUNNEL_RESOLUTION]",
+              JSON.stringify({
+                origin: funnelResolutionOriginReopen,
+                organization_id: instance.organization_id,
+                connection_id: instance.id,
+                conversation_id: existingByPhone.id,
+                funnel_id: funnelToRunReopen.id,
+                message_id: norm.messageId,
+                ctx: "reopen",
+              }),
             );
           }
 
-          // Reabre a mesma conversa em vez de criar uma nova: preserva histórico
-          await supabase
-            .from("webchat_conversations")
-            .update(updatePayload)
-            .eq("id", existingByPhone.id);
+          // Reabre a mesma conversa em vez de criar uma nova: preserva histórico.
+          // CAS em status='closed': se outra requisição concorrente já reabriu
+          // esta mesma conversa, não sobrescrevemos o funil que ela já fixou.
+          const reopenResult = await pinConversationFunnelOnReopenCAS(
+            supabase,
+            existingByPhone.id,
+            updatePayload,
+          );
+          if (!reopenResult.won) {
+            console.warn(
+              "[FUNNEL_RESOLUTION] reopen race lost — conversation already reopened by a concurrent request:",
+              JSON.stringify({ conversation_id: existingByPhone.id, persisted_flow_id: reopenResult.current_flow_id }),
+            );
+          }
           console.log(
             "[uazapi-webhook] reopened closed conversation for phone:",
             phoneCanonical,
@@ -3337,20 +3511,23 @@ Deno.serve(async (req) => {
           | { id: string; start_block_id: string | null }
           | null = null;
 
+        let funnelResolutionOriginExisting: FunnelResolutionOrigin = "legacy_fallback";
         try {
-          const { data: funnels } = await supabase
-            .from("capture_funnels")
-            .select("id, start_block_id, channels, allow_reentry")
-            .eq("organization_id", instance.organization_id)
-            .eq("status", "active");
+          const { candidates: funnels, origin } = await resolveFunnelCandidates(supabase, {
+            organizationId: instance.organization_id,
+            connectionId: instance.id,
+          });
+          funnelResolutionOriginExisting = origin;
 
           for (const cand of funnels || []) {
             const wa = (cand as any).channels?.whatsapp;
-            if (!wa?.enabled) continue;
-            const boundInstance = wa.evolution_instance_id;
-            if (boundInstance && boundInstance !== instance.id) continue;
+            if (origin === "legacy_fallback") {
+              if (!wa?.enabled) continue;
+              const boundInstance = wa.evolution_instance_id;
+              if (boundInstance && boundInstance !== instance.id) continue;
+            }
 
-            const keywords = wa.trigger_keywords || wa.keywords || "";
+            const keywords = wa?.trigger_keywords || wa?.keywords || "";
             const keywordList = typeof keywords === "string"
               ? keywords.split(",").map((k) => normalizeForMatch(k)).filter(
                 (k) => k.length > 0,
@@ -3428,13 +3605,34 @@ Deno.serve(async (req) => {
               current_agent_id: null,
               bot_locked_until: null,
             };
-            await supabase
-              .from("webchat_conversations")
-              .update(updateData)
-              .eq("id", existing.id);
+            // CAS: só fixa se current_flow_id ainda for o mesmo do snapshot lido
+            // em convData — evita duas mensagens quase simultâneas iniciarem
+            // funis diferentes para a mesma conversa.
+            const pinResult = await pinConversationFunnelCAS(
+              supabase,
+              existing.id,
+              convData?.current_flow_id ?? null,
+              updateData,
+            );
+            const wonPinning = pinResult.won;
+            const finalFunnelId = wonPinning ? funnelToRunExisting.id : pinResult.current_flow_id;
 
-            // Registrar início no histórico
-            if (convData?.lead_id) {
+            console.log(
+              "[FUNNEL_RESOLUTION]",
+              JSON.stringify({
+                origin: funnelResolutionOriginExisting,
+                organization_id: instance.organization_id,
+                connection_id: instance.id,
+                conversation_id: existing.id,
+                funnel_id: finalFunnelId,
+                message_id: norm.messageId,
+                ctx: "existing",
+                won_pinning_race: wonPinning,
+              }),
+            );
+
+            // Registrar início no histórico (só se nós de fato fixamos o funil)
+            if (wonPinning && convData?.lead_id) {
               try {
                 await supabase.from("lead_funnel_history").insert({
                   lead_id: convData.lead_id,
@@ -3448,6 +3646,7 @@ Deno.serve(async (req) => {
             console.log(
               "[uazapi-webhook] (re)triggered funnel for existing conversation:",
               funnelToRunExisting.id,
+              wonPinning ? "" : "(lost pinning race, adopted persisted funnel)",
             );
 
           }
@@ -3951,21 +4150,24 @@ Deno.serve(async (req) => {
         // and matches this evolution instance (or any instance) and trigger rules.
         let funnelToRun: { id: string; start_block_id: string | null } | null =
           null;
+        let funnelResolutionOriginNew: FunnelResolutionOrigin = "legacy_fallback";
         try {
-          const { data: candidates } = await supabase
-            .from("capture_funnels")
-            .select("id, start_block_id, channels, allow_reentry")
-            .eq("organization_id", instance.organization_id)
-            .eq("status", "active");
+          const { candidates, origin } = await resolveFunnelCandidates(supabase, {
+            organizationId: instance.organization_id,
+            connectionId: instance.id,
+          });
+          funnelResolutionOriginNew = origin;
 
           const normMsg = normalizeForMatch(norm.content || "");
           for (const cand of candidates || []) {
             const wa = (cand as any).channels?.whatsapp;
-            if (!wa?.enabled) continue;
-            const boundInstance = wa.evolution_instance_id;
-            if (boundInstance && boundInstance !== instance.id) continue;
+            if (origin === "legacy_fallback") {
+              if (!wa?.enabled) continue;
+              const boundInstance = wa.evolution_instance_id;
+              if (boundInstance && boundInstance !== instance.id) continue;
+            }
 
-            const keywords = wa.trigger_keywords || wa.keywords || "";
+            const keywords = wa?.trigger_keywords || wa?.keywords || "";
             const keywordList = typeof keywords === "string"
               ? keywords.split(",").map((k) => normalizeForMatch(k)).filter(
                 (k) => k.length > 0,
@@ -4087,6 +4289,17 @@ Deno.serve(async (req) => {
             JSON.stringify({
               funnel_id: funnelToRun.id,
               start_block_id: funnelToRun.start_block_id,
+            }),
+          );
+          console.log(
+            "[FUNNEL_RESOLUTION]",
+            JSON.stringify({
+              origin: funnelResolutionOriginNew,
+              organization_id: instance.organization_id,
+              connection_id: instance.id,
+              funnel_id: funnelToRun.id,
+              message_id: norm.messageId,
+              ctx: "new",
             }),
           );
         }

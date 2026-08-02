@@ -3971,6 +3971,7 @@ export type Database = {
           created_at: string
           created_by_super_admin: boolean
           custom_name: string | null
+          default_funnel_id: string | null
           health_data: Json | null
           high_delivery_mode: boolean | null
           id: string
@@ -4017,6 +4018,7 @@ export type Database = {
           created_at?: string
           created_by_super_admin?: boolean
           custom_name?: string | null
+          default_funnel_id?: string | null
           health_data?: Json | null
           high_delivery_mode?: boolean | null
           id?: string
@@ -4063,6 +4065,7 @@ export type Database = {
           created_at?: string
           created_by_super_admin?: boolean
           custom_name?: string | null
+          default_funnel_id?: string | null
           health_data?: Json | null
           high_delivery_mode?: boolean | null
           id?: string
@@ -4109,6 +4112,13 @@ export type Database = {
             columns: ["organization_id"]
             isOneToOne: false
             referencedRelation: "organizations"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "evolution_instances_default_funnel_id_fkey"
+            columns: ["default_funnel_id"]
+            isOneToOne: false
+            referencedRelation: "capture_funnels"
             referencedColumns: ["id"]
           },
         ]
@@ -12311,6 +12321,10 @@ export type Database = {
           similarity: number
           source: string
         }[]
+      }
+      set_connection_default_funnel: {
+        Args: { _connection_id: string; _funnel_id: string | null }
+        Returns: Database["public"]["Tables"]["evolution_instances"]["Row"]
       }
       show_limit: { Args: never; Returns: number }
       show_trgm: { Args: { "": string }; Returns: string[] }
