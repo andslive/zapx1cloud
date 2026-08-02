@@ -16,6 +16,8 @@ import {
   outboundCountUnchanged,
   resolveOriginalEventTime,
 } from "../_shared/receipt-recovery.ts";
+import { resolveEvolutionProviderConfig } from "../_shared/evolution-provider-config.ts";
+import { renderMessageTextOrSkip } from "./message-render.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -1630,42 +1632,6 @@ async function decryptWhatsAppMedia(
     "[uazapi-webhook] local media decrypt failed for all key derivations",
   );
   return null;
-}
-
-// Resolve UazAPI/Evolution config (URL + API keys) for a given organization,
-// com o mesmo fallback integration_settings → platform_settings usado em
-// todo o arquivo. Extraído para reuso: existiam duas cópias inline dessa
-// mesma lógica (uma delas, dentro de case "ai_receipt", referenciava uma
-// variável de outro escopo — TS2304/ReferenceError). Paridade comprovada por
-// ser exatamente o código antes duplicado, só parametrizado.
-async function resolveEvolutionProviderConfig(
-  supabase: any,
-  organizationId: string,
-  instanceToken?: string | null,
-): Promise<{ evoUrl: string; apiKeys: string[] }> {
-  const { data: cfg } = await supabase
-    .from("integration_settings")
-    .select("settings")
-    .eq("organization_id", organizationId)
-    .eq("integration_type", "whatsapp_provider")
-    .maybeSingle();
-  const settings = (cfg as any)?.settings || {};
-  let evoUrl = String(settings.evolution_go_url || "").replace(/\/$/, "");
-  const apiKeys = [instanceToken, settings.evolution_go_global_api_key];
-  if (!evoUrl || apiKeys.every((k) => !k)) {
-    const { data: platformCfg } = await supabase
-      .from("platform_settings")
-      .select("evolution_go_url, evolution_go_global_api_key")
-      .limit(1)
-      .maybeSingle();
-    evoUrl = evoUrl ||
-      String((platformCfg as any)?.evolution_go_url || "").replace(
-        /\/$/,
-        "",
-      );
-    apiKeys.push((platformCfg as any)?.evolution_go_global_api_key);
-  }
-  return { evoUrl, apiKeys };
 }
 
 // Try to download decrypted media bytes from UazAPI.
@@ -7034,20 +7000,13 @@ Mensagem do lead:
             switch (String(b.type).toLowerCase()) {
               case "message": {
                 if (b.data?.content) {
-                  // Renderiza uma única vez: b.data.content é só o template
-                  // ("{{ai.response}}" etc.), não o texto final — verificar
-                  // truthiness do template não garante que o resultado
-                  // substituído seja não-vazio (ex.: ai.response = "").
-                  const renderedText = replaceVars(b.data.content);
-                  // replaceVars retorna `any` (repassa o valor original se não
-                  // for string); checagem de vazio feita sobre uma coerção
-                  // segura, sem alterar o valor efetivamente enviado abaixo.
-                  const renderedTextForEmptyCheck =
-                    typeof renderedText === "string"
-                      ? renderedText
-                      : String(renderedText ?? "");
+                  // b.data.content é só o TEMPLATE (ex.: "{{ai.response}}");
+                  // renderMessageTextOrSkip devolve null se o resultado após
+                  // substituir as variáveis for vazio/só espaços — nesse caso
+                  // não há nada a enfileirar/enviar.
+                  const rendered = renderMessageTextOrSkip(b.data.content, replaceVars);
 
-                  if (!renderedTextForEmptyCheck.trim()) {
+                  if (!rendered) {
                     console.log(
                       "[EMPTY_MESSAGE_SKIPPED]",
                       JSON.stringify({
@@ -7063,8 +7022,8 @@ Mensagem do lead:
                     // NEW LOGIC: Presence must be part of delay, never sum.
                     const total_wait_ms = delay;
                     const typing_duration = Math.min(typing_duration_raw, total_wait_ms);
-                    // Não aplica trim ao conteúdo enviado — preserva formatação.
-                    const payload = { text: renderedText };
+                    // rendered.text não passou por trim — preserva formatação.
+                    const payload = { text: rendered.text };
 
                     console.log(`[uazapi-webhook] presence_config_loaded: block_id=${b.id} block_type=message show_typing=${show_typing} configured_typing=${typing_duration_raw}ms resolved_typing=${typing_duration}ms total_delay=${total_wait_ms}ms`);
                     if (typing_duration_raw > total_wait_ms) console.log(`[uazapi-webhook] timing_overlap_resolved: block_id=${b.id} typing reduced to match total delay`);
