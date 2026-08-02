@@ -1632,6 +1632,42 @@ async function decryptWhatsAppMedia(
   return null;
 }
 
+// Resolve UazAPI/Evolution config (URL + API keys) for a given organization,
+// com o mesmo fallback integration_settings → platform_settings usado em
+// todo o arquivo. Extraído para reuso: existiam duas cópias inline dessa
+// mesma lógica (uma delas, dentro de case "ai_receipt", referenciava uma
+// variável de outro escopo — TS2304/ReferenceError). Paridade comprovada por
+// ser exatamente o código antes duplicado, só parametrizado.
+async function resolveEvolutionProviderConfig(
+  supabase: any,
+  organizationId: string,
+  instanceToken?: string | null,
+): Promise<{ evoUrl: string; apiKeys: string[] }> {
+  const { data: cfg } = await supabase
+    .from("integration_settings")
+    .select("settings")
+    .eq("organization_id", organizationId)
+    .eq("integration_type", "whatsapp_provider")
+    .maybeSingle();
+  const settings = (cfg as any)?.settings || {};
+  let evoUrl = String(settings.evolution_go_url || "").replace(/\/$/, "");
+  const apiKeys = [instanceToken, settings.evolution_go_global_api_key];
+  if (!evoUrl || apiKeys.every((k) => !k)) {
+    const { data: platformCfg } = await supabase
+      .from("platform_settings")
+      .select("evolution_go_url, evolution_go_global_api_key")
+      .limit(1)
+      .maybeSingle();
+    evoUrl = evoUrl ||
+      String((platformCfg as any)?.evolution_go_url || "").replace(
+        /\/$/,
+        "",
+      );
+    apiKeys.push((platformCfg as any)?.evolution_go_global_api_key);
+  }
+  return { evoUrl, apiKeys };
+}
+
 // Try to download decrypted media bytes from UazAPI.
 // WhatsApp media is end-to-end encrypted: providers MUST decrypt using the
 // per-message mediaKey. We try, in order:
@@ -5243,36 +5279,12 @@ Deno.serve(async (req) => {
               : undefined;
 
           // Resolve UazAPI config (needed for media download)
-          const { data: cfg } = await supabase
-            .from("integration_settings")
-            .select("settings")
-            .eq("organization_id", instance.organization_id)
-            .eq("integration_type", "whatsapp_provider")
-            .maybeSingle();
-          const settings = (cfg as any)?.settings || {};
-          let resolvedEvoUrl = String(settings.evolution_go_url || "").replace(
-            /\/$/,
-            "",
-          );
-          const resolvedApiKeys = [
-            instance.instance_token,
-            settings.evolution_go_global_api_key,
-          ];
-          if (!resolvedEvoUrl || resolvedApiKeys.every((k) => !k)) {
-            const { data: platformCfg } = await supabase
-              .from("platform_settings")
-              .select("evolution_go_url, evolution_go_global_api_key")
-              .limit(1)
-              .maybeSingle();
-            resolvedEvoUrl = resolvedEvoUrl ||
-              String((platformCfg as any)?.evolution_go_url || "").replace(
-                /\/$/,
-                "",
-              );
-            resolvedApiKeys.push(
-              (platformCfg as any)?.evolution_go_global_api_key,
+          const { evoUrl: resolvedEvoUrl, apiKeys: resolvedApiKeys } =
+            await resolveEvolutionProviderConfig(
+              supabase,
+              instance.organization_id,
+              instance.instance_token,
             );
-          }
 
           if (!b64) {
             const dl = await downloadMediaBase64(
@@ -7022,27 +7034,51 @@ Mensagem do lead:
             switch (String(b.type).toLowerCase()) {
               case "message": {
                 if (b.data?.content) {
-                  const delay = b.data.delay_ms || 0;
-                  const typing_duration_raw = b.data.typing_duration_ms ?? 2000;
-                  const show_typing = b.data.show_typing ?? true;
-                  
-                  // NEW LOGIC: Presence must be part of delay, never sum.
-                  const total_wait_ms = delay;
-                  const typing_duration = Math.min(typing_duration_raw, total_wait_ms);
-                  const payload = { text: replaceVars(b.data.content) };
-                  
-                  console.log(`[uazapi-webhook] presence_config_loaded: block_id=${b.id} block_type=message show_typing=${show_typing} configured_typing=${typing_duration_raw}ms resolved_typing=${typing_duration}ms total_delay=${total_wait_ms}ms`);
-                  if (typing_duration_raw > total_wait_ms) console.log(`[uazapi-webhook] timing_overlap_resolved: block_id=${b.id} typing reduced to match total delay`);
+                  // Renderiza uma única vez: b.data.content é só o template
+                  // ("{{ai.response}}" etc.), não o texto final — verificar
+                  // truthiness do template não garante que o resultado
+                  // substituído seja não-vazio (ex.: ai.response = "").
+                  const renderedText = replaceVars(b.data.content);
+                  // replaceVars retorna `any` (repassa o valor original se não
+                  // for string); checagem de vazio feita sobre uma coerção
+                  // segura, sem alterar o valor efetivamente enviado abaixo.
+                  const renderedTextForEmptyCheck =
+                    typeof renderedText === "string"
+                      ? renderedText
+                      : String(renderedText ?? "");
 
-                  chunksToSend.push({
-                    type: "text",
-                    payload: payload,
-                    show_typing: show_typing,
-                    typing_duration: typing_duration,
-                    delay: pendingDelayMs + total_wait_ms,
-                    reply_to_message: b.data.reply_to_message,
-                    source_block_id: b.id,
-                  });
+                  if (!renderedTextForEmptyCheck.trim()) {
+                    console.log(
+                      "[EMPTY_MESSAGE_SKIPPED]",
+                      JSON.stringify({
+                        block_id: b.id,
+                        reason: "rendered_text_empty_after_substitution",
+                      }),
+                    );
+                  } else {
+                    const delay = b.data.delay_ms || 0;
+                    const typing_duration_raw = b.data.typing_duration_ms ?? 2000;
+                    const show_typing = b.data.show_typing ?? true;
+
+                    // NEW LOGIC: Presence must be part of delay, never sum.
+                    const total_wait_ms = delay;
+                    const typing_duration = Math.min(typing_duration_raw, total_wait_ms);
+                    // Não aplica trim ao conteúdo enviado — preserva formatação.
+                    const payload = { text: renderedText };
+
+                    console.log(`[uazapi-webhook] presence_config_loaded: block_id=${b.id} block_type=message show_typing=${show_typing} configured_typing=${typing_duration_raw}ms resolved_typing=${typing_duration}ms total_delay=${total_wait_ms}ms`);
+                    if (typing_duration_raw > total_wait_ms) console.log(`[uazapi-webhook] timing_overlap_resolved: block_id=${b.id} typing reduced to match total delay`);
+
+                    chunksToSend.push({
+                      type: "text",
+                      payload: payload,
+                      show_typing: show_typing,
+                      typing_duration: typing_duration,
+                      delay: pendingDelayMs + total_wait_ms,
+                      reply_to_message: b.data.reply_to_message,
+                      source_block_id: b.id,
+                    });
+                  }
                 }
                 pendingDelayMs = 0;
                 nextBlockId = b.next_block_id || null;
@@ -9179,9 +9215,19 @@ FORMATO JSON:
                     
                     if (!mediaData && effectiveMedia.rawMessage) {
                       console.log("[uazapi-webhook] ai_receipt: attempting downloadMediaBase64", { mediaType: effectiveMedia.type });
+                      // [FIX] resolvedEvoUrl/resolvedApiKeys pertencem a outro escopo
+                      // (bloco de mídia da mensagem inbound) e não estão acessíveis
+                      // aqui — resolvido apenas quando esta sub-rota é de fato
+                      // alcançada, para não gerar consulta extra por mensagem.
+                      const { evoUrl: aiReceiptEvoUrl, apiKeys: aiReceiptApiKeys } =
+                        await resolveEvolutionProviderConfig(
+                          supabase,
+                          instance.organization_id,
+                          instance.instance_token,
+                        );
                       const dl = await downloadMediaBase64(
-                        resolvedEvoUrl,
-                        resolvedApiKeys,
+                        aiReceiptEvoUrl,
+                        aiReceiptApiKeys,
                         effectiveMedia.rawMessage,
                         (effectiveMedia as any).messageId || norm.messageId,
                         effectiveMedia.type as any,
