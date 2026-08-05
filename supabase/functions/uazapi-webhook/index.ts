@@ -10280,6 +10280,11 @@ FORMATO JSON:
                   message_type: chunk.type === "media"
                     ? (chunk.payload?.type || "file")
                     : chunk.type,
+                  // Antes gravava sempre "sent" (default da coluna), mesmo
+                  // quando as 3 tentativas de envio à UazAPI falhavam — o
+                  // inbox mostrava a mensagem como entregue sem checar
+                  // sendSuccess. Agora reflete o resultado real do envio.
+                  status: sendSuccess ? "sent" : "failed",
                   metadata: {
                     funnel_id: funnel.id,
                     block_id: nextBlockId,
@@ -10287,6 +10292,7 @@ FORMATO JSON:
                     ...(chunk.payload?.url
                       ? { media_url: chunk.payload.url }
                       : {}),
+                    ...(sendSuccess ? {} : { send_error: lastSendError }),
                   },
                 });
               }

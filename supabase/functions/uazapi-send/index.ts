@@ -296,6 +296,11 @@ Deno.serve(async (req) => {
             instance: instance.name,
             type: payload.ptt !== false ? "ptt" : "audio",
             file: payload.audio || payload.url,
+            // audio/ogg; codecs=opus é o mimetype que o WhatsApp espera para
+            // renderizar como nota de voz gravada (bolha de áudio), não como
+            // arquivo anexado. Sem isso, a UazAPI pode aceitar o envio (200 OK)
+            // sem que o áudio apareça como ptt no cliente.
+            mimetype: payload.mimetype || "audio/ogg; codecs=opus",
             delay: sendDelay,
           });
 
@@ -303,11 +308,9 @@ Deno.serve(async (req) => {
             res = await uazFetch(url, apiKey, "/send/media", {
               number: uazNumber,
               instance: instance.name,
-
-              instance: instance.name,
               type: payload.ptt !== false ? "ptt" : "audio",
               file: payload.audio || payload.url,
-              mimetype: payload.mimetype || "audio/ogg",
+              mimetype: payload.mimetype || "audio/ogg; codecs=opus",
               delay: sendDelay,
             });
           }
