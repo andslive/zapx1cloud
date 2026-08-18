@@ -39,6 +39,7 @@ export interface IntegrationItem {
   /** Component key — maps to a configurator in IntegrationConfigDrawer */
   configKey?:
     | 'whatsapp'
+    | 'meta-cloud-api'
     | 'botconversa'
     | 'facebook'
     | 'email-config'
@@ -381,6 +382,26 @@ export const integrationsCatalog: IntegrationCategory[] = [
         color: 'bg-green-500/10 text-green-500',
         configKey: 'whatsapp',
         keywords: ['uazapi', 'evolution', 'whatsapp', 'api'],
+      },
+      {
+        // FASE 2A — card desativado (estrutura apenas). Ver relatório
+        // Fase 2A: nenhuma credencial real, número ou organização pode
+        // ser conectada por este card ainda; feature flag desligada por
+        // padrão (global e por organização).
+        id: 'meta-cloud-api-config',
+        name: 'WhatsApp Cloud API (Meta Oficial)',
+        description: 'Conecte números pela API oficial da Meta, com suporte à Coexistência.',
+        icon: Facebook,
+        color: 'bg-blue-500/10 text-blue-500',
+        configKey: 'meta-cloud-api',
+        // Deliberadamente SEM `comingSoon: true`: esse flag do catálogo
+        // impede o card de abrir (só mostra um toast "em breve"). Aqui
+        // queremos o oposto — o card abre e mostra o estado "Em
+        // configuração" explicitamente (ver MetaCloudApiConfig.tsx), com
+        // o botão de conexão desabilitado. A segurança contra ativação
+        // real vem do componente em si (sem SDK, sem token, botão
+        // disabled), não de esconder a tela.
+        keywords: ['meta', 'cloud api', 'oficial', 'embedded signup', 'coexistência', 'whatsapp business platform'],
       },
     ],
   },
