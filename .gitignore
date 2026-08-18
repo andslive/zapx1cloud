@@ -28,3 +28,18 @@ dist-ssr
 supabase/.env
 *.pem
 *.key
+
+# Dados de migração (PII: e-mails, telefones, mapa de user_id)
+data-export/
+data-export.zip
+*_id_map.csv
+
+# Dumps de schema (artefatos de trabalho, não versionar)
+schema_full*.sql
+schema_storage_policies_patch.sql
+
+# Estado local do Supabase CLI
+supabase/.temp/
+
+# Relatórios gerados pela migração
+scripts/migration/reports/
