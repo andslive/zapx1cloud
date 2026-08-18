@@ -1,4 +1,5 @@
 import type { LucideIcon } from 'lucide-react';
+import { META_CLOUD_API_ENABLED } from './metaCloudApiFeatureFlag';
 import {
   Instagram,
   Brain,
@@ -74,7 +75,14 @@ export interface IntegrationCategory {
   items: IntegrationItem[];
 }
 
-export const integrationsCatalog: IntegrationCategory[] = [
+/**
+ * Fase 5E — catálogo bruto (inclui o item Meta incondicionalmente). Nunca
+ * consumir isto diretamente na UI — use `integrationsCatalog` (abaixo),
+ * já filtrado pela feature flag. Mantido exportado só para o filtro puro
+ * poder ser testado com os dois estados da flag sem depender da constante
+ * hardcoded.
+ */
+export const rawIntegrationsCatalog: IntegrationCategory[] = [
   {
     id: 'ai',
     label: 'Inteligência Artificial',
@@ -384,23 +392,24 @@ export const integrationsCatalog: IntegrationCategory[] = [
         keywords: ['uazapi', 'evolution', 'whatsapp', 'api'],
       },
       {
-        // FASE 2A — card desativado (estrutura apenas). Ver relatório
-        // Fase 2A: nenhuma credencial real, número ou organização pode
-        // ser conectada por este card ainda; feature flag desligada por
-        // padrão (global e por organização).
+        // FASE 2A / Fase 5E — fundação técnica pronta, mas a direção
+        // comercial atual é NÃO oferecer Meta Cloud API direta agora
+        // (UazAPI é o provedor produtivo; a segunda opção futura é
+        // HookCloud, não Meta). Por isso este item só entra no catálogo
+        // renderizado quando `META_CLOUD_API_ENABLED === true` — ver
+        // `filterIntegrationsCatalogByMetaFlag` no final deste arquivo.
+        // Com a flag `false` (padrão), o item é removido da fonte antes
+        // de qualquer renderização/busca/filtro — não é `comingSoon`
+        // (que ainda mostraria o card com badge "Em breve"), é ausência
+        // completa. Mantido aqui no catálogo bruto para que, quando a
+        // flag for ligada no futuro, o card volte com a definição
+        // completa já pronta.
         id: 'meta-cloud-api-config',
         name: 'WhatsApp Cloud API (Meta Oficial)',
         description: 'Conecte números pela API oficial da Meta, com suporte à Coexistência.',
         icon: Facebook,
         color: 'bg-blue-500/10 text-blue-500',
         configKey: 'meta-cloud-api',
-        // Deliberadamente SEM `comingSoon: true`: esse flag do catálogo
-        // impede o card de abrir (só mostra um toast "em breve"). Aqui
-        // queremos o oposto — o card abre e mostra o estado "Em
-        // configuração" explicitamente (ver MetaCloudApiConfig.tsx), com
-        // o botão de conexão desabilitado. A segurança contra ativação
-        // real vem do componente em si (sem SDK, sem token, botão
-        // disabled), não de esconder a tela.
         keywords: ['meta', 'cloud api', 'oficial', 'embedded signup', 'coexistência', 'whatsapp business platform'],
       },
     ],
@@ -447,3 +456,40 @@ export const integrationsCatalog: IntegrationCategory[] = [
     ],
   },
 ];
+
+/**
+ * Fase 5E — remove o item Meta Cloud API do catálogo quando a feature
+ * flag está desligada (falha fechada: `metaCloudEnabled` não booleano ou
+ * ausente também oculta o item, nunca o inclui por omissão). Categorias
+ * que ficarem sem nenhum item após a filtragem são removidas também, para
+ * nunca deixar espaço vazio na grade. Função pura — recebe o estado da
+ * flag como parâmetro em vez de ler a constante diretamente, para que os
+ * dois estados sejam testáveis sem depender do valor hardcoded.
+ *
+ * Não duplica uma segunda flag: usa a mesma `META_CLOUD_API_ENABLED` já
+ * existente (importada abaixo, no único ponto de leitura real).
+ */
+export function filterIntegrationsCatalogByMetaFlag(
+  catalog: IntegrationCategory[],
+  metaCloudEnabled: boolean,
+): IntegrationCategory[] {
+  if (metaCloudEnabled === true) return catalog;
+  return catalog
+    .map((cat) => ({
+      ...cat,
+      items: cat.items.filter((item) => item.id !== 'meta-cloud-api-config'),
+    }))
+    .filter((cat) => cat.items.length > 0);
+}
+
+/**
+ * Catálogo pronto para a UI — já filtrado pela feature flag real. Todo
+ * consumidor existente (`IntegrationsManager.tsx`, busca, filtros,
+ * contagens) continua importando `integrationsCatalog` sem nenhuma
+ * mudança de código: o item Meta simplesmente não existe aqui quando a
+ * flag está desligada.
+ */
+export const integrationsCatalog: IntegrationCategory[] = filterIntegrationsCatalogByMetaFlag(
+  rawIntegrationsCatalog,
+  META_CLOUD_API_ENABLED,
+);

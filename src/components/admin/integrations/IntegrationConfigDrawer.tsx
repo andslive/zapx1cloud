@@ -1,5 +1,6 @@
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
 import type { IntegrationItem } from '@/config/integrationsCatalog';
+import { META_CLOUD_API_ENABLED } from '@/config/metaCloudApiFeatureFlag';
 import { ApiKeysManager } from './ApiKeysManager';
 import { WhatsAppConfig } from './WhatsAppConfig';
 import { MetaCloudApiConfig } from './MetaCloudApiConfig';
@@ -35,7 +36,12 @@ export function IntegrationConfigDrawer({ item, open, onOpenChange }: Integratio
       case 'whatsapp':
         return <WhatsAppConfig />;
       case 'meta-cloud-api':
-        return <MetaCloudApiConfig />;
+        // Fase 5E — defesa adicional: o item já é removido do catálogo
+        // renderizado quando a flag está desligada (integrationsCatalog.ts),
+        // então este painel deveria ser inalcançável pela UI normal. Esta
+        // checagem só cobre uma abertura programática direta (ex.: alguém
+        // montando `item`/`open` manualmente fora do fluxo do catálogo).
+        return META_CLOUD_API_ENABLED ? <MetaCloudApiConfig /> : null;
       case 'botconversa':
         return <BotConversaConfig />;
       case 'facebook':
