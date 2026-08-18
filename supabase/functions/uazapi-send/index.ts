@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneBR } from "../_shared/phone.ts";
+import { dispatchMetaCloudSend, type MetaCloudSendType } from "../_shared/meta-cloud-dispatch.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -107,7 +108,28 @@ async function humanLikeSendPipeline(supabase: any, url: string, token: string, 
     return true;
 }
 
-Deno.serve(async (req) => {
+/**
+ * FASE 2B.0.EVOHUB-2 — predicado puro do gate de roteamento multi-provider,
+ * extraído para ser testável isoladamente sem exercitar o handler HTTP
+ * completo (que cria um client Supabase real e depende de env vars de
+ * produção). Mesma regra de retrocompatibilidade de `resolve.ts`:
+ * qualquer valor diferente de exatamente "meta_cloud" (incluindo
+ * ausente/nulo/vazio/desconhecido) permanece no caminho UazAPI existente,
+ * sem alteração de comportamento.
+ */
+export function isMetaCloudConnection(instance: { provider?: string | null } | null | undefined): boolean {
+  return instance?.provider === "meta_cloud";
+}
+
+// FASE 2B.0.EVOHUB-2 — extraído para função nomeada e exportada, com
+// `Deno.serve` movido para trás de `import.meta.main` (mesmo padrão já
+// usado em `meta-cloud-webhook/index.ts` e `meta-cloud-send/index.ts`).
+// Mudança estrutural pura: nenhuma linha do corpo da função foi alterada
+// nesta extração — apenas a fronteira (nome, `export`, e onde termina em
+// `}` em vez de `});`). Sem isso, meramente IMPORTAR este arquivo (como um
+// teste precisa fazer para testar `isMetaCloudConnection`) já abria uma
+// porta de rede real via `Deno.serve` de nível de módulo.
+export async function handleUazapiSendRequest(req: Request): Promise<Response> {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   console.log("UAZAPI_SEND_VERSION", "chat-send-uses-direct-uazapi-v7");
@@ -197,6 +219,33 @@ Deno.serve(async (req) => {
           organization_id: organization_id
         }
       }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    // FASE 2B.0.EVOHUB-2 — gate de roteamento multi-provider. Este é o
+    // chokepoint real de envio do CRM (funis, chat manual, campanhas, cron
+    // de IA, catálogo, agendamento, e os fetches diretos dentro de
+    // uazapi-webhook — todos convergem aqui, direta ou indiretamente via o
+    // proxy `whatsapp-send`). Conexões com `provider='meta_cloud'` são
+    // desviadas para o núcleo de despacho Meta ANTES de qualquer lógica
+    // específica de UazAPI abaixo (nenhuma delas é alcançada para essas
+    // conexões). Conexões `provider='uazapi'` (ou ausente/legado — mesma
+    // regra de retrocompatibilidade de `resolve.ts`) seguem exatamente o
+    // caminho existente, sem nenhuma alteração de comportamento.
+    if (isMetaCloudConnection(instance)) {
+      const result = await dispatchMetaCloudSend(
+        {
+          organizationId: organization_id,
+          connectionId: instance_id!,
+          to,
+          type: type as MetaCloudSendType,
+          payload,
+        },
+        { supabase: supabase as any, env: Deno.env },
+      );
+      return new Response(JSON.stringify(result.body), {
+        status: result.status,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     const { data: platformCfg } = await supabase.from("platform_settings").select("uazapi_url, uazapi_admin_token").maybeSingle();
@@ -466,4 +515,8 @@ Deno.serve(async (req) => {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(handleUazapiSendRequest);
+}

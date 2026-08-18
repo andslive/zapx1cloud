@@ -2,6 +2,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '
 import type { IntegrationItem } from '@/config/integrationsCatalog';
 import { ApiKeysManager } from './ApiKeysManager';
 import { WhatsAppConfig } from './WhatsAppConfig';
+import { MetaCloudApiConfig } from './MetaCloudApiConfig';
 import { BotConversaConfig } from './BotConversaConfig';
 import { FacebookLeadsConfig } from './FacebookLeadsConfig';
 import { EmailConfigManager } from './EmailConfigManager';
@@ -33,6 +34,8 @@ export function IntegrationConfigDrawer({ item, open, onOpenChange }: Integratio
     switch (item.configKey) {
       case 'whatsapp':
         return <WhatsAppConfig />;
+      case 'meta-cloud-api':
+        return <MetaCloudApiConfig />;
       case 'botconversa':
         return <BotConversaConfig />;
       case 'facebook':
