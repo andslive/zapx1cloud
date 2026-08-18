@@ -80,9 +80,31 @@
 
 -- ─── 0. Pré-requisito da FK composta da Correção 3 ───
 
-ALTER TABLE public.evolution_instances
-  ADD CONSTRAINT evolution_instances_id_organization_id_key
-  UNIQUE (id, organization_id);
+-- Idempotente: verificação de reconciliação (Fase 5B/5C) encontrou este
+-- objeto já presente estruturalmente no projeto Supabase Cloud — o schema
+-- deste projeto foi semeado por import direto (schema_full.sql), não por
+-- `supabase db push` migration-a-migração, então o histórico de migrations
+-- não reflete o que já está aplicado. Este bloco evita falha (constraint
+-- already exists) numa reaplicação acidental deste arquivo, sem recriar
+-- nem alterar o objeto se ele já existir com a definição esperada.
+DO $$
+DECLARE
+  v_def text;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO v_def
+  FROM pg_catalog.pg_constraint
+  WHERE conname = 'evolution_instances_id_organization_id_key'
+    AND conrelid = 'public.evolution_instances'::regclass;
+
+  IF v_def IS NULL THEN
+    ALTER TABLE public.evolution_instances
+      ADD CONSTRAINT evolution_instances_id_organization_id_key
+      UNIQUE (id, organization_id);
+  ELSIF v_def <> 'UNIQUE (id, organization_id)' THEN
+    RAISE EXCEPTION 'evolution_instances_id_organization_id_key já existe em public.evolution_instances com definição diferente da esperada (%) — revisar manualmente antes de prosseguir.', v_def;
+  END IF;
+  -- Definição já existente e idêntica à esperada: nada a fazer.
+END $$;
 
 -- ─── 0b. CHECK constraint em evolution_instances.provider (Fase 2A.3, Correção 1) ───
 --
@@ -100,10 +122,30 @@ ALTER TABLE public.evolution_instances
 --     WHERE provider IS NOT NULL AND provider NOT IN ('uazapi', 'meta_cloud');
 --   -- se vazio, então: ALTER TABLE public.evolution_instances
 --   --   VALIDATE CONSTRAINT evolution_instances_provider_known_check;
-ALTER TABLE public.evolution_instances
-  ADD CONSTRAINT evolution_instances_provider_known_check
-  CHECK (provider IS NULL OR provider IN ('uazapi', 'meta_cloud'))
-  NOT VALID;
+-- Idempotente pelo mesmo motivo do bloco acima (achado de reconciliação
+-- Fase 5B/5C: constraint já presente no Cloud). Nunca valida a constraint
+-- automaticamente (permanece NOT VALID como já está em produção) — a
+-- validação retroativa continua sendo um passo manual separado, condicionado
+-- à consulta somente leitura já documentada abaixo.
+DO $$
+DECLARE
+  v_def text;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO v_def
+  FROM pg_catalog.pg_constraint
+  WHERE conname = 'evolution_instances_provider_known_check'
+    AND conrelid = 'public.evolution_instances'::regclass;
+
+  IF v_def IS NULL THEN
+    ALTER TABLE public.evolution_instances
+      ADD CONSTRAINT evolution_instances_provider_known_check
+      CHECK (provider IS NULL OR provider IN ('uazapi', 'meta_cloud'))
+      NOT VALID;
+  ELSIF v_def <> $DEF$CHECK (((provider IS NULL) OR (provider = ANY (ARRAY['uazapi'::text, 'meta_cloud'::text])))) NOT VALID$DEF$ THEN
+    RAISE EXCEPTION 'evolution_instances_provider_known_check já existe em public.evolution_instances com definição diferente da esperada (%) — revisar manualmente antes de prosseguir.', v_def;
+  END IF;
+  -- Definição já existente e idêntica à esperada (inclusive NOT VALID): nada a fazer.
+END $$;
 
 -- ─── 1. Configuração Meta Cloud API por conexão (1:1 com evolution_instances) ───
 
