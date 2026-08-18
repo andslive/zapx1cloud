@@ -1,6 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { aiChat, describeAIError } from "../_shared/ai-call.ts";
+import { openAIChat, describeOpenAIError } from "../_shared/ai-provider/openai.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -44,23 +43,13 @@ serve(async (req) => {
       );
     }
 
-    // Resolve org from auth header for routing
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const supabase = createClient(supabaseUrl, serviceKey);
-    let organizationId: string | null = null;
-    try {
-      const auth = req.headers.get("Authorization");
-      if (auth) {
-        const u = createClient(supabaseUrl, Deno.env.get("SUPABASE_ANON_KEY") ?? Deno.env.get("SUPABASE_PUBLISHABLE_KEY")!,
-          { global: { headers: { Authorization: auth } }, auth: { persistSession: false } });
-        const { data: ud } = await u.auth.getUser();
-        if (ud?.user) {
-          const { data: prof } = await supabase.from("profiles").select("organization_id").eq("id", ud.user.id).maybeSingle();
-          organizationId = prof?.organization_id ?? null;
-        }
-      }
-    } catch (_) {}
+    const openaiApiKey = Deno.env.get("OPENAI_API_KEY");
+    if (!openaiApiKey) {
+      return new Response(
+        JSON.stringify({ error: "OPENAI_API_KEY não configurada na plataforma" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
 
     const systemPrompt = fieldPrompts[field] || `Você é um especialista em vendas B2B.
 Reescreva o conteúdo para ser mais profissional, claro e persuasivo.
@@ -73,39 +62,34 @@ Contexto do produto:
 - ICP: ${productContext.icp || 'Não definido'}
 ` : '';
 
-    const { response, config } = await aiChat({
-      organizationId,
-      capability: 'content_generation',
-      model: 'google/gemini-3-flash-preview',
-      label: 'optimize-product-field',
-      supabase,
-      body: {
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: `${contextInfo}\n\nTexto original para otimizar:\n"${value}"\n\nRetorne APENAS o texto otimizado, sem explicações ou marcadores.` },
-        ],
-        tools: [{
-          type: "function",
-          function: {
-            name: "optimize_text",
-            description: "Return the optimized text with improvements",
-            parameters: {
-              type: "object",
-              properties: {
-                optimized: { type: "string" },
-                improvements: { type: "array", items: { type: "string" } },
-              },
-              required: ["optimized", "improvements"],
-              additionalProperties: false,
+    const response = await openAIChat({
+      apiKey: openaiApiKey,
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `${contextInfo}\n\nTexto original para otimizar:\n"${value}"\n\nRetorne APENAS o texto otimizado, sem explicações ou marcadores.` },
+      ],
+      tools: [{
+        type: "function",
+        function: {
+          name: "optimize_text",
+          description: "Return the optimized text with improvements",
+          parameters: {
+            type: "object",
+            properties: {
+              optimized: { type: "string" },
+              improvements: { type: "array", items: { type: "string" } },
             },
+            required: ["optimized", "improvements"],
+            additionalProperties: false,
           },
-        }],
-        tool_choice: { type: "function", function: { name: "optimize_text" } },
-      },
+        },
+      }],
+      tool_choice: { type: "function", function: { name: "optimize_text" } },
     });
 
     if (!response.ok) {
-      const errMsg = await describeAIError(response, config.provider);
+      const errMsg = await describeOpenAIError(response);
       return new Response(JSON.stringify({ error: errMsg }), {
         status: response.status,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
