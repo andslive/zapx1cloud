@@ -16,6 +16,14 @@ import {
   outboundCountUnchanged,
   resolveOriginalEventTime,
 } from "../_shared/receipt-recovery.ts";
+import {
+  buildTransactionFingerprint,
+  decideReceiptDuplicateGate,
+  extractBankTransactionId,
+  extractTransactionDateTime,
+  type FingerprintClaimResult,
+  hashFingerprint,
+} from "../_shared/receipt-fingerprint.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -7295,6 +7303,115 @@ Mensagem do lead:
                       break;
                     }
 
+                    // [FASE 2 — dedup de comprovante] Gate atômico por
+                    // fingerprint canônica da transação, ANTES de qualquer
+                    // chamada à Meta e antes da checagem acima (Phase 4) —
+                    // que só cobre reenvio no MESMO pixel_block_id.
+                    //
+                    // [FASE 2B] Este NÃO é mais o gate principal — desde a
+                    // Fase 2B, o bloco `ai_receipt` já tenta o mesmo claim
+                    // ANTES de aprovar/avançar (ver `deterministic_dedup_blocked`
+                    // por fingerprint, alguns milhares de linhas acima). Este
+                    // gate aqui vira defesa em profundidade: cobre qualquer
+                    // caminho que alcance o bloco `pixel` sem ter passado
+                    // pelo gate do `ai_receipt` na mesma execução (ex.:
+                    // `pixel` reaproveitado em outro tipo de fluxo, ou uma
+                    // segunda passagem numa mesma requisição). Idempotência:
+                    // se o claim já foi feito no `ai_receipt` (mesma
+                    // execução), o claim_id vem pronto em flowVariables e
+                    // este bloco NÃO tenta reivindicar de novo — evita dupla
+                    // marcação/erro.
+                    const _claimIdFromEarlyGate: string | null =
+                      (flowVariables as any).__receipt_fingerprint_claim_id || null;
+                    let _receiptFingerprintClaimId: string | null = _claimIdFromEarlyGate;
+                    if (eventName === "Purchase" && !_claimIdFromEarlyGate) {
+                      const _fpStrength = (flowVariables as any).__receipt_fingerprint_strength;
+                      const _fp = (flowVariables as any).__receipt_fingerprint_hash;
+                      const _fpOrgId = (conv as any).organization_id || null;
+                      let _claimResult: FingerprintClaimResult | null = null;
+                      let _claimRpcErrorFlag = false;
+                      if (_fpStrength === "strong" && _fp && _fpOrgId) {
+                        const { data: _claimRows, error: _claimErr } = await supabase.rpc(
+                          "claim_receipt_fingerprint",
+                          {
+                            p_organization_id: _fpOrgId,
+                            p_receipt_fingerprint: _fp,
+                            p_fingerprint_version: (flowVariables as any).__receipt_fingerprint_version || 1,
+                            p_lead_id: (conv as any).lead_id || null,
+                            p_conversation_id: conversationId,
+                          },
+                        );
+                        if (_claimErr) {
+                          _claimRpcErrorFlag = true;
+                          // Fail-open deliberado (mesma filosofia do resto
+                          // do bloco ai_receipt): uma falha em checar
+                          // duplicidade não pode travar uma venda legítima.
+                          console.warn("[RECEIPT_FINGERPRINT_CLAIM_RPC_FAILED]", String(_claimErr.message || _claimErr));
+                        } else {
+                          _claimResult = (Array.isArray(_claimRows) ? _claimRows[0] : _claimRows) || null;
+                        }
+                      } else if (_fpStrength === "strong" && _fp && !_fpOrgId) {
+                        console.warn("[RECEIPT_FINGERPRINT_GATE_SKIPPED_NO_ORG]", {
+                          conversation_id: conversationId, block_id: b.id,
+                        });
+                      } else if (_fpStrength === "weak") {
+                        console.log("[RECEIPT_FINGERPRINT_WEAK_NOT_AUTOBLOCKING]", {
+                          conversation_id: conversationId, block_id: b.id,
+                        });
+                      }
+
+                      // [FASE 2B] Mesma função de decisão do gate antecipado
+                      // do ai_receipt — nenhuma lógica divergente.
+                      const _gateDecision = decideReceiptDuplicateGate({
+                        fingerprintStrength: _fpStrength,
+                        fingerprintHash: _fp,
+                        organizationId: _fpOrgId,
+                        alreadyClaimedId: null, // já tratado acima via _claimIdFromEarlyGate
+                        claimRpcError: _claimRpcErrorFlag,
+                        claimResult: _claimResult,
+                      });
+
+                      if (_gateDecision.action === "block") {
+                        console.log("[RECEIPT_FINGERPRINT_DUPLICATE_BLOCKED]", JSON.stringify({
+                          conversation_id: conversationId,
+                          block_id: b.id,
+                          existing_purchase_audit_id: _gateDecision.existingPurchaseAuditId,
+                        }));
+                        await supabase.from("purchase_audit").insert({
+                          conversation_id: conversationId,
+                          lead_id: (conv as any).lead_id,
+                          organization_id: _fpOrgId,
+                          pixel_block_id: b.id,
+                          event_name: eventName,
+                          purchase_status: "duplicate",
+                          purchase_source: "webhook",
+                          receipt_fingerprint: _fp,
+                          transaction_fingerprint: (flowVariables as any).__receipt_fingerprint || null,
+                          fingerprint_strength: _fpStrength,
+                          fingerprint_version: (flowVariables as any).__receipt_fingerprint_version || 1,
+                          bank_transaction_id: (flowVariables as any).__receipt_bank_transaction_id || null,
+                          duplicate_of_purchase_audit_id: _gateDecision.existingPurchaseAuditId,
+                          duplicate_reason: "same_receipt_fingerprint",
+                        });
+                        // Não avança como pagamento novo, não soma no
+                        // dashboard, não envia Purchase à Meta — mesmo
+                        // padrão de continuidade já usado pela Phase 4
+                        // acima (reaproveitado, não é mensagem nova). Na
+                        // prática, hoje isto é inalcançável para o caso do
+                        // incidente real: o gate do ai_receipt (que roda
+                        // antes) já bloqueia e nem deixa a execução chegar
+                        // aqui. Este branch cobre o cenário residual de o
+                        // bloco `pixel` ser alcançado sem ter passado pelo
+                        // gate do ai_receipt na mesma execução.
+                        nextBlockId = b.next_block_id || null;
+                        currentBlock = findBlock(nextBlockId);
+                        break;
+                      }
+                      if (_gateDecision.action === "proceed" && _gateDecision.claimId) {
+                        _receiptFingerprintClaimId = _gateDecision.claimId;
+                      }
+                    }
+
                     // 2. Find integration
                     let query = supabase.from("facebook_lead_integrations").select("pixel_id, pixel_access_token, page_id").eq("is_active", true);
                     if (pageId) {
@@ -7494,7 +7611,7 @@ Mensagem do lead:
                       const _eventOccurredAtIso = recoveryCtx
                         ? new Date((recoveryEventTimeSeconds || 0) * 1000).toISOString()
                         : new Date().toISOString();
-                      const { error: _recordErr } = await supabase.rpc("record_purchase_result", {
+                      const { data: _recordRow, error: _recordErr } = await supabase.rpc("record_purchase_result", {
                         p_conversation_id: conversationId,
                         p_lead_id: external_id,
                         p_pixel_block_id: b.id,
@@ -7530,12 +7647,41 @@ Mensagem do lead:
                             recovered_from_openai_credit_incident: true,
                           }
                           : null,
+                        // [FASE 2 — dedup de comprovante] persistidos na
+                        // linha canônica só para auditoria/consulta — a
+                        // decisão de duplicidade já aconteceu ANTES, no gate
+                        // claim_receipt_fingerprint (acima, antes do envio à
+                        // Meta). Ausentes quando não houve fingerprint forte
+                        // (comportamento idêntico ao anterior).
+                        p_organization_id: (conv as any).organization_id || null,
+                        p_bank_transaction_id: (flowVariables as any).__receipt_bank_transaction_id || null,
+                        p_transaction_fingerprint: (flowVariables as any).__receipt_fingerprint || null,
+                        p_receipt_fingerprint: (flowVariables as any).__receipt_fingerprint_hash || null,
+                        p_fingerprint_version: (flowVariables as any).__receipt_fingerprint_version || null,
+                        p_fingerprint_strength: (flowVariables as any).__receipt_fingerprint_strength || null,
+                        p_receipt_transaction_at: (flowVariables as any).__receipt_transaction_at || null,
                       });
                       if (_recordErr) {
                         console.error("[RECORD_PURCHASE_RESULT_FAILED]", JSON.stringify({
                           conversation_id: conversationId,
                           error: _recordErr.message,
                         }));
+                      } else if (_receiptFingerprintClaimId) {
+                        // Vincula o claim (já garantidamente único) ao id
+                        // canônico recém-criado, para que uma duplicata
+                        // futura encontre existing_purchase_audit_id
+                        // preenchido em vez de NULL.
+                        const _createdId = Array.isArray(_recordRow) ? _recordRow[0]?.id : (_recordRow as any)?.id;
+                        if (_createdId) {
+                          try {
+                            await supabase.rpc("link_receipt_fingerprint_claim", {
+                              p_claim_id: _receiptFingerprintClaimId,
+                              p_purchase_audit_id: _createdId,
+                            });
+                          } catch (_linkErr) {
+                            console.warn("[RECEIPT_FINGERPRINT_CLAIM_LINK_FAILED]", String(_linkErr));
+                          }
+                        }
                       }
                       if (recoveryCtx && (payload as any).__recovery_checkpoint) {
                         await (payload as any).__recovery_checkpoint(
@@ -8773,6 +8919,17 @@ Mensagem do lead:
                         route: "stay", decision: "ignored_short_ack_over_ocr",
                         metadata: { cur_text: _curText.slice(0, 80) },
                       });
+                      // [FIX FASE 2] Mesmo raciocínio do dedup_blocked acima:
+                      // esta mensagem trouxe mídia própria (já tratada
+                      // sincronamente aqui), então o buffer salvo no
+                      // ingest (~linha 5755) para ELA não deve sobreviver
+                      // para ser reaproveitado por uma mensagem futura sem
+                      // mídia.
+                      try {
+                        if ((flowVariables as any).__pending_receipt_media) {
+                          delete (flowVariables as any).__pending_receipt_media;
+                        }
+                      } catch (_) { /* noop */ }
                       // Segue para o fluxo IA normal abaixo (não força break).
                     } else {
                       // [FASE 27] Releitura de valor alto ANTES de aceitar:
@@ -8827,6 +8984,20 @@ Mensagem do lead:
                             route: "none", decision: "deterministic_dedup_blocked",
                             metadata: { ocr_hash: _ocrHash },
                           });
+                          // [FIX FASE 2 — vazamento de __pending_receipt_media]
+                          // Sem isto, o OCR deste comprovante (já corretamente
+                          // bloqueado aqui) ficava disponível para replay
+                          // (linha ~8212-8259) na PRÓXIMA mensagem qualquer —
+                          // inclusive texto puro sem mídia nova — reabrindo a
+                          // extração determinística com um hash de dedup
+                          // diferente (a mensagem seguinte muda o texto
+                          // concatenado) e criando uma segunda venda. Caso
+                          // real: lead cb525181-…, chip19, 06/08/2026 09:18.
+                          try {
+                            if ((flowVariables as any).__pending_receipt_media) {
+                              delete (flowVariables as any).__pending_receipt_media;
+                            }
+                          } catch (_) { /* noop */ }
                           // Não chama IA, não avança, fica no bloco.
                           nextBlockId = b.id;
                           currentBlock = null;
@@ -8842,6 +9013,205 @@ Mensagem do lead:
                         flowVariables[_valueVar] = _finalValue;
                         (flowVariables as any).comprovante_identified = true;
                         flowVariables["ai.response"] = "";
+
+                        // [FASE 2 — dedup de comprovante] Identidade canônica
+                        // da transação, calculada a partir dos MESMOS campos
+                        // já extraídos acima (não do texto bruto concatenado
+                        // usado pela dedup de curto prazo acima, que é o que
+                        // permitia burlar reenvios com legenda/texto
+                        // diferente). Propagada via flowVariables — mesmo
+                        // mecanismo já usado para nomecomprovante/valorcomprovante
+                        // — até o bloco `pixel`, onde é a base do gate
+                        // atômico antes do envio à Meta.
+                        try {
+                          const _bankTxId = extractBankTransactionId(_ocrText);
+                          const _txAt = extractTransactionDateTime(_ocrText);
+                          const _fp = buildTransactionFingerprint({
+                            bankTransactionId: _bankTxId,
+                            amount: _detValFinal,
+                            payerName: _detName,
+                            transactionAt: _txAt,
+                          });
+                          (flowVariables as any).__receipt_fingerprint = _fp.fingerprint;
+                          (flowVariables as any).__receipt_fingerprint_hash = await hashFingerprint(_fp.fingerprint);
+                          (flowVariables as any).__receipt_fingerprint_strength = _fp.strength;
+                          (flowVariables as any).__receipt_fingerprint_version = _fp.version;
+                          (flowVariables as any).__receipt_bank_transaction_id = _bankTxId;
+                          (flowVariables as any).__receipt_transaction_at = _txAt;
+                          await _auditReceipt({
+                            source: "deterministic", identified: true, name: _detName, value: _finalValue,
+                            route: "info", decision: "receipt_fingerprint_computed",
+                            metadata: {
+                              fingerprint_strength: _fp.strength,
+                              fingerprint_version: _fp.version,
+                              has_bank_transaction_id: !!_bankTxId,
+                              has_transaction_at: !!_txAt,
+                            },
+                          });
+                          if (_fp.strength === "weak") {
+                            console.log("[AI_RECEIPT_FINGERPRINT_WEAK_NOT_AUTOBLOCKING]", {
+                              conversation_id: conversationId,
+                              block_id: b.id,
+                            });
+                          }
+                        } catch (_fpErr) {
+                          // Fail-open deliberado: falha ao calcular a
+                          // fingerprint não pode travar uma venda legítima —
+                          // o bloco `pixel` trata fingerprint ausente como
+                          // "sem gate novo", comportamento idêntico ao atual.
+                          console.warn("[AI_RECEIPT_FINGERPRINT_COMPUTE_FAILED]", String(_fpErr));
+                        }
+
+                        // [FASE 2B — gate antecipado] Decisão de duplicidade
+                        // ANTES de qualquer efeito de aprovação: antes de
+                        // avançar nextBlockId, antes de persistir o avanço,
+                        // antes de qualquer bloco de upsell/entrega de
+                        // conteúdo ser alcançado. Reusa a MESMA fingerprint
+                        // calculada acima e a MESMA RPC atômica usada como
+                        // defesa em profundidade no bloco `pixel` — não é
+                        // uma segunda lógica de dedup.
+                        // Fail-open: erro na RPC NUNCA é interpretado como
+                        // duplicidade (só bloqueia em claimed === false,
+                        // resposta explícita e bem-sucedida da RPC).
+                        const _fpStrengthEarly = (flowVariables as any).__receipt_fingerprint_strength;
+                        const _fpHashEarly = (flowVariables as any).__receipt_fingerprint_hash;
+                        const _fpOrgIdEarly = (conv as any).organization_id || null;
+                        let _claimResultEarly: FingerprintClaimResult | null = null;
+                        let _claimRpcErrorEarly = false;
+                        if (_fpStrengthEarly === "strong" && _fpHashEarly && _fpOrgIdEarly) {
+                          try {
+                            const { data: _claimRowsEarly, error: _claimErrEarly } = await supabase.rpc(
+                              "claim_receipt_fingerprint",
+                              {
+                                p_organization_id: _fpOrgIdEarly,
+                                p_receipt_fingerprint: _fpHashEarly,
+                                p_fingerprint_version: (flowVariables as any).__receipt_fingerprint_version || 1,
+                                p_lead_id: (conv as any).lead_id || null,
+                                p_conversation_id: conversationId,
+                              },
+                            );
+                            if (_claimErrEarly) {
+                              _claimRpcErrorEarly = true;
+                              console.warn("[AI_RECEIPT_FINGERPRINT_CLAIM_RPC_FAILED]", String(_claimErrEarly.message || _claimErrEarly));
+                            } else {
+                              _claimResultEarly = (Array.isArray(_claimRowsEarly) ? _claimRowsEarly[0] : _claimRowsEarly) || null;
+                            }
+                          } catch (_gateErrEarly) {
+                            _claimRpcErrorEarly = true;
+                            console.warn("[AI_RECEIPT_FINGERPRINT_GATE_EXCEPTION]", String(_gateErrEarly));
+                          }
+                        } else if (_fpStrengthEarly === "strong" && _fpHashEarly && !_fpOrgIdEarly) {
+                          console.warn("[AI_RECEIPT_FINGERPRINT_GATE_SKIPPED_NO_ORG]", {
+                            conversation_id: conversationId, block_id: b.id,
+                          });
+                        }
+
+                        // [FASE 2B] Decisão delegada à função pura
+                        // compartilhada com o gate do bloco `pixel` — ver
+                        // supabase/functions/_shared/receipt-fingerprint.ts.
+                        // Nenhuma lógica de bloqueio duplicada aqui.
+                        const _gateDecisionEarly = decideReceiptDuplicateGate({
+                          fingerprintStrength: _fpStrengthEarly,
+                          fingerprintHash: _fpHashEarly,
+                          organizationId: _fpOrgIdEarly,
+                          alreadyClaimedId: null, // este É o primeiro ponto de claim na execução
+                          claimRpcError: _claimRpcErrorEarly,
+                          claimResult: _claimResultEarly,
+                        });
+
+                        if (_gateDecisionEarly.action === "proceed" && _gateDecisionEarly.claimId) {
+                          // Propagado para o bloco `pixel`: evita um segundo
+                          // claim (idempotência) quando ele for alcançado
+                          // nesta mesma execução.
+                          (flowVariables as any).__receipt_fingerprint_claim_id = _gateDecisionEarly.claimId;
+                        }
+
+                        if (_gateDecisionEarly.action === "block") {
+                          console.log("[AI_RECEIPT_FINGERPRINT_DEDUP_BLOCKED_EARLY]", JSON.stringify({
+                            conversation_id: conversationId,
+                            block_id: b.id,
+                            existing_purchase_audit_id: _gateDecisionEarly.existingPurchaseAuditId,
+                          }));
+                          await _auditReceipt({
+                            source: "deterministic", identified: true, name: _detName, value: _finalValue,
+                            route: "none", decision: "deterministic_dedup_blocked",
+                            metadata: {
+                              reason: _gateDecisionEarly.reason,
+                              existing_purchase_audit_id: _gateDecisionEarly.existingPurchaseAuditId,
+                              fingerprint_strength: _fpStrengthEarly,
+                              fingerprint_hash: _fpHashEarly,
+                            },
+                          });
+
+                          // Desfaz, em memória, os campos de "aprovação" já
+                          // setados acima (ainda não persistidos) — nenhum
+                          // bloco de upsell/entrega vai enxergar
+                          // comprovante_identified=true nem os valores
+                          // deste comprovante repetido.
+                          delete flowVariables[_nameVar];
+                          delete flowVariables[_valueVar];
+                          delete (flowVariables as any).comprovante_identified;
+                          delete (flowVariables as any).__receipt_fingerprint_claim_id;
+
+                          // Mesmo fix do branch de dedup por hash acima:
+                          // buffer de mídia pendente não pode sobreviver
+                          // para ser reaproveitado por uma mensagem futura.
+                          try {
+                            if ((flowVariables as any).__pending_receipt_media) {
+                              delete (flowVariables as any).__pending_receipt_media;
+                            }
+                          } catch (_) { /* noop */ }
+
+                          if (!Array.isArray(flowVariables["__consumed_input_message_ids"])) {
+                            flowVariables["__consumed_input_message_ids"] = [];
+                          }
+                          if ((norm as any)?.messageId && !flowVariables["__consumed_input_message_ids"].includes((norm as any).messageId)) {
+                            flowVariables["__consumed_input_message_ids"].push((norm as any).messageId);
+                          }
+
+                          // Resposta neutra e curta — reaproveitando o
+                          // padrão de "1 mensagem fixa por janela" já usado
+                          // em COMPROVANTE_UNSUPPORTED_MEDIA_IGNORED acima.
+                          // Não existia mensagem própria para comprovante
+                          // repetido nesta base; esta é nova, sem promessa
+                          // comercial, só informativa.
+                          const _dupMsgKey = `receipt_fingerprint_duplicate::${conversationId}::${(flowVariables as any).__receipt_fingerprint_hash}`;
+                          let _dupMsgAlready = false;
+                          try {
+                            _dupMsgAlready = await isDuplicateResponse(supabase, conversationId as string, _dupMsgKey, 600_000);
+                          } catch (_) { _dupMsgAlready = false; }
+                          if (!_dupMsgAlready) {
+                            chunksToSend.push({
+                              type: "text",
+                              payload: {
+                                text: "Esse comprovante já foi utilizado aqui. Se você já fez um novo pagamento, me manda o comprovante dele, por favor 🙏",
+                              },
+                              source_block_id: b.id,
+                              delay: pendingDelayMs,
+                            });
+                            pendingDelayMs = 0;
+                            try { await recordSentResponse(supabase, conversationId as string, _dupMsgKey); } catch (_) { /* best-effort */ }
+                          }
+
+                          try {
+                            await supabase.from("webchat_conversations").update({
+                              flow_variables: flowVariables,
+                              current_block_id: b.id,
+                              flow_completed: false,
+                            }).eq("id", conversationId);
+                          } catch (_persistErrDup) {
+                            console.warn("[AI_RECEIPT_FINGERPRINT_DEDUP_PERSIST_FAILED]", String(_persistErrDup));
+                          }
+
+                          // Permanece no bloco: não avança, não aprova
+                          // upsell, não entrega conteúdo pago, não registra
+                          // venda, não chama a Meta. Lead pode enviar um
+                          // comprovante realmente novo a qualquer momento.
+                          nextBlockId = b.id;
+                          currentBlock = null;
+                          safety = 1000;
+                          break;
+                        }
 
                         if (!Array.isArray(flowVariables["__consumed_input_message_ids"])) {
                           flowVariables["__consumed_input_message_ids"] = [];
