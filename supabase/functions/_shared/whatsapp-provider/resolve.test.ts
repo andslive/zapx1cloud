@@ -80,3 +80,10 @@ Deno.test("organizationId ausente é recusado antes de qualquer consulta", async
   if (!isWhatsAppProviderError(err)) throw new Error("esperava WhatsAppProviderError");
   assertEquals(err.code, "ORG_MISMATCH");
 });
+
+Deno.test("connectionId ausente (string vazia) é recusado antes de qualquer consulta, com CONNECTION_NOT_FOUND", async () => {
+  const supabase = fakeSupabase([{ id: "conn-1", organization_id: "org-a", provider: "uazapi" }]);
+  const err = await assertRejects(() => resolveConnectionProvider(supabase, "", "org-a"));
+  if (!isWhatsAppProviderError(err)) throw new Error("esperava WhatsAppProviderError");
+  assertEquals(err.code, "CONNECTION_NOT_FOUND");
+});
