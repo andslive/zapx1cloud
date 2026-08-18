@@ -1,20 +1,114 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { resolveAIProvider } from "../_shared/ai-credentials.ts";
+import {
+  REF_FIELDS_DATA,
+  sanitizeFileName,
+  sha256Hex,
+  genBlockId,
+  extractMedia,
+  cloneTemplateBlocks,
+  computeTopologicalRoot,
+  selectEligibleLeadMessages,
+  type MediaKind,
+  type ExtractedMedia,
+} from "../_shared/clone-funnel-core.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-function sanitizeFileName(name: string): string {
-  if (!name) return `file-${Date.now()}`;
-  return name
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // Remove accents
-    .replace(/[^a-zA-Z0-9.-]/g, "_") // Keep only safe chars
-    .replace(/\.\.+/g, ".") // No double dots
-    .replace(/^_+|_+$/g, ""); // No leading/trailing underscores
+// ---------------------------------------------------------------------------
+// "Clonar Funil" (Atendimentos) — DETERMINISTIC reimplementation.
+//
+// novo funil = sequência inbound do lead (100% determinística, sem IA)
+//              + cópia profunda e independente do funil "Funil (Modelo)"
+//
+// Nenhuma IA participa da geração/organização da primeira parte. As
+// mensagens do lead viram blocos 1:1, na ordem exata em que o Chat de
+// Atendimentos as exibe, e são ligadas linearmente (next_block_id) até o
+// start_block_id clonado do Funil (Modelo).
+//
+// Lógica pura/testável (clone do modelo, extração de mídia, hashing) vive em
+// ../_shared/clone-funnel-core.ts — ver clone-funnel-core.test.ts.
+// ---------------------------------------------------------------------------
+
+// Defaults neutros já usados pelo sistema para blocos criados manualmente no
+// editor (src/types/funnel.ts::createDefaultBlock) — não são deduzidos do
+// intervalo real entre as mensagens da conversa nem escolhidos por IA.
+const BLOCK_DEFAULTS: Record<string, Record<string, unknown>> = {
+  message: { delay_ms: 5000, show_typing: true, typing_duration_ms: 5000 },
+  image: { delay_ms: 5000, show_typing: true },
+  audio: { delay_ms: 5000, show_typing: true, typing_duration_ms: 5000, ptt: true },
+  video: { delay_ms: 5000, show_typing: true, video_type: 'file' },
+  document: { delay_ms: 5000, show_typing: true },
+};
+
+const DEFAULT_BLOCK_CHANNELS = ['chat', 'form', 'widget', 'whatsapp'];
+
+// Tipos/extensões/tamanho aceitos ao materializar mídia inbound em
+// Storage permanente. Rejeita disfarces (ex.: .exe renomeado para .jpg) e
+// path traversal (nome sempre passa por sanitizeFileName).
+const MIME_ALLOW_PREFIX: Record<MediaKind, string[]> = {
+  image: ['image/'],
+  audio: ['audio/'],
+  video: ['video/'],
+  document: ['application/pdf', 'application/msword', 'application/vnd.', 'text/plain', 'image/'],
+};
+const MAX_MEDIA_BYTES = 60 * 1024 * 1024; // 60MB, bem acima do que WhatsApp permite
+
+interface ManifestItem {
+  message_id: string;
+  provider_message_id: string | null;
+  position: number;
+  timestamp_used: string;
+  kind: MediaKind | 'text';
+  block_id: string;
+  extra_block_id?: string; // legenda de áudio, quando aplicável
+}
+
+interface ResolvedMediaAsset {
+  manifestIndex: number;
+  kind: MediaKind;
+  bytes: Uint8Array;
+  mime: string;
+  extension: string;
+  originalFileName: string | null;
+  caption: string | null;
+  hash: string;
+}
+
+async function fetchAndValidateMedia(media: ExtractedMedia, messageId: string): Promise<ResolvedMediaAsset> {
+  const response = await fetch(media.url);
+  if (!response.ok) {
+    throw new Error(`Falha ao baixar mídia da mensagem ${messageId}: HTTP ${response.status}`);
+  }
+  const buf = new Uint8Array(await response.arrayBuffer());
+  if (buf.length === 0) throw new Error(`Mídia da mensagem ${messageId} veio vazia.`);
+  if (buf.length > MAX_MEDIA_BYTES) {
+    throw new Error(`Mídia da mensagem ${messageId} excede o limite de ${MAX_MEDIA_BYTES} bytes.`);
+  }
+
+  const mime = (response.headers.get('content-type') || media.mime || '').split(';')[0].trim().toLowerCase();
+  const allowedPrefixes = MIME_ALLOW_PREFIX[media.kind];
+  const mimeOk = mime && allowedPrefixes.some((p) => mime.startsWith(p));
+  if (!mimeOk) {
+    throw new Error(`Mídia da mensagem ${messageId} tem MIME type incompatível com '${media.kind}': ${mime || '(vazio)'}`);
+  }
+
+  const hash = await sha256Hex(buf);
+  const extension = mime.split('/')[1]?.split('+')[0] || 'bin';
+
+  return {
+    manifestIndex: -1,
+    kind: media.kind,
+    bytes: buf,
+    mime,
+    extension,
+    originalFileName: media.filename,
+    caption: media.caption,
+    hash,
+  };
 }
 
 serve(async (req) => {
@@ -22,33 +116,54 @@ serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  // Paths de Storage criados NESTA execução — usados para compensação caso
+  // uma etapa posterior falhe antes da persistência do funil.
+  const uploadedPaths: string[] = [];
+
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
+    // 1-2. Autenticação/organização
     const { conversation_id, organization_id, user_id } = await req.json();
 
-    if (!conversation_id) {
+    if (!conversation_id || typeof conversation_id !== 'string') {
       throw new Error('conversation_id is required');
     }
+    if (!organization_id || typeof organization_id !== 'string') {
+      throw new Error('organization_id is required');
+    }
 
-    // 1. Fetch conversation and lead
+    const { data: orgRow, error: orgError } = await supabase
+      .from('organizations')
+      .select('id, settings')
+      .eq('id', organization_id)
+      .single();
+    if (orgError || !orgRow) {
+      throw new Error('Organização não encontrada');
+    }
+
+    const templateFunnelId = orgRow.settings?.clone_funnel_template_id;
+    if (!templateFunnelId || typeof templateFunnelId !== 'string') {
+      throw new Error('Nenhum funil-modelo configurado para esta organização (organizations.settings.clone_funnel_template_id). Configure antes de usar "Clonar Funil".');
+    }
+
+    // 3. Conversa — busca EXATAMENTE pelo ID recebido, sem ampliar por
+    // telefone/lead/instância/organização.
     const { data: conversation, error: convError } = await supabase
       .from('webchat_conversations')
       .select('*, leads(*)')
       .eq('id', conversation_id)
+      .eq('organization_id', organization_id)
       .single();
-
     if (convError || !conversation) {
-      throw new Error('Conversation not found');
+      throw new Error('Conversa não encontrada ou não pertence a esta organização.');
     }
 
     const lead = conversation.leads;
     const leadName = lead?.name || conversation.visitor_name || 'Visitante';
     let productId = lead?.product_id;
-
-    // 2. Fetch first product if missing
     if (!productId) {
       const { data: firstProduct } = await supabase
         .from('products')
@@ -57,233 +172,294 @@ serve(async (req) => {
         .order('created_at', { ascending: true })
         .limit(1)
         .single();
-      
       productId = firstProduct?.id;
     }
-
     if (!productId) {
-      throw new Error('No product found for this organization');
+      throw new Error('Nenhum produto encontrado para esta organização.');
     }
 
-    // 3. Fetch inbound messages
-    const { data: messages, error: msgError } = await supabase
+    // 4-6. Mensagens: MESMA fonte e MESMO critério de ordenação usados pelo
+    // Chat de Atendimentos (supabase/functions/webchat-inbox/index.ts):
+    // .eq('conversation_id', id).order('created_at', { ascending: true }).
+    // Adicionamos `id` como desempate estável (a tela não tem desempate
+    // explícito; para nossa própria reprodutibilidade usamos `id` como
+    // segundo critério — isso nunca diverge da ordem exibida, exceto no
+    // caso extremamente raro de duas mensagens com created_at idêntico até
+    // o microssegundo, caso em que a tela também não garante uma ordem
+    // estável).
+    const { data: allMessages, error: msgError } = await supabase
       .from('webchat_messages')
-      .select('*')
+      .select('id, conversation_id, direction, sender_type, content, metadata, is_deleted, created_at')
       .eq('conversation_id', conversation_id)
-      .eq('direction', 'inbound')
-      .order('created_at', { ascending: true });
-
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true });
     if (msgError) {
-      throw new Error('Failed to fetch messages');
+      throw new Error(`Falha ao buscar mensagens: ${msgError.message}`);
     }
 
-    // Helper to upload media
-    const uploadMedia = async (url: string, kind: string, fileName?: string) => {
-      try {
-        if (url.includes('.supabase.co/storage/v1/object/public/')) {
-          if (url.includes('/funnel-assets/')) return url;
+    // Fase 4B — extraído para selectEligibleLeadMessages() (clone-funnel-core.ts),
+    // mesma lógica exata, agora testável sem client Supabase/rede. Autoria/
+    // direção ambígua (registros legados divergentes): não incluir
+    // silenciosamente, apenas registrar para o relatório.
+    const { eligible, ambiguous } = selectEligibleLeadMessages(allMessages || []);
+    if (ambiguous.length > 0) {
+      console.warn(`[clone-funnel] ${ambiguous.length} mensagem(ns) com direção/autoria ambígua na conversa ${conversation_id} — excluídas por segurança.`);
+    }
+
+    if (eligible.length === 0) {
+      throw new Error('A conversa selecionada não possui nenhuma mensagem inbound elegível do lead. Nenhum funil foi criado.');
+    }
+
+    // 7. Manifesto determinístico (em memória)
+    const manifest: ManifestItem[] = [];
+    const mediaToResolve: { index: number; media: ExtractedMedia; messageId: string }[] = [];
+    const textItems: { index: number; content: string }[] = [];
+
+    eligible.forEach((msg: any, i: number) => {
+      const media = extractMedia(msg); // lança erro (fail-closed) se mídia mal-formada
+      if (media) {
+        mediaToResolve.push({ index: i, media, messageId: msg.id });
+      } else {
+        textItems.push({ index: i, content: msg.content ?? '' });
+      }
+    });
+
+    // 8. Localizar e validar TODAS as mídias antes de qualquer persistência.
+    const resolvedAssets = new Map<number, ResolvedMediaAsset>();
+    for (const item of mediaToResolve) {
+      const asset = await fetchAndValidateMedia(item.media, item.messageId);
+      asset.manifestIndex = item.index;
+      resolvedAssets.set(item.index, asset);
+    }
+
+    // 9. Validar o funil-modelo configurado.
+    const { data: templateFunnel, error: templateError } = await supabase
+      .from('capture_funnels')
+      .select('id, name, organization_id, start_block_id, flow_blocks')
+      .eq('id', templateFunnelId)
+      .eq('organization_id', organization_id)
+      .single();
+    if (templateError || !templateFunnel) {
+      throw new Error('Funil-modelo configurado não foi encontrado ou não pertence a esta organização.');
+    }
+    if (!Array.isArray(templateFunnel.flow_blocks) || templateFunnel.flow_blocks.length === 0) {
+      throw new Error('Funil-modelo configurado está sem blocos válidos.');
+    }
+
+    // 10. Clonar o modelo em memória (IDs novos, sem executar nada dele).
+    //
+    // A entrada usada é a RAIZ TOPOLÓGICA REAL do grafo (o único bloco que
+    // nenhum outro referencia) — não o `start_block_id` gravado no registro.
+    // Auditoria de 2026-08-08 confirmou que, no "Funil (Modelo)", o
+    // start_block_id configurado pulava a pergunta inicial ("Consegue abrir
+    // os rótulos? 🥰") e o wait_response que preenche a variável `resposta`,
+    // entrando direto no bloco de condição que testa essa variável — que
+    // ficaria sempre vazia. computeTopologicalRoot() falha fechado se o
+    // funil-modelo não tiver exatamente uma raiz (nunca escolhe por
+    // aproximação).
+    const modelEntryBlockId = computeTopologicalRoot(templateFunnel.flow_blocks as any[]);
+    const { blocks: modelBlocks, start_block_id: modelStartBlockId } = cloneTemplateBlocks(
+      templateFunnel.flow_blocks as any[],
+      modelEntryBlockId
+    );
+
+    // 11-12. Construir a sequência linear do lead e ligar ao modelo.
+    // Idempotência: fingerprint determinístico (conversa + modelo + IDs das
+    // mensagens incluídas) vira o slug do funil. Duas chamadas equivalentes
+    // (clique duplo, retry) colidem no índice único (organization_id, slug)
+    // já existente na tabela e a segunda apenas retorna o funil já criado —
+    // sem depender de migration nova.
+    const fingerprintInput = JSON.stringify({
+      conversation_id,
+      template_funnel_id: templateFunnelId,
+      message_ids: eligible.map((m: any) => m.id),
+    });
+    const fingerprint = await sha256Hex(fingerprintInput);
+    const slug = `clone-${conversation_id.slice(0, 8)}-${fingerprint.slice(0, 12)}`;
+
+    const { data: existingFunnel } = await supabase
+      .from('capture_funnels')
+      .select('id')
+      .eq('organization_id', organization_id)
+      .eq('slug', slug)
+      .maybeSingle();
+    if (existingFunnel) {
+      return new Response(
+        JSON.stringify({ success: true, funnel_id: existingFunnel.id, idempotent: true }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const leadBlocks: any[] = [];
+    let leadBlockCursor = 0;
+
+    for (let i = 0; i < eligible.length; i++) {
+      const msg = eligible[i];
+      const asset = resolvedAssets.get(i);
+
+      if (asset) {
+        const blockId = genBlockId();
+        const data: any = {
+          ...BLOCK_DEFAULTS[asset.kind],
+          channels: DEFAULT_BLOCK_CHANNELS,
+        };
+
+        if (asset.kind === 'image') {
+          data.image_url = '__PENDING_UPLOAD__';
+          data.image_alt = asset.originalFileName || '';
+          if (asset.caption) data.content = asset.caption;
+        } else if (asset.kind === 'video') {
+          data.video_url = '__PENDING_UPLOAD__';
+          if (asset.caption) data.content = asset.caption;
+        } else if (asset.kind === 'document') {
+          data.document_url = '__PENDING_UPLOAD__';
+          data.file_name = asset.originalFileName || `documento.${asset.extension}`;
+          if (asset.caption) data.content = asset.caption;
+        } else if (asset.kind === 'audio') {
+          data.audio_url = '__PENDING_UPLOAD__';
+          // 'audio' não tem campo de legenda no schema — legenda vira um
+          // bloco de texto separado, logo depois, sem alterar o conteúdo.
         }
 
-        const response = await fetch(url);
-        if (!response.ok) {
-          console.error(`Failed to fetch media from ${url}: ${response.status}`);
-          return null;
-        }
-        
-        const blob = await response.blob();
-        const extension = blob.type.split('/')[1]?.split(';')[0] || 'bin';
-        const safeKind = kind.toLowerCase().replace(/[^a-z]/g, 'document');
-        const safeFileName = sanitizeFileName(fileName || `file-${Date.now()}.${extension}`);
-        const path = `${safeKind}/${Date.now()}-${safeFileName}`;
+        const block = { id: blockId, type: asset.kind, position: { x: 0, y: 0 }, data, next_block_id: null };
+        leadBlocks.push(block);
+        (asset as any).__blockId = blockId;
+        leadBlockCursor++;
 
-        const { data, error } = await supabase.storage
-          .from('funnel-assets')
-          .upload(path, blob, {
-            contentType: blob.type,
-            upsert: true
+        const manifestItem: ManifestItem = {
+          message_id: msg.id,
+          provider_message_id: msg.metadata?.evolution_message_id || null,
+          position: i,
+          timestamp_used: msg.created_at,
+          kind: asset.kind,
+          block_id: blockId,
+        };
+
+        if (asset.kind === 'audio' && asset.caption) {
+          const captionBlockId = genBlockId();
+          leadBlocks.push({
+            id: captionBlockId,
+            type: 'message',
+            position: { x: 0, y: 0 },
+            data: { content: asset.caption, ...BLOCK_DEFAULTS.message, channels: DEFAULT_BLOCK_CHANNELS },
+            next_block_id: null,
           });
-
-        if (error) {
-          console.error('Storage upload error:', error);
-          return null;
+          manifestItem.extra_block_id = captionBlockId;
+          leadBlockCursor++;
         }
 
-        const { data: { publicUrl } } = supabase.storage
-          .from('funnel-assets')
-          .getPublicUrl(path);
-
-        return publicUrl;
-      } catch (e) {
-        console.error('Failed to proxy media:', e);
-        return null;
+        manifest.push(manifestItem);
+      } else {
+        const blockId = genBlockId();
+        leadBlocks.push({
+          id: blockId,
+          type: 'message',
+          position: { x: 0, y: 0 },
+          data: { content: msg.content ?? '', ...BLOCK_DEFAULTS.message, channels: DEFAULT_BLOCK_CHANNELS },
+          next_block_id: null,
+        });
+        leadBlockCursor++;
+        manifest.push({
+          message_id: msg.id,
+          provider_message_id: msg.metadata?.evolution_message_id || null,
+          position: i,
+          timestamp_used: msg.created_at,
+          kind: 'text',
+          block_id: blockId,
+        });
       }
-    };
-
-    // Prepare message data for AI
-    const preparedMessages: any[] = [];
-    for (const msg of messages) {
-      let metadata = msg.metadata || {};
-      
-      // Try parsing content as metadata if empty
-      if ((!metadata || Object.keys(metadata).length === 0) && msg.content && msg.content.trim().startsWith('{')) {
-        try {
-          const parsed = JSON.parse(msg.content);
-          metadata = parsed.message || parsed;
-        } catch (e) { /* ignore */ }
-      }
-
-      let mediaUrl = null;
-      let mediaKind = null;
-      let fileName = null;
-
-      // Media extraction
-      if (metadata.media && metadata.media.url) {
-        mediaUrl = metadata.media.url;
-        mediaKind = metadata.media.kind || metadata.media.type || metadata.media.multimodal_processed;
-        fileName = metadata.media.filename || metadata.media.fileName;
-      } else if (metadata.imageMessage) {
-        mediaUrl = metadata.imageMessage.url || metadata.imageMessage.directPath || metadata.imageMessage.URL || metadata.imageMessage.DirectPath;
-        mediaKind = 'image';
-      } else if (metadata.videoMessage) {
-        mediaUrl = metadata.videoMessage.url || metadata.videoMessage.directPath || metadata.videoMessage.URL || metadata.videoMessage.DirectPath;
-        mediaKind = 'video';
-      } else if (metadata.audioMessage) {
-        mediaUrl = metadata.audioMessage.url || metadata.audioMessage.directPath || metadata.audioMessage.URL || metadata.audioMessage.DirectPath;
-        mediaKind = 'audio';
-      } else if (metadata.documentMessage) {
-        mediaUrl = metadata.documentMessage.url || metadata.documentMessage.directPath || metadata.documentMessage.URL || metadata.documentMessage.DirectPath;
-        mediaKind = 'document';
-        fileName = metadata.documentMessage.fileName || metadata.documentMessage.filename;
-      }
-
-      let finalMediaUrl = null;
-      if (mediaUrl) {
-        finalMediaUrl = await uploadMedia(mediaUrl, mediaKind || 'document', fileName);
-      }
-
-      preparedMessages.push({
-        sender: msg.sender_type === 'visitor' ? 'Lead' : 'Bot',
-        text: msg.content,
-        mediaUrl: finalMediaUrl,
-        mediaKind: mediaKind,
-        fileName: fileName
-      });
     }
 
-    // 4. Use AI to generate funnel blocks
-    console.log('[clone-funnel] calling AI for block generation');
-    const { provider, apiKey, model } = await resolveAIProvider(organization_id, "content_generation");
-    
-    const systemPrompt = `Você é um arquiteto de funis de vendas para WhatsApp. Sua tarefa é transformar uma sequência de mensagens em um funil de automação no formato JSON.
-    As mensagens foram enviadas pelo Lead durante uma conversa. O usuário quer transformar essas mensagens (incluindo áudios e documentos) em um funil que possa ser enviado para outros leads.
-    
-    REGRAS:
-    1. Crie blocos individuais para cada mensagem, áudio ou documento.
-    2. NÃO conecte os blocos. O campo 'next_block_id' deve ser SEMPRE null.
-    3. Tipos de blocos suportados e seus dados:
-       - 'message': Para texto. Data: { "content": string, "delay_ms": 5000, "typing_duration_ms": 5000, "channels": ["chat", "form", "widget", "whatsapp"] }
-       - 'audio': Para áudio. Data: { "audio_url": string, "ptt": true, "delay_ms": 0, "typing_duration_ms": 5000, "channels": [...] }
-       - 'image': Para imagens. Data: { "image_url": string, "content": string, "channels": [...] }
-       - 'video': Para vídeos. Data: { "video_url": string, "video_type": "file", "content": string, "channels": [...] }
-       - 'document': Para PDFs/Arquivos. Data: { "document_url": string, "file_name": string, "content": string, "channels": [...] }
-    4. Organize os blocos em 3 colunas paralelas conforme o tipo:
-       - Coluna 1 (Mensagens/Imagens): x: 250
-       - Coluna 2 (Áudios): x: 550
-       - Coluna 3 (Vídeos/Documentos): x: 850
-    5. O valor de 'y' deve ser incremental dentro de cada coluna (ex: 100, 250, 400...).
-    6. Retorne APENAS o JSON no formato: { "blocks": [...] }.`;
+    // Liga a sequência: block[i].next_block_id = block[i+1].id; o último
+    // aponta para a entrada clonada do funil-modelo.
+    for (let i = 0; i < leadBlocks.length; i++) {
+      leadBlocks[i].next_block_id = i < leadBlocks.length - 1 ? leadBlocks[i + 1].id : modelStartBlockId;
+    }
 
-    const userPrompt = `Conversa com o Lead (${leadName}):
-    ${preparedMessages.map((m, i) => `Mensagem ${i}: [${m.sender}] ${m.text} ${m.mediaUrl ? `(Mídia: ${m.mediaUrl}, Tipo: ${m.mediaKind}, Nome: ${m.fileName})` : ''}`).join('\n')}`;
+    // Posições visuais: sequência do lead em linha, seguida pelo modelo
+    // deslocado (preservando as posições relativas internas do modelo).
+    const LEAD_SPACING_X = 320;
+    leadBlocks.forEach((b, i) => {
+      b.position = { x: i * LEAD_SPACING_X, y: 0 };
+    });
+    const modelMinX = Math.min(...modelBlocks.map((b: any) => (typeof b.position?.x === 'number' ? b.position.x : 0)));
+    const offsetX = leadBlocks.length * LEAD_SPACING_X + LEAD_SPACING_X - modelMinX;
+    modelBlocks.forEach((b: any) => {
+      const x = typeof b.position?.x === 'number' ? b.position.x : 0;
+      const y = typeof b.position?.y === 'number' ? b.position.y : 0;
+      b.position = { x: x + offsetX, y };
+    });
 
-    let flowBlocks: any[] = [];
-    
-    try {
-      const isOpenAI = apiKey.startsWith("sk-");
-      const aiUrl = isOpenAI
-        ? "https://api.openai.com/v1/chat/completions"
-        : "https://ai.gateway.lovable.dev/v1/chat/completions";
+    const flowBlocks = [...leadBlocks, ...modelBlocks];
+    const startBlockId = leadBlocks[0].id;
 
-      let modelName = model || 'gpt-4o-mini';
-      if (!isOpenAI && !modelName.includes("/")) {
-        modelName = `openai/${modelName}`;
+    // 13. Validar o grafo completo antes de qualquer upload/persistência.
+    const allIds = new Set(flowBlocks.map((b: any) => b.id));
+    if (allIds.size !== flowBlocks.length) throw new Error('IDs de bloco duplicados no funil final.');
+    if (!allIds.has(startBlockId)) throw new Error('start_block_id calculado não existe no funil final.');
+    for (const b of flowBlocks as any[]) {
+      const refs = [b.next_block_id, ...REF_FIELDS_DATA.map((f) => b.data?.[f])].filter(Boolean);
+      for (const r of refs) {
+        if (!allIds.has(r)) throw new Error(`Referência para id inexistente no funil final: bloco ${b.id} -> ${r}`);
+      }
+    }
+    // Nenhum bloco do lead pode ficar órfão (sem next_block_id resolvido) e
+    // nenhum item outbound deve ter entrado no manifesto.
+    if (manifest.length !== eligible.length) {
+      throw new Error('Divergência entre manifesto e mensagens elegíveis — abortando.');
+    }
+
+    // 14. Upload permanente das mídias validadas (content-addressed: mesmo
+    // hash => mesmo path, sem re-upload físico; duas ocorrências distintas
+    // do mesmo arquivo continuam gerando dois blocos, apenas compartilham o
+    // asset).
+    const uploadedUrlByHash = new Map<string, string>();
+    for (const [, asset] of resolvedAssets) {
+      let publicUrl = uploadedUrlByHash.get(asset.hash);
+      if (!publicUrl) {
+        const safeName = sanitizeFileName(asset.originalFileName || `${asset.hash}.${asset.extension}`);
+        const path = `${asset.kind}/${organization_id}/${asset.hash}-${safeName}`;
+
+        const { data: existingList } = await supabase.storage.from('funnel-assets').list(`${asset.kind}/${organization_id}`, {
+          search: `${asset.hash}-`,
+        });
+        const alreadyThere = (existingList || []).some((f: any) => f.name === `${asset.hash}-${safeName}`);
+
+        if (!alreadyThere) {
+          const { error: uploadError } = await supabase.storage
+            .from('funnel-assets')
+            .upload(path, asset.bytes, { contentType: asset.mime, upsert: false });
+          if (uploadError && !String(uploadError.message || '').includes('already exists')) {
+            throw new Error(`Falha ao enviar mídia para Storage permanente: ${uploadError.message}`);
+          }
+          if (!uploadError) uploadedPaths.push(path);
+        }
+
+        const { data: { publicUrl: url } } = supabase.storage.from('funnel-assets').getPublicUrl(path);
+        publicUrl = url;
+        uploadedUrlByHash.set(asset.hash, publicUrl);
       }
 
-      const aiResponse = await fetch(aiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: modelName,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ],
-          temperature: 0.1,
-          response_format: { type: 'json_object' }
-        })
-      });
+      const blockId = (asset as any).__blockId as string;
+      const block = flowBlocks.find((b: any) => b.id === blockId);
+      if (!block) throw new Error('Bloco de mídia não encontrado ao atribuir URL permanente — abortando.');
+      if (asset.kind === 'image') block.data.image_url = publicUrl;
+      else if (asset.kind === 'video') block.data.video_url = publicUrl;
+      else if (asset.kind === 'document') block.data.document_url = publicUrl;
+      else if (asset.kind === 'audio') block.data.audio_url = publicUrl;
+    }
 
-      const aiData = await aiResponse.json();
-      const content = aiData.choices?.[0]?.message?.content;
-      if (content) {
-        const parsed = JSON.parse(content);
-        flowBlocks = parsed.blocks || [];
-        
-        // Post-process to ensure columns and no connections
-        if (flowBlocks.length > 0) {
-          let messageY = 100;
-          let audioY = 100;
-          let documentY = 100;
-
-          flowBlocks = flowBlocks.map((block: any) => {
-            const type = block.type;
-            let x = 250;
-            let y = 100;
-
-            if (type === 'audio') {
-              x = 550;
-              y = audioY;
-              audioY += 200;
-            } else if (type === 'document' || type === 'video') {
-              x = 850;
-              y = documentY;
-              documentY += 200;
-            } else {
-              x = 250;
-              y = messageY;
-              messageY += 200;
-            }
-
-            return {
-              ...block,
-              next_block_id: null,
-              position: { x, y },
-              data: {
-                ...block.data,
-                delay_ms: type === 'message' ? (block.data.delay_ms ?? 5000) : (type === 'audio' ? 0 : (block.data.delay_ms ?? 500)),
-                typing_duration_ms: (type === 'message' || type === 'audio') ? (block.data.typing_duration_ms ?? 5000) : block.data.typing_duration_ms,
-                ptt: type === 'audio' ? true : block.data.ptt,
-                channels: block.data.channels || ['chat', 'form', 'widget', 'whatsapp']
-              }
-            };
-          });
+    // Nenhuma URL temporária pode sobreviver.
+    for (const b of flowBlocks as any[]) {
+      for (const f of ['image_url', 'video_url', 'document_url', 'audio_url']) {
+        if (b.data?.[f] === '__PENDING_UPLOAD__') {
+          throw new Error(`Bloco ${b.id} ficou com URL de mídia não resolvida — abortando.`);
         }
       }
-    } catch (e) {
-      console.error('[clone-funnel] AI generation failed, falling back to basic logic', e);
-      // Fallback logic here if needed, but we'll try to rely on AI first
     }
 
-    // 5. Create the funnel
-    const funnelName = `Funil ${leadName} - AI`;
-    const slug = `${leadName.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${Date.now().toString().slice(-4)}`;
-
-    if (flowBlocks.length === 0) {
-      throw new Error('No blocks generated for the funnel');
-    }
+    // 15. Persistir — só agora, depois de toda validação.
+    const funnelName = `Funil ${leadName} - Clonado`;
 
     const { data: newFunnel, error: insertError } = await supabase
       .from('capture_funnels')
@@ -294,21 +470,44 @@ serve(async (req) => {
         slug,
         status: 'draft',
         flow_blocks: flowBlocks,
-        start_block_id: null,
+        start_block_id: startBlockId,
         created_by: user_id,
         channels: {
           chat: { enabled: true },
           form: { enabled: true },
           widget: { enabled: true },
-          whatsapp: { enabled: true }
-        }
+          whatsapp: { enabled: true },
+        },
       })
       .select()
       .single();
 
     if (insertError) {
-      throw new Error(`Failed to create funnel: ${insertError.message}`);
+      // 16. Compensação: remove somente os arquivos criados NESTA execução.
+      if (uploadedPaths.length > 0) {
+        await supabase.storage.from('funnel-assets').remove(uploadedPaths);
+      }
+      // Corrida real (dois cliques simultâneos ganhando a checagem de
+      // idempotência ao mesmo tempo): o índice único (organization_id, slug)
+      // rejeita o segundo insert — devolve o que já existe em vez de erro.
+      if (insertError.code === '23505') {
+        const { data: raceWinner } = await supabase
+          .from('capture_funnels')
+          .select('id')
+          .eq('organization_id', organization_id)
+          .eq('slug', slug)
+          .maybeSingle();
+        if (raceWinner) {
+          return new Response(
+            JSON.stringify({ success: true, funnel_id: raceWinner.id, idempotent: true }),
+            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+      }
+      throw new Error(`Falha ao criar funil: ${insertError.message}`);
     }
+
+    console.log(`[clone-funnel] funil ${newFunnel.id} criado: ${manifest.length} mensagens do lead + ${modelBlocks.length} blocos do modelo`);
 
     return new Response(
       JSON.stringify({ success: true, funnel_id: newFunnel.id }),
@@ -316,6 +515,16 @@ serve(async (req) => {
     );
 
   } catch (error: any) {
+    if (uploadedPaths.length > 0) {
+      try {
+        const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+        const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+        const supabase = createClient(supabaseUrl, supabaseServiceKey);
+        await supabase.storage.from('funnel-assets').remove(uploadedPaths);
+      } catch (cleanupError) {
+        console.error('[clone-funnel] Falha na compensação de Storage:', cleanupError);
+      }
+    }
     console.error('Clone funnel error:', error);
     return new Response(
       JSON.stringify({ error: error.message }),
