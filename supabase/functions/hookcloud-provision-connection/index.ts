@@ -164,14 +164,21 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
   // nunca do corpo da requisição (mesmo que o cliente envie um
   // organization_id, ele só é usado para CONFIRMAR que bate com o real;
   // nunca como autoridade por si só — ver validação cross-tenant abaixo).
+  // FASE 13B (achado de revisão): também confirma que o usuário não está
+  // desativado/suspenso (`profiles.disabled`/`is_active`) — um JWT ainda
+  // válido não deveria bastar para provisionar uma conexão Meta real se a
+  // conta já foi desativada pela própria organização.
   const { data: profile } = await deps.adminClient
     .from("profiles")
-    .select("organization_id")
+    .select("organization_id, disabled, is_active")
     .eq("id", caller.id)
     .maybeSingle();
 
   if (!profile?.organization_id) {
     return jsonResponse(403, { error: "no_organization" });
+  }
+  if (profile.disabled === true || profile.is_active === false) {
+    return jsonResponse(403, { error: "user_disabled" });
   }
 
   // 3) Papel administrativo — mesmo padrão de create-team-member: consulta

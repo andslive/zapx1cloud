@@ -26,6 +26,8 @@ function authClient(userId: string | null): AuthClientLike {
 
 interface AdminMockConfig {
   profileOrgId?: string | null;
+  profileDisabled?: boolean;
+  profileIsActive?: boolean;
   roles?: string[];
   rpcResult?: { data: any; error: { code?: string; message?: string } | null };
   rpcCalls?: Array<{ fn: string; args: Record<string, unknown> }>;
@@ -51,7 +53,11 @@ function adminClient(config: AdminMockConfig): AdminSupabaseLike {
                   if (table === "profiles") {
                     return {
                       data: config.profileOrgId !== undefined && config.profileOrgId !== null
-                        ? { organization_id: config.profileOrgId }
+                        ? {
+                          organization_id: config.profileOrgId,
+                          disabled: config.profileDisabled ?? false,
+                          is_active: config.profileIsActive ?? true,
+                        }
                         : null,
                       error: null,
                     };
@@ -573,5 +579,37 @@ Deno.test("callbackBaseUrl http://127.0.0.1 (dev local) é aceita como exceção
     assertEquals(res.status, 201);
     const body = await res.json();
     assert(body.callback_url.startsWith("http://127.0.0.1"));
+  });
+});
+
+// ── Fase 13B (achado de revisão): usuário desativado/suspenso rejeitado ──
+
+Deno.test("usuário com profiles.disabled=true => 403, mesmo com JWT válido e papel admin", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileDisabled: true }) }),
+    );
+    assertEquals(res.status, 403);
+  });
+});
+
+Deno.test("usuário com profiles.is_active=false => 403", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileIsActive: false }) }),
+    );
+    assertEquals(res.status, 403);
+  });
+});
+
+Deno.test("usuário ativo (disabled=false, is_active=true) continua permitido", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileDisabled: false, profileIsActive: true }) }),
+    );
+    assertEquals(res.status, 201);
   });
 });
