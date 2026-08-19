@@ -16,8 +16,14 @@
 
 import { assert, assertEquals } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import { computeHmacSha256Hex } from "../_shared/meta-webhook-signature.ts";
-import { hashHookCloudWebhookSecret } from "../_shared/meta-webhook-hookcloud-secret.ts";
 import {
+  generateHookCloudVerifyToken,
+  hashHookCloudVerifyToken,
+  hashHookCloudWebhookSecret,
+} from "../_shared/meta-webhook-hookcloud-secret.ts";
+import {
+  handleGetRequest,
+  handleHookCloudVerification,
   handleInboundEvent,
   handleVerification,
   insertLedgerRow,
@@ -28,6 +34,7 @@ import {
 
 const APP_SECRET = "test-secret";
 const HOOKCLOUD_SECRET = "hc-segredo-de-teste-64-caracteres-simulado-para-verificacao-aqui";
+const HOOKCLOUD_VERIFY_TOKEN = "hc-verify-token-de-teste-64-caracteres-simulado-para-o-get-aqui";
 const TEST_TIMEOUT_MS = 50;
 const NOW_SECONDS = Math.floor(Date.now() / 1000);
 
@@ -41,6 +48,7 @@ function directMetaCandidate(): MetaCloudConnectionCandidate {
     onboardingState: "active",
     onboardingSourceRaw: "direct_meta",
     hookcloudSecretHash: null,
+    hookcloudVerifyTokenHash: null,
   };
 }
 
@@ -54,12 +62,18 @@ async function hookCloudCandidate(overrides: Partial<MetaCloudConnectionCandidat
     onboardingState: "active",
     onboardingSourceRaw: "hookcloud",
     hookcloudSecretHash: await hashHookCloudWebhookSecret(HOOKCLOUD_SECRET),
+    hookcloudVerifyTokenHash: await hashHookCloudVerifyToken(HOOKCLOUD_VERIFY_TOKEN),
     ...overrides,
   };
 }
 
 function resolverReturning(candidates: MetaCloudConnectionCandidate[]) {
   return async (_phoneNumberId: string) => candidates;
+}
+
+/** Mock do lookup por hash do callback secret — usado pelos testes do GET individual HookCloud (Fase 14A). */
+function hashResolverReturning(candidates: MetaCloudConnectionCandidate[]) {
+  return async (_callbackSecretHash: string) => candidates;
 }
 
 async function signedRequest(bodyObj: unknown, url = "https://example.com/meta-cloud-webhook"): Promise<Request> {
@@ -615,4 +629,291 @@ Deno.test("GET: token nunca aparece na resposta de erro", () => {
   const req = new Request("https://x/webhook?hub.mode=subscribe&hub.verify_token=segredo-nao-pode-vazar&hub.challenge=abc");
   const res = handleVerification(req, { get: (k) => (k === "META_WEBHOOK_VERIFY_TOKEN" ? "tok123" : undefined) });
   assert(!res.status.toString().includes("segredo-nao-pode-vazar"));
+});
+
+// ── FASE 14A — GET individual por conexão HookCloud ──────────────────────
+
+function hookCloudGetUrl(hcs: string | null, verifyToken: string | null, challenge = "abc", mode = "subscribe"): string {
+  const params = new URLSearchParams();
+  if (mode) params.set("hub.mode", mode);
+  if (verifyToken !== null) params.set("hub.verify_token", verifyToken);
+  params.set("hub.challenge", challenge);
+  if (hcs !== null) params.set("hcs", hcs);
+  return `https://x/webhook?${params.toString()}`;
+}
+
+Deno.test("GET HookCloud válido (hcs + verify token corretos, conexão pending) => 200 com o challenge", async () => {
+  const candidate = await hookCloudCandidate({ onboardingState: "pending" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null,
+    appSecret: undefined,
+    resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  assertEquals(res.status, 200);
+  assertEquals(await res.text(), "abc");
+});
+
+Deno.test("GET HookCloud válido com conexão já 'active' também retorna challenge (estado compatível)", async () => {
+  const candidate = await hookCloudCandidate({ onboardingState: "active" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null,
+    appSecret: undefined,
+    resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  assertEquals(res.status, 200);
+});
+
+Deno.test("GET HookCloud: hcs inválido (nenhuma conexão localizada) => 403 uniforme", async () => {
+  const req = new Request(hookCloudGetUrl("hcs-errado-nao-corresponde-a-nenhuma-conexao", HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null,
+    appSecret: undefined,
+    resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: verify token inválido (conexão localizada, token errado) => 403 uniforme", async () => {
+  const candidate = await hookCloudCandidate({ onboardingState: "pending" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, "verify-token-errado"));
+  const res = await handleGetRequest(req, {
+    supabase: null,
+    appSecret: undefined,
+    resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: hcs e verify token ambos ausentes (mas hcs presente vazio) => 403", async () => {
+  const req = new Request(hookCloudGetUrl("", null));
+  const res = await handleGetRequest(req, {
+    supabase: null,
+    appSecret: undefined,
+    resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: resposta 403 é textualmente idêntica em todos os motivos de rejeição (uniforme, sem enumeração)", async () => {
+  const candidatePending = await hookCloudCandidate({ onboardingState: "pending" });
+
+  const reqWrongHcs = new Request(hookCloudGetUrl("hcs-errado", HOOKCLOUD_VERIFY_TOKEN));
+  const resWrongHcs = await handleGetRequest(reqWrongHcs, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([]),
+  });
+
+  const reqWrongToken = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, "token-errado"));
+  const resWrongToken = await handleGetRequest(reqWrongToken, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidatePending]),
+  });
+
+  const reqOtherOrgWrongToken = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, "token-de-outra-organizacao"));
+  const otherOrgCandidate = await hookCloudCandidate({ organizationId: "org-outra", onboardingState: "pending" });
+  const resOtherOrg = await handleGetRequest(reqOtherOrgWrongToken, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([otherOrgCandidate]),
+  });
+
+  const bodies = await Promise.all([resWrongHcs.text(), resWrongToken.text(), resOtherOrg.text()]);
+  assertEquals(resWrongHcs.status, 403);
+  assertEquals(resWrongToken.status, 403);
+  assertEquals(resOtherOrg.status, 403);
+  assertEquals(bodies[0], bodies[1]);
+  assertEquals(bodies[1], bodies[2]);
+});
+
+Deno.test("GET HookCloud: conexão de outra organização é rejeitada como qualquer outro verify token incorreto (uniforme)", async () => {
+  // "Outra organização" aqui significa: o hcs da requisição não corresponde a
+  // NENHUMA conexão real (o admin de outra organização nunca teria o hcs
+  // correto de uma conexão que não é dele) — o lookup por hash já garante
+  // isolamento por tenant, sem precisar de checagem explícita de organização.
+  const req = new Request(hookCloudGetUrl("hcs-de-outra-organizacao-nao-existe-aqui", HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: conexão não-HookCloud (onboarding_source=direct_meta) é rejeitada mesmo com hcs/verify token corretos", async () => {
+  const wrongSourceCandidate = await hookCloudCandidate({ onboardingSourceRaw: "direct_meta" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([wrongSourceCandidate]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: provider != meta_cloud é rejeitado mesmo com hcs/verify token corretos", async () => {
+  const wrongProviderCandidate = await hookCloudCandidate({ provider: "uazapi" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([wrongProviderCandidate]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: estado incompatível (ex.: 'disconnected') é rejeitado mesmo com hcs/verify token corretos", async () => {
+  const incompatibleStateCandidate = await hookCloudCandidate({ onboardingState: "disconnected" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([incompatibleStateCandidate]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: múltiplas conexões candidatas (situação anômala) é rejeitada uniformemente", async () => {
+  const c1 = await hookCloudCandidate({ connectionId: "conn-hc-1" });
+  const c2 = await hookCloudCandidate({ connectionId: "conn-hc-2" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([c1, c2]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: callback secret sozinho (sem hub.verify_token) NUNCA valida o GET", async () => {
+  const candidate = await hookCloudCandidate({ onboardingState: "pending" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, null));
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: verify token NUNCA autentica o POST — só o callback secret (hcs) participa da verificação do POST", async () => {
+  // Prova estrutural: processHookCloudEvent (caminho POST) só é alcançável
+  // via handleInboundEvent, que só lê `hcs` da query string — nunca
+  // `hub.verify_token` (que sequer é um parâmetro de POST da Meta). O
+  // verify token gerado nesta fase não tem NENHUMA função no fluxo de POST.
+  const candidate = await hookCloudCandidate(); // onboardingState "active" — exigido pelo gate do POST
+  const req = new Request(`https://x/webhook?hcs=${HOOKCLOUD_SECRET}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(samplePayload()),
+  });
+  const res = await handleInboundEvent(req, {
+    supabase: mockSupabase("always_insert"),
+    appSecret: APP_SECRET,
+    resolveConnectionCandidates: resolverReturning([candidate]),
+    hookCloudEnv: HOOKCLOUD_ENABLED_ENV,
+    isOrganizationAllowedForMetaCloud: async () => true,
+  });
+  // Aceito (200) só porque o hcs (callback secret) bateu — nenhum
+  // hub.verify_token foi enviado nem teria efeito algum aqui.
+  assertEquals(res.status, 200);
+});
+
+Deno.test("GET HookCloud: direct_meta continua usando exclusivamente o GET global (handleVerification), mesmo com `hcs` ausente na URL", async () => {
+  const req = new Request("https://x/webhook?hub.mode=subscribe&hub.verify_token=tok-global-correto&hub.challenge=desafio-global");
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([]), // nunca chamado quando hcs está ausente
+  });
+  // Sem env correto injetado aqui (handleVerification usa Deno.env real,
+  // que não tem META_WEBHOOK_VERIFY_TOKEN='tok-global-correto' no processo
+  // de teste) — só prova que o roteamento delega para o caminho global
+  // inalterado, e nunca tenta o caminho HookCloud sem `hcs`.
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: comparação do verify token é em tempo constante (reaproveita timingSafeEqualHex já auditado)", async () => {
+  // Prova indireta: um valor de comprimento diferente do hash esperado
+  // (64 hex) ainda assim é rejeitado corretamente, sem lançar exceção —
+  // comportamento consistente com timingSafeEqualHex (ver
+  // meta-webhook-signature.test.ts para a prova unitária do algoritmo).
+  const candidate = await hookCloudCandidate({ onboardingState: "pending" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, "curto"));
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("GET HookCloud: nenhum segredo aparece no corpo da resposta de rejeição", async () => {
+  const candidate = await hookCloudCandidate({ onboardingState: "pending" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, "verify-token-que-nao-pode-vazar-em-lugar-nenhum"));
+  const res = await handleGetRequest(req, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  const body = await res.text();
+  assert(!body.includes(HOOKCLOUD_SECRET));
+  assert(!body.includes("verify-token-que-nao-pode-vazar-em-lugar-nenhum"));
+  assert(!body.includes(candidate.connectionId));
+  assert(!body.includes(candidate.organizationId));
+});
+
+Deno.test("GET HookCloud: falha ao resolver conexão (exceção no lookup) é tratada como 403 uniforme, nunca 500 revelador", async () => {
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null,
+    appSecret: undefined,
+    resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: async () => {
+      throw new Error("db unreachable");
+    },
+  });
+  assertEquals(res.status, 403);
+});
+
+Deno.test("handleHookCloudVerification: chamada direta (sem passar por handleGetRequest) também aplica todas as checagens", async () => {
+  const candidate = await hookCloudCandidate({ onboardingState: "pending" });
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleHookCloudVerification(req, HOOKCLOUD_SECRET, {
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  assertEquals(res.status, 200);
+});
+
+Deno.test("GET: `resolveConnectionByCallbackSecretHash` não injetada + hcs presente => 403 (falha fechada, nunca cai para o verify token global)", async () => {
+  const req = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_VERIFY_TOKEN));
+  const res = await handleGetRequest(req, {
+    supabase: null,
+    appSecret: undefined,
+    resolveConnectionCandidates: resolverReturning([]),
+    // resolveConnectionByCallbackSecretHash deliberadamente omitido
+  });
+  assertEquals(res.status, 403);
+});
+
+// ── FASE 14A — geração de dois segredos independentes (prova de integração) ─
+
+Deno.test("callback secret e verify token de uma mesma conexão simulada nunca coincidem, e cada um só valida seu próprio propósito", async () => {
+  const verifyTokenRaw = generateHookCloudVerifyToken();
+  assert(verifyTokenRaw !== HOOKCLOUD_SECRET);
+  const verifyTokenHash = await hashHookCloudVerifyToken(verifyTokenRaw);
+  const candidate = await hookCloudCandidate({ hookcloudVerifyTokenHash: verifyTokenHash });
+
+  // GET com o verify token recém-gerado => sucesso.
+  const okReq = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, verifyTokenRaw));
+  const okRes = await handleGetRequest(okReq, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  assertEquals(okRes.status, 200);
+
+  // GET usando o CALLBACK SECRET no lugar do verify token => rejeitado
+  // (não são intercambiáveis).
+  const swappedReq = new Request(hookCloudGetUrl(HOOKCLOUD_SECRET, HOOKCLOUD_SECRET));
+  const swappedRes = await handleGetRequest(swappedReq, {
+    supabase: null, appSecret: undefined, resolveConnectionCandidates: resolverReturning([]),
+    resolveConnectionByCallbackSecretHash: hashResolverReturning([candidate]),
+  });
+  assertEquals(swappedRes.status, 403);
 });
