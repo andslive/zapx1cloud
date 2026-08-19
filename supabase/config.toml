@@ -1,1 +1,15 @@
-project_id = "rbzekjfufhqjpjmjgwmb"
+project_id = "ydunpoqdhijhnrarohiz"
+
+# Receptores de webhook externos (UazAPI/Evolution) — a origem NÃO envia JWT do Supabase,
+# então precisam de verify_jwt=false, senão o gateway rejeita com 401 antes de rodar.
+[functions.uazapi-webhook]
+verify_jwt = false
+
+[functions.evolution-webhook]
+verify_jwt = false
+
+# FASE 2A — webhook dedicado da Meta Cloud API (não reaproveita a URL da
+# UazAPI). A Meta também não envia JWT do Supabase; autenticação real é a
+# validação de X-Hub-Signature-256 dentro da própria função, não o gateway.
+[functions.meta-cloud-webhook]
+verify_jwt = false
