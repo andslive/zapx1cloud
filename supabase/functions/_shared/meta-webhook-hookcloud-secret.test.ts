@@ -7,6 +7,7 @@
 
 import { assert, assertEquals } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
+  generateHookCloudCallbackSecret,
   hashHookCloudWebhookSecret,
   hasMinimumHookCloudSecretEntropy,
   MIN_HOOKCLOUD_SECRET_HEX_LENGTH,
@@ -75,4 +76,31 @@ Deno.test("verificação nunca chama console.* — o segredo bruto nunca é loga
     console.warn = originalWarn;
   }
   assertEquals(called, false, "nenhuma função deste módulo deve chamar console.* em nenhuma circunstância");
+});
+
+// ─── FASE 13A — geração CSPRNG do segredo bruto (provisionamento) ───────
+
+Deno.test("generateHookCloudCallbackSecret: CSPRNG gera segredos distintos a cada chamada", () => {
+  const a = generateHookCloudCallbackSecret();
+  const b = generateHookCloudCallbackSecret();
+  assert(a !== b, "duas gerações consecutivas nunca devem coincidir");
+});
+
+Deno.test("generateHookCloudCallbackSecret: formato e entropia — 64 caracteres hex (256 bits), sempre válido pelo mínimo já exigido", () => {
+  const secret = generateHookCloudCallbackSecret();
+  assertEquals(secret.length, MIN_HOOKCLOUD_SECRET_HEX_LENGTH);
+  assert(/^[0-9a-f]{64}$/.test(secret), "deve ser hex minúsculo puro — URL-safe por construção");
+  assert(hasMinimumHookCloudSecretEntropy(secret.length));
+});
+
+Deno.test("generateHookCloudCallbackSecret: 100 gerações consecutivas nunca colidem (checagem estatística leve de CSPRNG)", () => {
+  const seen = new Set<string>();
+  for (let i = 0; i < 100; i++) seen.add(generateHookCloudCallbackSecret());
+  assertEquals(seen.size, 100);
+});
+
+Deno.test("generateHookCloudCallbackSecret: o valor gerado é aceito pelo verificador quando hasheado corretamente (compatível com o gate existente)", async () => {
+  const raw = generateHookCloudCallbackSecret();
+  const hash = await hashHookCloudWebhookSecret(raw);
+  assertEquals(await verifyHookCloudWebhookSecret(raw, hash), true);
 });

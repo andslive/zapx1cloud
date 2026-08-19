@@ -23,6 +23,7 @@ import { timingSafeEqualHex } from "./meta-webhook-signature.ts";
 
 /** >= 256 bits = 32 bytes. Um segredo hex de 32 bytes tem 64 caracteres. */
 export const MIN_HOOKCLOUD_SECRET_HEX_LENGTH = 64;
+const RAW_SECRET_BYTES = 32; // 256 bits
 
 /**
  * Verifica se `rawSecretHexLength` (o comprimento em caracteres hex do
@@ -55,4 +56,25 @@ export async function verifyHookCloudWebhookSecret(
   if (!rawSecretFromRequest) return false;
   const computedHash = await hashHookCloudWebhookSecret(rawSecretFromRequest);
   return timingSafeEqualHex(computedHash, storedHash);
+}
+
+// FASE 13A — geração do segredo bruto (provisionamento, não verificação).
+//
+// CSPRNG via `crypto.getRandomValues` (Web Crypto, disponível no runtime
+// Deno — mesma API já usada em `meta-webhook-signature.ts` para HMAC).
+// Codificação hex: já é URL-safe por construção (alfabeto `0-9a-f`, sem
+// `+`/`/`/`=` que exigiriam escaping numa query string) — consistente com
+// `MIN_HOOKCLOUD_SECRET_HEX_LENGTH`/`hasMinimumHookCloudSecretEntropy`
+// já existentes acima, que assumem exatamente este formato. 32 bytes
+// aleatórios = 256 bits de entropia real (não apenas comprimento de
+// string) = 64 caracteres hex.
+//
+// O valor retornado aqui NUNCA deve ser persistido em nenhuma tabela —
+// só `hashHookCloudWebhookSecret(valor)` é persistido. O chamador (Edge
+// Function de provisionamento) é responsável por devolver este valor ao
+// administrador exatamente uma vez, e nunca logá-lo.
+export function generateHookCloudCallbackSecret(): string {
+  const bytes = new Uint8Array(RAW_SECRET_BYTES);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
