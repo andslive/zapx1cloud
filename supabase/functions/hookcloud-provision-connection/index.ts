@@ -133,6 +133,25 @@ function isPlausibleOpaqueId(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= 64;
 }
 
+/**
+ * HTTPS obrigatório para a base da URL de callback, exceto para
+ * desenvolvimento local (127.0.0.1/localhost, onde o próprio Supabase CLI
+ * serve as Edge Functions em HTTP por padrão). Falha fechada para
+ * qualquer outra coisa (URL malformada, `http://` num domínio real, etc.)
+ * — nunca constrói uma URL de callback insegura por omissão.
+ */
+function isTrustedCallbackBaseUrl(base: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(base);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  if (parsed.protocol === "http:" && (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost")) return true;
+  return false;
+}
+
 export async function handleProvisionRequest(req: Request, deps: ProvisionHookCloudConnectionDeps): Promise<Response> {
   // 1) Autenticação real — nunca confia em nenhum campo do corpo da
   // requisição para identidade. Mesmo padrão de create-team-member.
@@ -166,6 +185,15 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
   const isAuthorizedRole = roles.some((r) => REQUIRED_ROLES.has(r));
   if (!isAuthorizedRole) {
     return jsonResponse(403, { error: "insufficient_role" });
+  }
+
+  // Falha rápido em configuração de servidor inválida, ANTES de qualquer
+  // trabalho de banco — nunca constrói uma URL de callback insegura.
+  // Exceção só para desenvolvimento local (127.0.0.1/localhost), onde o
+  // próprio Supabase CLI serve em HTTP.
+  if (!isTrustedCallbackBaseUrl(deps.callbackBaseUrl)) {
+    console.error("[hookcloud-provision-connection] callbackBaseUrl configurado não é HTTPS confiável");
+    return jsonResponse(500, { error: "invalid_callback_base_url" });
   }
 
   let body: Partial<ProvisionHookCloudConnectionInput>;

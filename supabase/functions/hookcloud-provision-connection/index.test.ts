@@ -543,3 +543,35 @@ Deno.test("avisos de segurança presentes na resposta (URL em log de infraestrut
     assert(joined.includes("hmac"));
   });
 });
+
+// ── Fase 13B (achado de revisão): HTTPS obrigatório na base do callback ──
+
+Deno.test("callbackBaseUrl http:// num domínio real (fora de teste/local) => 500, nunca constrói URL insegura", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps({ callbackBaseUrl: "http://ydunpoqdhijhnrarohiz.supabase.co" }));
+    assertEquals(res.status, 500);
+  });
+});
+
+Deno.test("callbackBaseUrl malformada => 500", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps({ callbackBaseUrl: "nao-e-uma-url" }));
+    assertEquals(res.status, 500);
+  });
+});
+
+Deno.test("callbackBaseUrl https:// é aceita normalmente", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps({ callbackBaseUrl: CALLBACK_BASE_URL }));
+    assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("callbackBaseUrl http://127.0.0.1 (dev local) é aceita como exceção deliberada", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps({ callbackBaseUrl: "http://127.0.0.1:54321" }));
+    assertEquals(res.status, 201);
+    const body = await res.json();
+    assert(body.callback_url.startsWith("http://127.0.0.1"));
+  });
+});
