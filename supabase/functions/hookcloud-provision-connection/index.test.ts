@@ -13,7 +13,12 @@ import {
   type MetaAccessTokenValidator,
   type ProvisionHookCloudConnectionDeps,
 } from "./index.ts";
-import { hashHookCloudWebhookSecret, verifyHookCloudWebhookSecret } from "../_shared/meta-webhook-hookcloud-secret.ts";
+import {
+  hashHookCloudVerifyToken,
+  hashHookCloudWebhookSecret,
+  verifyHookCloudVerifyToken,
+  verifyHookCloudWebhookSecret,
+} from "../_shared/meta-webhook-hookcloud-secret.ts";
 
 const CALLER_ID = "user-1";
 const ORG_ID = "org-a";
@@ -611,5 +616,116 @@ Deno.test("usuário ativo (disabled=false, is_active=true) continua permitido", 
       baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileDisabled: false, profileIsActive: true }) }),
     );
     assertEquals(res.status, 201);
+  });
+});
+
+// ── Fase 14A — verify token individual, INDEPENDENTE do callback secret ──
+
+Deno.test("14A.1) resposta de sucesso inclui verify_token, distinto do callback secret embutido na URL", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps());
+    const body = await res.json();
+    assertEquals(typeof body.verify_token, "string");
+    const callbackSecret = new URL(body.callback_url).searchParams.get("hcs")!;
+    assert(body.verify_token !== callbackSecret, "os dois segredos nunca podem ser o mesmo valor");
+  });
+});
+
+Deno.test("14A.2) verify_token tem 64 caracteres hex (256 bits) e é distinto a cada chamada", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res1 = await handleProvisionRequest(req(validPayload({ phoneNumberId: "vt-aaa" })), baseDeps());
+    const res2 = await handleProvisionRequest(req(validPayload({ phoneNumberId: "vt-bbb" })), baseDeps());
+    const body1 = await res1.json();
+    const body2 = await res2.json();
+    assertEquals(body1.verify_token.length, 64);
+    assert(/^[0-9a-f]{64}$/.test(body1.verify_token));
+    assert(body1.verify_token !== body2.verify_token);
+  });
+});
+
+Deno.test("14A.3) a RPC recebe SOMENTE o hash do verify token, nunca o valor bruto — e o hash é diferente do hash do callback secret", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    );
+    const body = await res.json();
+    const sentVerifyTokenHash = rpcCalls[0].args.p_hookcloud_verify_token_hash as string;
+    const sentCallbackHash = rpcCalls[0].args.p_hookcloud_secret_hash as string;
+    assert(sentVerifyTokenHash !== body.verify_token, "o valor enviado à RPC nunca pode ser igual ao valor bruto");
+    assertEquals(sentVerifyTokenHash, await hashHookCloudVerifyToken(body.verify_token));
+    assert(sentVerifyTokenHash !== sentCallbackHash, "os dois hashes enviados à RPC nunca podem coincidir");
+  });
+});
+
+Deno.test("14A.4) o verify_token bruto retornado, hasheado, é aceito pelo verificador de GET (Fase 14A)", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps());
+    const body = await res.json();
+    const storedHash = await hashHookCloudVerifyToken(body.verify_token);
+    assertEquals(await verifyHookCloudVerifyToken(body.verify_token, storedHash), true);
+  });
+});
+
+Deno.test("14A.5) verify_token NUNCA é embutido na callback_url — só o callback secret (hcs) vai na URL", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps());
+    const body = await res.json();
+    assertEquals(body.callback_url.includes(body.verify_token), false, "o verify_token nunca deve aparecer dentro da callback_url");
+    const url = new URL(body.callback_url);
+    assertEquals([...url.searchParams.keys()].length, 1, "a URL só tem o parâmetro hcs — verify_token é devolvido separado");
+  });
+});
+
+Deno.test("14A.6) resposta de erro NUNCA contém verify_token nem seu hash", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({
+        adminClient: adminClient({
+          profileOrgId: ORG_ID,
+          roles: ["admin"],
+          rpcResult: { data: null, error: { message: "hookcloud_provisioning_failed" } },
+        }),
+      }),
+    );
+    assertEquals(res.status, 500);
+    const body = await res.json();
+    assertEquals("verify_token" in body, false);
+  });
+});
+
+Deno.test("14A.7) generateVerifyToken injetado é usado no lugar do CSPRNG real (isolamento de teste, mesmo padrão de generateSecret)", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ generateVerifyToken: () => "verify-token-fixo-de-teste" }),
+    );
+    const body = await res.json();
+    assertEquals(body.verify_token, "verify-token-fixo-de-teste");
+  });
+});
+
+Deno.test("14A.8) nenhuma chamada a console.* durante o fluxo inclui o verify_token bruto", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const originalLog = console.log, originalWarn = console.warn, originalError = console.error;
+    const calls: unknown[] = [];
+    console.log = (...a: unknown[]) => calls.push(a);
+    console.warn = (...a: unknown[]) => calls.push(a);
+    console.error = (...a: unknown[]) => calls.push(a);
+    let capturedVerifyToken = "";
+    try {
+      const res = await handleProvisionRequest(req(validPayload()), baseDeps({ generateVerifyToken: () => "verify-token-para-checar-log" }));
+      const body = await res.json();
+      capturedVerifyToken = body.verify_token;
+    } finally {
+      console.log = originalLog;
+      console.warn = originalWarn;
+      console.error = originalError;
+    }
+    assertEquals(capturedVerifyToken, "verify-token-para-checar-log");
+    const serialized = JSON.stringify(calls);
+    assertEquals(serialized.includes("verify-token-para-checar-log"), false);
   });
 });

@@ -10,11 +10,13 @@
 //      20260819200000, NÃO aplicada nesta fase) — que cria a instância
 //      base, o secret do token no Vault, e a config Meta com
 //      onboarding_state='pending', tudo dentro de UMA transação;
-//   4) gera um segredo de callback via CSPRNG, guarda só o HASH (a RPC
-//      recebe o hash, nunca o valor bruto);
+//   4) gera DOIS segredos INDEPENDENTES via CSPRNG (Fase 14A) — um
+//      callback secret (POST, embutido na URL como `hcs`) e um verify
+//      token (GET, devolvido separado) — guarda só o HASH de cada um (a
+//      RPC recebe os hashes, nunca os valores brutos);
 //   5) monta a URL de callback a partir de configuração confiável do
-//      servidor (nunca do Host header da requisição) e a devolve ao
-//      administrador exatamente UMA vez.
+//      servidor (nunca do Host header da requisição) e devolve os dois
+//      valores brutos ao administrador exatamente UMA vez.
 //
 // NÃO É FRONTEND. NÃO faz Embedded Signup. NÃO chama a Graph API real.
 // NÃO usa credencial real em nenhum teste. NÃO libera nenhuma ação de
@@ -31,7 +33,12 @@
 // mecanismo, nenhum caminho paralelo de armazenamento de token).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-import { generateHookCloudCallbackSecret, hashHookCloudWebhookSecret } from "../_shared/meta-webhook-hookcloud-secret.ts";
+import {
+  generateHookCloudCallbackSecret,
+  generateHookCloudVerifyToken,
+  hashHookCloudVerifyToken,
+  hashHookCloudWebhookSecret,
+} from "../_shared/meta-webhook-hookcloud-secret.ts";
 import { resolveHookCloudWebhookMode } from "../_shared/meta-webhook-hookcloud-mode.ts";
 import { isMetaCloudApiEnabled } from "../_shared/meta-cloud-flags.ts";
 
@@ -101,6 +108,8 @@ export interface ProvisionHookCloudConnectionDeps {
   callbackBaseUrl: string;
   /** Injetável para teste — evita depender de crypto real em todo teste. */
   generateSecret?: () => string;
+  /** FASE 14A — injetável para teste; gera o verify token INDEPENDENTE do callback secret (chamada CSPRNG separada). */
+  generateVerifyToken?: () => string;
   /** Injetável para teste — substitui isMetaCloudApiEnabled sem precisar mockar a consulta completa de flags. */
   isMetaCloudApiEnabledForOrg?: (organizationId: string) => Promise<boolean>;
 }
@@ -262,13 +271,21 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
     return jsonResponse(400, { error: "invalid_token" });
   }
 
-  // 8) Segredo de callback — CSPRNG, só o hash é enviado à RPC.
+  // 8) Dois segredos INDEPENDENTES — CSPRNG separado para cada um (nunca
+  // um derivado do outro), só o HASH de cada um é enviado à RPC.
+  //   - callbackSecret (`hcs`)  → autentica exclusivamente o POST.
+  //   - verifyToken             → autentica exclusivamente o GET
+  //     individual desta conexão (Fase 14A) — nunca reutiliza o mesmo
+  //     valor do callback secret.
   const generateSecret = deps.generateSecret ?? generateHookCloudCallbackSecret;
+  const generateVerifyToken = deps.generateVerifyToken ?? generateHookCloudVerifyToken;
   const rawCallbackSecret = generateSecret();
+  const rawVerifyToken = generateVerifyToken();
   const callbackSecretHash = await hashHookCloudWebhookSecret(rawCallbackSecret);
+  const verifyTokenHash = await hashHookCloudVerifyToken(rawVerifyToken);
 
-  // 9) RPC atômica — cria tudo ou nada. O token real só existe nesta
-  // chamada (nunca logado, nunca no corpo de erro).
+  // 9) RPC atômica — cria tudo ou nada. Os valores brutos só existem
+  // nesta chamada (nunca logados, nunca no corpo de erro).
   const { data: rpcData, error: rpcError } = await deps.adminClient.rpc("provision_hookcloud_meta_connection", {
     p_organization_id: organizationId,
     p_connection_name: body.connectionName,
@@ -278,6 +295,7 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
     p_display_phone_number: body.displayPhoneNumber,
     p_access_token: body.accessToken,
     p_hookcloud_secret_hash: callbackSecretHash,
+    p_hookcloud_verify_token_hash: verifyTokenHash,
   });
 
   if (rpcError) {
@@ -310,38 +328,48 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
   const callbackUrl = `${deps.callbackBaseUrl.replace(/\/$/, "")}/functions/v1/meta-cloud-webhook?hcs=${rawCallbackSecret}`;
 
   // 11) Resposta — só o estritamente necessário. NUNCA o Meta Access
-  // Token, referência de Vault, service role, App Secret ou o HASH do
-  // segredo (só o valor bruto, e só agora — nenhuma segunda leitura
-  // possível depois desta resposta).
+  // Token, referência de Vault, service role, App Secret ou os HASHES dos
+  // dois segredos (só os valores BRUTOS, e só agora — nenhuma segunda
+  // leitura possível depois desta resposta). `verify_token` é devolvido
+  // SEPARADO da `callback_url` (nunca embutido nela) — é o valor que o
+  // administrador deve colar no campo "Verify Token" do painel HookCloud,
+  // nunca na URL de callback.
   return jsonResponse(201, {
     connection_id: connectionId,
     onboarding_state: onboardingState,
     callback_url: callbackUrl,
+    verify_token: rawVerifyToken,
     warnings: [
       "A URL de callback contém o segredo em texto — pode aparecer em logs de infraestrutura (proxies/CDN). Trate como sensível.",
-      "Este segredo é uma mitigação, não substitui HMAC — a Meta não permite header personalizado neste modo.",
-      "Este valor não será mostrado novamente. Se perdido, será necessário rotacionar o segredo numa fase futura.",
+      "O callback secret (na URL) e o verify_token (separado) são dois valores INDEPENDENTES — nunca use um no lugar do outro.",
+      "O callback secret é uma mitigação ao POST, não substitui HMAC — a Meta não permite header personalizado neste modo.",
+      "O verify_token só é exigido pela Meta uma vez, no momento em que o painel HookCloud configura o callback.",
+      "Nenhum dos dois valores será mostrado novamente. Se perdidos, será necessário rotacionar numa fase futura.",
       "A conexão foi criada como 'pending' — nenhuma mensagem pode ser enviada ou recebida até uma verificação posterior.",
     ],
   });
 }
 
-// ── Nota sobre o GET verify_token (decisão registrada, não implementada) ─
+// ── Nota sobre o GET verify_token — RESOLVIDO para HookCloud na Fase 14A ─
 //
-// O GET de verificação usa hoje um único META_WEBHOOK_VERIFY_TOKEN
-// PLATAFORMA-WIDE (compartilhado por TODAS as organizações desta
-// instalação — ver meta-cloud-webhook/index.ts, handleVerification,
-// intocado desde a Fase 2A). Retornar esse valor para um admin de UMA
-// organização divulgaria um segredo do qual a segurança de TODAS as
-// outras organizações também depende indiretamente — uma violação de
-// menor privilégio, mesmo que o verify_token em si tenha baixo risco
-// (só prova posse da URL de callback para a Meta, não autentica POSTs).
-// Esta ambiguidade operacional é registrada e NÃO resolvida por
-// improviso nesta fase — o valor NUNCA é incluído na resposta deste
-// endpoint. Uma fase futura própria deve decidir entre: (a) restringir a
-// exibição a super_admin apenas; (b) migrar para um verify_token por
-// organização/conexão (mudança estrutural maior, fora do escopo desta
-// fase); ou (c) manter como configuração manual feita fora deste fluxo.
+// A Fase 13A registrou esta lacuna como decisão pendente: o GET de
+// verificação usava (e para `direct_meta`/legado continua usando) um
+// único META_WEBHOOK_VERIFY_TOKEN PLATAFORMA-WIDE, o que impedia devolver
+// esse valor a um admin de uma única organização sem violar menor
+// privilégio.
+//
+// A Fase 14A resolveu isso ESPECIFICAMENTE para conexões HookCloud: cada
+// conexão agora tem seu PRÓPRIO `hookcloud_verify_token_hash`
+// (independente do callback secret), gerado e devolvido nesta mesma
+// resposta (`verify_token`, acima) — nunca o verify token global. O admin
+// cola este valor no campo "Verify Token" do painel HookCloud; o
+// `meta-cloud-webhook/index.ts` (Fase 14A, `handleHookCloudVerification`)
+// localiza a conexão pelo `hcs` e valida este token individualmente,
+// nunca contra o valor global.
+//
+// O verify token PLATAFORMA-WIDE (META_WEBHOOK_VERIFY_TOKEN) permanece
+// intocado e continua sendo a única opção para o caminho `direct_meta` —
+// não foi removido, pois pode haver consumidor legado.
 
 // ── Nota de integração (deliberadamente NÃO feita nesta fase) ───────────
 //

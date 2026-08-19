@@ -78,3 +78,42 @@ export function generateHookCloudCallbackSecret(): string {
   crypto.getRandomValues(bytes);
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+// FASE 14A — verify token individual por conexão HookCloud.
+//
+// Segredo INDEPENDENTE do callback secret acima: gerado por uma chamada
+// SEPARADA a `crypto.getRandomValues` (nunca deriva um do outro, nunca
+// reaproveita os mesmos bytes), com o mesmo formato (32 bytes = 256 bits,
+// hex, URL-safe por construção). Autentica EXCLUSIVAMENTE o GET
+// `hub.verify_token` — nunca participa da verificação do POST (essa
+// continua sendo só `verifyHookCloudWebhookSecret`, acima, inalterada).
+// Só o hash SHA-256 é persistido (ver migration 20260819300000, NÃO
+// aplicada); o valor bruto só existe em memória e na resposta única do
+// provisionamento/rotação.
+
+export function generateHookCloudVerifyToken(): string {
+  const bytes = new Uint8Array(RAW_SECRET_BYTES);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Hash SHA-256 (hex) do verify token bruto — é isto, nunca o valor bruto, que é armazenado. */
+export async function hashHookCloudVerifyToken(rawToken: string): Promise<string> {
+  return await sha256Hex(rawToken);
+}
+
+/**
+ * Compara o `hub.verify_token` recebido num GET contra o hash armazenado
+ * para a conexão, em tempo constante — mesmo padrão de
+ * `verifyHookCloudWebhookSecret`. `storedHash` ausente é tratado como
+ * "nenhum verify token configurado" — SEMPRE reprova.
+ */
+export async function verifyHookCloudVerifyToken(
+  rawTokenFromRequest: string | null | undefined,
+  storedHash: string | null | undefined,
+): Promise<boolean> {
+  if (!storedHash) return false;
+  if (!rawTokenFromRequest) return false;
+  const computedHash = await hashHookCloudVerifyToken(rawTokenFromRequest);
+  return timingSafeEqualHex(computedHash, storedHash);
+}

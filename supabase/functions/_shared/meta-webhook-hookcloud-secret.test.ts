@@ -8,9 +8,12 @@
 import { assert, assertEquals } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
   generateHookCloudCallbackSecret,
+  generateHookCloudVerifyToken,
+  hashHookCloudVerifyToken,
   hashHookCloudWebhookSecret,
   hasMinimumHookCloudSecretEntropy,
   MIN_HOOKCLOUD_SECRET_HEX_LENGTH,
+  verifyHookCloudVerifyToken,
   verifyHookCloudWebhookSecret,
 } from "./meta-webhook-hookcloud-secret.ts";
 
@@ -103,4 +106,85 @@ Deno.test("generateHookCloudCallbackSecret: o valor gerado é aceito pelo verifi
   const raw = generateHookCloudCallbackSecret();
   const hash = await hashHookCloudWebhookSecret(raw);
   assertEquals(await verifyHookCloudWebhookSecret(raw, hash), true);
+});
+
+// ─── FASE 14A — verify token individual por conexão (GET) ───────────────
+// Segredo INDEPENDENTE do callback secret — mesmo formato, gerado por uma
+// chamada separada a crypto.getRandomValues, nunca derivado/reaproveitado
+// do callback secret. Autentica exclusivamente o GET, nunca o POST.
+
+Deno.test("generateHookCloudVerifyToken: formato e entropia — 64 caracteres hex (256 bits)", () => {
+  const token = generateHookCloudVerifyToken();
+  assertEquals(token.length, MIN_HOOKCLOUD_SECRET_HEX_LENGTH);
+  assert(/^[0-9a-f]{64}$/.test(token), "deve ser hex minúsculo puro — URL-safe por construção");
+});
+
+Deno.test("generateHookCloudVerifyToken: CSPRNG gera valores distintos a cada chamada", () => {
+  const a = generateHookCloudVerifyToken();
+  const b = generateHookCloudVerifyToken();
+  assert(a !== b);
+});
+
+Deno.test("generateHookCloudVerifyToken: 100 gerações consecutivas nunca colidem", () => {
+  const seen = new Set<string>();
+  for (let i = 0; i < 100; i++) seen.add(generateHookCloudVerifyToken());
+  assertEquals(seen.size, 100);
+});
+
+Deno.test("callback secret e verify token gerados juntos NUNCA coincidem (independência real, não só nominal)", () => {
+  for (let i = 0; i < 50; i++) {
+    const callbackSecret = generateHookCloudCallbackSecret();
+    const verifyToken = generateHookCloudVerifyToken();
+    assert(callbackSecret !== verifyToken, "os dois segredos nunca podem ter o mesmo valor bruto");
+  }
+});
+
+Deno.test("verify token correto (mesmo hash) é aceito; incorreto é rejeitado", async () => {
+  const raw = generateHookCloudVerifyToken();
+  const hash = await hashHookCloudVerifyToken(raw);
+  assertEquals(await verifyHookCloudVerifyToken(raw, hash), true);
+  assertEquals(await verifyHookCloudVerifyToken("valor-errado", hash), false);
+});
+
+Deno.test("verify token: ausente na requisição ou hash ausente sempre rejeita", async () => {
+  const hash = await hashHookCloudVerifyToken("verify-token-real");
+  assertEquals(await verifyHookCloudVerifyToken(null, hash), false);
+  assertEquals(await verifyHookCloudVerifyToken(undefined, hash), false);
+  assertEquals(await verifyHookCloudVerifyToken("", hash), false);
+  assertEquals(await verifyHookCloudVerifyToken("qualquer-coisa", null), false);
+  assertEquals(await verifyHookCloudVerifyToken("qualquer-coisa", undefined), false);
+  assertEquals(await verifyHookCloudVerifyToken("qualquer-coisa", ""), false);
+});
+
+Deno.test("verify token: o callback secret NUNCA é aceito no lugar do verify token, e vice-versa (segredos não intercambiáveis)", async () => {
+  const callbackSecret = generateHookCloudCallbackSecret();
+  const verifyToken = generateHookCloudVerifyToken();
+  const callbackHash = await hashHookCloudWebhookSecret(callbackSecret);
+  const verifyTokenHash = await hashHookCloudVerifyToken(verifyToken);
+
+  // O callback secret bruto não é aceito contra o hash do verify token.
+  assertEquals(await verifyHookCloudVerifyToken(callbackSecret, verifyTokenHash), false);
+  // O verify token bruto não é aceito contra o hash do callback secret.
+  assertEquals(await verifyHookCloudWebhookSecret(verifyToken, callbackHash), false);
+});
+
+Deno.test("verify token: nenhuma função deste módulo chama console.* — o valor bruto nunca é logado", async () => {
+  const originalLog = console.log;
+  const originalError = console.error;
+  const originalWarn = console.warn;
+  let called = false;
+  console.log = () => { called = true; };
+  console.error = () => { called = true; };
+  console.warn = () => { called = true; };
+  try {
+    const raw = generateHookCloudVerifyToken();
+    const hash = await hashHookCloudVerifyToken(raw);
+    await verifyHookCloudVerifyToken(raw, hash);
+    await verifyHookCloudVerifyToken("errado", hash);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    console.warn = originalWarn;
+  }
+  assertEquals(called, false, "nenhuma função deste módulo deve chamar console.* em nenhuma circunstância");
 });

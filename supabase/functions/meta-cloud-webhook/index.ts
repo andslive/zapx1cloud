@@ -38,10 +38,20 @@
 //   qual dos motivos específicos causou a rejeição — evita enumeração de
 //   Phone Number ID, WABA ou organização).
 //
+// FASE 14A — GET individual por conexão HookCloud: quando a query string
+// traz `hcs`, o GET deixa de usar o verify token GLOBAL
+// (META_WEBHOOK_VERIFY_TOKEN) e passa a localizar exatamente uma conexão
+// pelo hash do `hcs` recebido, validando um `hookcloud_verify_token_hash`
+// PRÓPRIO dessa conexão (segredo independente do callback secret usado no
+// POST). `handleVerification` (o caminho global) continua byte a byte
+// inalterado e é o único caminho quando `hcs` está ausente — nunca
+// removido, porque pode haver consumidor legado/direct_meta.
+//
 // Responsabilidades desta fase, e SOMENTE estas:
 //   1) GET  → verificação do webhook (hub.mode/hub.verify_token/hub.challenge)
-//             — inalterado; não tem nenhuma noção de conexão/Phone Number
-//             ID, então não pode, por construção, vazar essa informação.
+//             — via verify token global (sem `hcs`) OU via verify token
+//             individual por conexão (com `hcs`, Fase 14A). Nenhum dos
+//             dois caminhos executa ação de negócio.
 //   2) POST → capturar o corpo BRUTO antes de qualquer parse; extrair só
 //      os dois identificadores mínimos não confiáveis (entry.id,
 //      metadata.phone_number_id) para localizar a conexão candidata;
@@ -74,7 +84,11 @@ import {
   parseMetaCloudOnboardingSource,
   UnknownMetaCloudOnboardingSourceError,
 } from "../_shared/whatsapp-provider/meta-onboarding-source.ts";
-import { verifyHookCloudWebhookSecret } from "../_shared/meta-webhook-hookcloud-secret.ts";
+import {
+  hashHookCloudWebhookSecret,
+  verifyHookCloudVerifyToken,
+  verifyHookCloudWebhookSecret,
+} from "../_shared/meta-webhook-hookcloud-secret.ts";
 import { resolveHookCloudPilotConnectionIds, resolveHookCloudWebhookMode } from "../_shared/meta-webhook-hookcloud-mode.ts";
 import { evaluateHookCloudWebhookGate } from "../_shared/meta-webhook-hookcloud-gate.ts";
 import {
@@ -198,6 +212,8 @@ export interface MetaCloudConnectionCandidate {
   onboardingState: string;
   onboardingSourceRaw: string | null;
   hookcloudSecretHash: string | null;
+  /** FASE 14A — hash do verify token individual (autentica só o GET). Independente de hookcloudSecretHash (POST). */
+  hookcloudVerifyTokenHash: string | null;
 }
 
 /** Superfície mínima para a consulta de lookup — separada de `LedgerSupabaseLike` (só insert). */
@@ -217,18 +233,20 @@ export interface MetaCloudLookupSupabaseLike {
  * em profundidade, mesmo padrão já usado em `resolve.ts` para
  * `organization_id`, nunca confiar só na constraint do banco).
  */
-export async function resolveMetaCloudConnectionCandidates(
+const META_CLOUD_CANDIDATE_COLUMNS =
+  "evolution_instance_id, organization_id, waba_id, phone_number_id, onboarding_state, onboarding_source, hookcloud_webhook_secret_hash, hookcloud_verify_token_hash";
+
+/**
+ * Constrói candidatos a partir de linhas de `evolution_instances_meta_cloud`
+ * já buscadas — compartilhado pelos dois lookups (por phone_number_id,
+ * usado no POST, e por hookcloud_webhook_secret_hash, usado no GET
+ * individual da Fase 14A), para nunca duplicar a lógica de resolução de
+ * `provider`/retrocompatibilidade.
+ */
+async function hydrateCandidates(
   supabase: MetaCloudLookupSupabaseLike,
-  phoneNumberId: string,
+  metaRows: any[],
 ): Promise<MetaCloudConnectionCandidate[]> {
-  const { data: metaRows, error: metaError } = await supabase
-    .from("evolution_instances_meta_cloud")
-    .select("evolution_instance_id, organization_id, waba_id, phone_number_id, onboarding_state, onboarding_source, hookcloud_webhook_secret_hash")
-    .eq("phone_number_id", phoneNumberId);
-
-  if (metaError) throw new Error(`lookup_error_${metaError.code ?? "unknown"}`);
-  if (!metaRows || metaRows.length === 0) return [];
-
   const candidates: MetaCloudConnectionCandidate[] = [];
   for (const row of metaRows) {
     const { data: connRows, error: connError } = await supabase
@@ -250,9 +268,48 @@ export async function resolveMetaCloudConnectionCandidates(
       onboardingState: String(row.onboarding_state),
       onboardingSourceRaw: row.onboarding_source ?? null,
       hookcloudSecretHash: row.hookcloud_webhook_secret_hash ?? null,
+      hookcloudVerifyTokenHash: row.hookcloud_verify_token_hash ?? null,
     });
   }
   return candidates;
+}
+
+export async function resolveMetaCloudConnectionCandidates(
+  supabase: MetaCloudLookupSupabaseLike,
+  phoneNumberId: string,
+): Promise<MetaCloudConnectionCandidate[]> {
+  const { data: metaRows, error: metaError } = await supabase
+    .from("evolution_instances_meta_cloud")
+    .select(META_CLOUD_CANDIDATE_COLUMNS)
+    .eq("phone_number_id", phoneNumberId);
+
+  if (metaError) throw new Error(`lookup_error_${metaError.code ?? "unknown"}`);
+  if (!metaRows || metaRows.length === 0) return [];
+  return await hydrateCandidates(supabase, metaRows);
+}
+
+// ── FASE 14A — resolução por hash do callback secret (GET individual) ───
+// O GET oficial da Meta não inclui nenhum identificador de conexão além
+// da própria URL (não há phone_number_id/WABA no corpo — só
+// hub.mode/hub.verify_token/hub.challenge). Por isso o `hcs` da query
+// string é o ÚNICO identificador disponível para localizar exclusivamente
+// a conexão HookCloud: em vez de comparar o segredo bruto em memória
+// contra N candidatos, ele já FUNCIONA como chave de busca (hash SHA-256
+// determinístico do segredo — mesmo princípio de um token de sessão
+// opaco), reduzindo a zero ou exatamente uma conexão candidata antes de
+// qualquer outra checagem.
+export async function resolveMetaCloudConnectionByCallbackSecretHash(
+  supabase: MetaCloudLookupSupabaseLike,
+  callbackSecretHash: string,
+): Promise<MetaCloudConnectionCandidate[]> {
+  const { data: metaRows, error: metaError } = await supabase
+    .from("evolution_instances_meta_cloud")
+    .select(META_CLOUD_CANDIDATE_COLUMNS)
+    .eq("hookcloud_webhook_secret_hash", callbackSecretHash);
+
+  if (metaError) throw new Error(`lookup_error_${metaError.code ?? "unknown"}`);
+  if (!metaRows || metaRows.length === 0) return [];
+  return await hydrateCandidates(supabase, metaRows);
 }
 
 // ── Verificação (GET) ────────────────────────────────────────────────────
@@ -275,6 +332,114 @@ export function handleVerification(req: Request, env: { get(key: string): string
   return new Response("Forbidden", { status: 403 });
 }
 
+// ── FASE 14A — GET individual por conexão HookCloud ──────────────────────
+// Caminho NOVO, só alcançado quando a query string traz `hcs` (o mesmo
+// parâmetro já usado no POST para o callback secret — nenhum segundo
+// parâmetro inventado). `handleVerification` acima permanece
+// BYTE A BYTE inalterada e continua sendo o único caminho para
+// `direct_meta`/legado (ausência de `hcs`) — o verify token global
+// (META_WEBHOOK_VERIFY_TOKEN) não foi removido nem por este caminho: ele
+// só deixa de ser usado quando `hcs` está presente, nunca é substituído
+// globalmente.
+//
+// Falha fechada, resposta UNIFORME em todo motivo de rejeição — nunca
+// revela se: a conexão existe; o hcs está correto/incorreto; o verify
+// token está correto/incorreto; a organização; o WABA ou o Phone Number
+// ID. Nenhuma ação de negócio é executada aqui — só localizar a conexão,
+// validar dois segredos independentes, e devolver o challenge.
+
+const HOOKCLOUD_GET_COMPATIBLE_ONBOARDING_STATES = new Set(["pending", "active"]);
+
+function hookCloudForbidden(): Response {
+  return new Response("Forbidden", { status: 403 });
+}
+
+export interface HookCloudVerificationDeps {
+  /** Localiza a(s) conexão(ões) cujo hookcloud_webhook_secret_hash bate com o hash do `hcs` recebido. */
+  resolveConnectionByCallbackSecretHash: (callbackSecretHash: string) => Promise<MetaCloudConnectionCandidate[]>;
+}
+
+export async function handleHookCloudVerification(
+  req: Request,
+  hcs: string,
+  deps: HookCloudVerificationDeps,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const mode = url.searchParams.get("hub.mode");
+  const verifyToken = url.searchParams.get("hub.verify_token");
+  const challenge = url.searchParams.get("hub.challenge");
+
+  if (mode !== "subscribe" || !verifyToken) {
+    return hookCloudForbidden();
+  }
+
+  // O hcs recebido JÁ É a chave de busca (hash determinístico) — não há
+  // comparação byte a byte de segredo bruto aqui contra N candidatos; a
+  // consulta ao banco por igualdade de hash reduz a zero ou exatamente
+  // uma linha antes de qualquer outra checagem.
+  const callbackSecretHash = await hashHookCloudWebhookSecret(hcs);
+
+  let candidates: MetaCloudConnectionCandidate[];
+  try {
+    candidates = await deps.resolveConnectionByCallbackSecretHash(callbackSecretHash);
+  } catch {
+    return hookCloudForbidden();
+  }
+  // Resposta uniforme para zero OU múltiplas conexões — nunca distingue
+  // as duas (mesma exigência de anti-enumeração já aplicada ao POST).
+  if (candidates.length !== 1) {
+    return hookCloudForbidden();
+  }
+  const candidate = candidates[0];
+
+  if (candidate.provider !== "meta_cloud") {
+    return hookCloudForbidden();
+  }
+
+  let onboardingSource: "hookcloud" | "direct_meta" | null;
+  try {
+    onboardingSource = parseMetaCloudOnboardingSource(candidate.onboardingSourceRaw);
+  } catch {
+    return hookCloudForbidden();
+  }
+  if (onboardingSource !== "hookcloud") {
+    return hookCloudForbidden();
+  }
+
+  if (!HOOKCLOUD_GET_COMPATIBLE_ONBOARDING_STATES.has(candidate.onboardingState)) {
+    return hookCloudForbidden();
+  }
+
+  // O verify token NUNCA autentica sozinho — o hcs já precisou localizar
+  // exatamente 1 conexão antes de chegarmos aqui. E o callback secret
+  // (hcs) sozinho também nunca basta: sem um hub.verify_token válido para
+  // ESSA MESMA conexão, o GET continua sendo rejeitado.
+  const verifyTokenValid = await verifyHookCloudVerifyToken(verifyToken, candidate.hookcloudVerifyTokenHash);
+  if (!verifyTokenValid) {
+    return hookCloudForbidden();
+  }
+
+  return new Response(challenge ?? "", { status: 200 });
+}
+
+/** Decide entre o GET individual HookCloud (`hcs` presente) e o GET global inalterado (`hcs` ausente). */
+export async function handleGetRequest(req: Request, deps: HandleInboundEventDeps): Promise<Response> {
+  const url = new URL(req.url);
+  const hcs = url.searchParams.get("hcs");
+  if (!hcs) {
+    return handleVerification(req);
+  }
+  if (!deps.resolveConnectionByCallbackSecretHash) {
+    // Dependência não injetada (ex.: ambiente real ainda sem wiring) —
+    // falha fechada, mesma resposta uniforme, nunca cai para o verify
+    // token global (isso misturaria os dois modos).
+    return hookCloudForbidden();
+  }
+  return await handleHookCloudVerification(req, hcs, {
+    resolveConnectionByCallbackSecretHash: deps.resolveConnectionByCallbackSecretHash,
+  });
+}
+
 // ── Evento inbound (POST) ────────────────────────────────────────────────
 
 export interface HandleInboundEventDeps {
@@ -288,6 +453,8 @@ export interface HandleInboundEventDeps {
   hookCloudEnv?: { get(key: string): string | undefined };
   /** Só para teste — substitui isMetaCloudApiEnabled (flag por organização) sem precisar mockar uma consulta completa. */
   isOrganizationAllowedForMetaCloud?: (organizationId: string) => Promise<boolean>;
+  /** FASE 14A — localiza a conexão candidata pelo hash do callback secret, usado exclusivamente pelo GET individual HookCloud (`hcs` na query string). Opcional: ausente => GET com `hcs` falha fechado (nunca cai para o verify token global). */
+  resolveConnectionByCallbackSecretHash?: (callbackSecretHash: string) => Promise<MetaCloudConnectionCandidate[]>;
 }
 
 function jsonError(status: number, code: string): Response {
@@ -595,7 +762,7 @@ async function processHookCloudEvent(
 // ── Roteamento por método HTTP (testável separadamente do entry point) ──
 
 export async function routeRequest(req: Request, deps: HandleInboundEventDeps): Promise<Response> {
-  if (req.method === "GET") return handleVerification(req);
+  if (req.method === "GET") return handleGetRequest(req, deps);
   if (req.method === "POST") return handleInboundEvent(req, deps);
   return new Response("Method Not Allowed", { status: 405 });
 }
@@ -613,6 +780,8 @@ if (import.meta.main) {
       appSecret: Deno.env.get("META_APP_SECRET"),
       resolveConnectionCandidates: (phoneNumberId) =>
         resolveMetaCloudConnectionCandidates(realSupabase as unknown as MetaCloudLookupSupabaseLike, phoneNumberId),
+      resolveConnectionByCallbackSecretHash: (callbackSecretHash) =>
+        resolveMetaCloudConnectionByCallbackSecretHash(realSupabase as unknown as MetaCloudLookupSupabaseLike, callbackSecretHash),
     });
   });
 }
