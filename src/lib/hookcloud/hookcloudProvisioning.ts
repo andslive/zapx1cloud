@@ -237,7 +237,12 @@ export function isTrustedHookCloudCallbackUrl(url: string, expectedOrigin: strin
  * `invoke`) produz `FunctionsFetchError`/`AbortError` pelo mesmo
  * caminho — também ambíguo. Ver Fase 18A, Parte 5.
  */
-function extractResponseStatus(context: unknown): number | undefined {
+// FASE 18G — exportadas (eram privadas do módulo) para reuso exato por
+// `hookcloudRotation.ts`: mesmo SDK, mesmo formato real de erro
+// (`FunctionsHttpError`/`FunctionsFetchError`/`FunctionsRelayError`),
+// mesma regra de nunca reler o corpo/nunca expor texto bruto — evita
+// duas implementações que podem divergir silenciosamente.
+export function extractResponseStatus(context: unknown): number | undefined {
   if (context && typeof context === 'object' && 'status' in context) {
     const status = (context as Record<string, unknown>).status;
     return typeof status === 'number' ? status : undefined;
@@ -246,7 +251,7 @@ function extractResponseStatus(context: unknown): number | undefined {
 }
 
 /** Lê o corpo JSON do `Response` de erro UMA ÚNICA VEZ — nunca relê, nunca expõe o corpo bruto, só o campo `error` (código curto). */
-async function extractErrorCodeFromResponse(context: unknown): Promise<string> {
+export async function extractErrorCodeFromResponse(context: unknown): Promise<string> {
   if (!context || typeof context !== 'object' || typeof (context as Record<string, unknown>).json !== 'function') {
     return 'unknown_error';
   }

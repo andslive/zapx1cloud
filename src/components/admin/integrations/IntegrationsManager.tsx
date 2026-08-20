@@ -26,6 +26,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useAuth } from '@/hooks/useAuth';
 import { useHookCloudPilotAccess } from '@/hooks/useHookCloudPilotAccess';
 import { useBlockInternalNavigationWhileSensitive } from '@/hooks/useBlockInternalNavigationWhileSensitive';
+import { useBlockBrowserHistoryWhileSensitive } from '@/hooks/useBlockBrowserHistoryWhileSensitive';
 import { hookCloudLifecycleBlockMessage, type HookCloudSensitiveLifecycle } from '@/lib/hookcloud/hookcloudProvisioning';
 
 type StatusFilter = 'all' | 'active' | 'inactive' | 'coming_soon';
@@ -84,6 +85,15 @@ export function IntegrationsManager() {
   // `useBlockInternalNavigationWhileSensitive` para o porquê do
   // mecanismo (roteador declarativo, sem `useBlocker` disponível).
   useBlockInternalNavigationWhileSensitive(hookCloudLifecycle !== 'idle', () => {
+    const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
+    if (warning) toast.warning(warning);
+  });
+
+  // FASE 18G — também intercepta voltar/avançar do navegador enquanto o
+  // segredo não foi confirmado. Ver `useBlockBrowserHistoryWhileSensitive`
+  // para o mecanismo exato (uso normal e público de `history.pushState`,
+  // nunca um monkey-patch da função nativa).
+  useBlockBrowserHistoryWhileSensitive(hookCloudLifecycle !== 'idle', () => {
     const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
     if (warning) toast.warning(warning);
   });

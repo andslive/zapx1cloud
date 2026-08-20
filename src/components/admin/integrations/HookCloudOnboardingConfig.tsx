@@ -56,6 +56,7 @@ import {
   type HookCloudSensitiveLifecycle,
 } from '@/lib/hookcloud/hookcloudProvisioning';
 import { getHookCloudCallbackExpectedOrigin } from '@/lib/hookcloud/hookcloudRuntimeConfig';
+import { useBlockPageUnloadWhileSensitive } from '@/hooks/useBlockPageUnloadWhileSensitive';
 import { HookCloudSecretRevealModal } from './HookCloudSecretRevealModal';
 
 const EMPTY_VALUES: HookCloudOnboardingFormValues = {
@@ -140,28 +141,15 @@ export function HookCloudOnboardingConfig({ onSensitiveLifecycleChange }: HookCl
     if (changed) submissionIdentityRef.current = null;
   }, [user?.id, profile?.organization_id]);
 
-  // Proteção genérica contra fechar/recarregar a aba enquanto uma
-  // submissão está em andamento ou um segredo ainda não foi confirmado
-  // como salvo. Usa a API nativa do navegador (`beforeunload`) — nenhuma
-  // dependência nova, nenhum segredo/dado digitado entra na mensagem (o
-  // texto do prompt de confirmação é controlado inteiramente pelo
-  // navegador, não pelo `returnValue`, em todos os browsers modernos).
-  // Isso cobre fechar a aba/recarregar; bloquear navegação SPA (troca de
-  // rota via React Router) exigiria um guard de rota — este projeto usa
-  // `BrowserRouter` (não o data router `createBrowserRouter`), que não
-  // expõe `useBlocker`, e não é justificável adicionar uma dependência
-  // nova só para isso. Limitação registrada explicitamente no relatório
-  // da Fase 18B: navegação SPA para outra tela não é bloqueada, só o
-  // fechamento/recarregamento da aba.
-  useEffect(() => {
-    if (lifecycle === 'idle') return;
-    const handler = (e: BeforeUnloadEvent) => {
-      e.preventDefault();
-      e.returnValue = '';
-    };
-    window.addEventListener('beforeunload', handler);
-    return () => window.removeEventListener('beforeunload', handler);
-  }, [lifecycle]);
+  // Fase 18B: cobre fechar/recarregar a aba. Fase 18F/18G: navegação SPA
+  // interna (`<Link>`/`<a>`) e voltar/avançar do navegador agora também
+  // são bloqueados — ver `IntegrationsManager.tsx`, que já intercepta
+  // isso no nível da página (`useBlockInternalNavigationWhileSensitive`/
+  // `useBlockBrowserHistoryWhileSensitive`); `navigate()` programático
+  // (fora de um clique em `<a>`) permanece sem bloqueio confiável sem
+  // migrar o roteador — limitação registrada no relatório da Fase 18G,
+  // mitigada pela UI de rotação de credenciais (Alternativa B).
+  useBlockPageUnloadWhileSensitive(lifecycle !== 'idle');
 
   const handleChange = (field: keyof HookCloudOnboardingFormValues) => (e: React.ChangeEvent<HTMLInputElement>) => {
     setValues((v) => ({ ...v, [field]: e.target.value }));
