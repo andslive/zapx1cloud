@@ -60,6 +60,7 @@ import { useWhatsAppInstances } from '@/hooks/useWhatsAppInstances';
 import { Globe, Package, Smartphone, Compass, BookOpen, Hand } from 'lucide-react';
 import { AgentWelcomeMenuTab } from './AgentWelcomeMenuTab';
 import { AgentHumanizationTab, DEFAULT_HUMANIZATION } from './AgentHumanizationTab';
+import { filterUazapiOnlyConnections } from '@/lib/whatsapp/connectionProviderView';
 
 interface AgentEditorProps {
   open: boolean;
@@ -137,6 +138,11 @@ export function AgentEditor({
   const { isGenerating, generateAgent, optimizeField } = useGenerateAgentAI();
   const { data: products } = useProducts();
   const { data: evolutionInstances } = useWhatsAppInstances();
+  // FASE 18F — persiste `evolution_instance_id` no agente (restringe por
+  // qual conexão ele responde) — uma conexão Meta/HookCloud pendente
+  // nunca pode aparecer como opção. `evolutionInstances` continua
+  // completo só para resolver/exibir a conexão JÁ salva (abaixo).
+  const eligibleEvolutionInstances = filterUazapiOnlyConnections(evolutionInstances || []);
 
   // Global agent types are forced to no product
   const GLOBAL_TYPES: AgentType[] = ['admin', 'support', 'financial', 'orchestrator'];
@@ -1063,7 +1069,7 @@ export function AgentEditor({
                           <span>Qualquer conexão (padrão)</span>
                         </div>
                       </SelectItem>
-                      {(evolutionInstances || []).map((inst) => {
+                      {eligibleEvolutionInstances.map((inst) => {
                         const connected = inst.status === 'connected' || inst.status === 'paired';
                         return (
                           <SelectItem key={inst.id} value={inst.id}>
@@ -1084,7 +1090,7 @@ export function AgentEditor({
                           </SelectItem>
                         );
                       })}
-                      {(!evolutionInstances || evolutionInstances.length === 0) && (
+                      {eligibleEvolutionInstances.length === 0 && (
                         <div className="px-2 py-3 text-xs text-muted-foreground">
                           Nenhuma conexão WhatsApp cadastrada.
                         </div>

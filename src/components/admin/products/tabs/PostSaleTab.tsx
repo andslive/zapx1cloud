@@ -8,6 +8,7 @@ import { useSectors } from '@/hooks/useSectors';
 import { useTeamMembers } from '@/hooks/useTeam';
 import { useAuth } from '@/hooks/useAuth';
 import { useWhatsAppInstances } from '@/hooks/useWhatsAppInstances';
+import { filterUazapiOnlyConnections } from '@/lib/whatsapp/connectionProviderView';
 
 import { supabase } from '@/integrations/supabase/client';
 import { useQuery } from '@tanstack/react-query';
@@ -337,7 +338,8 @@ function EventCard({ productId, event, existing, agents, templates, stages, tags
                         <SelectTrigger><SelectValue placeholder="Instância padrão da organização" /></SelectTrigger>
                         <SelectContent>
                           <SelectItem value={NONE}>Instância padrão (automático)</SelectItem>
-                          {(evolutionInstances || []).map((inst) => (
+                          {/* FASE 18F — persiste `evolution_instance_id` no envio pós-venda automatizado; uma conexão Meta/HookCloud pendente nunca pode aparecer aqui. */}
+                          {filterUazapiOnlyConnections(evolutionInstances || []).map((inst) => (
                             <SelectItem key={inst.id} value={inst.id}>
                               {inst.name}{inst.phone_number ? ` · ${inst.phone_number}` : ''}
                             </SelectItem>
