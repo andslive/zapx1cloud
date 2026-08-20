@@ -45,6 +45,58 @@ Deno.test("resolveHookCloudAdminAllowedOrigins: espaço interno na origem não �
   assertEquals(origins.has(" https://admin.x1zap.com"), false);
 });
 
+// ── FASE 17A (achado de revisão) — validação de formato da origem ───────
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: entrada com path é descartada (nunca aceita como origem literal)", () => {
+  const origins = resolveHookCloudAdminAllowedOrigins(fakeEnv("https://admin.x1zap.com/algum/caminho"));
+  assertEquals(origins.size, 0);
+});
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: entrada com query string é descartada", () => {
+  const origins = resolveHookCloudAdminAllowedOrigins(fakeEnv("https://admin.x1zap.com?x=1"));
+  assertEquals(origins.size, 0);
+});
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: entrada com fragmento é descartada", () => {
+  const origins = resolveHookCloudAdminAllowedOrigins(fakeEnv("https://admin.x1zap.com#secao"));
+  assertEquals(origins.size, 0);
+});
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: entrada com credenciais embutidas (user:pass@) é descartada", () => {
+  const origins = resolveHookCloudAdminAllowedOrigins(fakeEnv("https://user:pass@admin.x1zap.com"));
+  assertEquals(origins.size, 0);
+});
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: HTTP num domínio de produção é descartado (exige HTTPS)", () => {
+  const origins = resolveHookCloudAdminAllowedOrigins(fakeEnv("http://admin.x1zap.com"));
+  assertEquals(origins.size, 0);
+});
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: HTTP em 127.0.0.1/localhost é aceito — exceção explícita e restrita de desenvolvimento, nunca heurística ampla", () => {
+  const origins = resolveHookCloudAdminAllowedOrigins(fakeEnv("http://127.0.0.1:54321,http://localhost:3000"));
+  assertEquals(origins.has("http://127.0.0.1:54321"), true);
+  assertEquals(origins.has("http://localhost:3000"), true);
+  assertEquals(origins.size, 2);
+});
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: HTTP em outro host de loopback-like (ex.: 127.0.0.2) NÃO é aceito — exceção é só os dois hosts exatos, nunca uma faixa", () => {
+  const origins = resolveHookCloudAdminAllowedOrigins(fakeEnv("http://127.0.0.2:54321"));
+  assertEquals(origins.size, 0);
+});
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: entrada sintaticamente inválida (não é uma URL) é descartada sem lançar exceção", () => {
+  const origins = resolveHookCloudAdminAllowedOrigins(fakeEnv("nao-e-uma-url-valida, , https://admin.x1zap.com"));
+  assertEquals(origins.has("https://admin.x1zap.com"), true);
+  assertEquals(origins.size, 1);
+});
+
+Deno.test("resolveHookCloudAdminAllowedOrigins: origem HTTPS válida sem barra final e com barra final normalizam para o mesmo valor canônico", () => {
+  const withSlash = resolveHookCloudAdminAllowedOrigins(fakeEnv("https://admin.x1zap.com/"));
+  const withoutSlash = resolveHookCloudAdminAllowedOrigins(fakeEnv("https://admin.x1zap.com"));
+  assertEquals([...withSlash], [...withoutSlash]);
+  assertEquals([...withSlash], ["https://admin.x1zap.com"]);
+});
+
 // ── Decisão CORS ──────────────────────────────────────────────────────
 
 Deno.test("buildCorsDecision: sem header Origin => allowed=true, sem cabeçalhos CORS (contexto servidor-servidor)", () => {
@@ -167,6 +219,27 @@ Deno.test("readJsonBodyWithLimit: corpo acima do limite SEM Content-Length (stre
   const result = await readJsonBodyWithLimit(req, HOOKCLOUD_ADMIN_MAX_BODY_BYTES);
   assertEquals(result.ok, false);
   if (!result.ok) assertEquals(result.reason, "too_large");
+});
+
+Deno.test("readJsonBodyWithLimit: FASE 17A — bytes UTF-8 inválidos são rejeitados (reason='invalid_utf8'), nunca silenciosamente substituídos por U+FFFD", async () => {
+  // 0xFF 0xFE não é uma sequência UTF-8 válida em nenhum contexto.
+  const invalidUtf8 = new Uint8Array([0x7b, 0x22, 0x61, 0x22, 0x3a, 0xff, 0xfe, 0x7d]); // '{"a":<bytes inválidos>}'
+  const req = new Request("https://x/endpoint", {
+    method: "POST",
+    headers: { "content-type": "application/json", "content-length": String(invalidUtf8.byteLength) },
+    body: invalidUtf8,
+  });
+  const result = await readJsonBodyWithLimit(req, HOOKCLOUD_ADMIN_MAX_BODY_BYTES);
+  assertEquals(result.ok, false);
+  if (!result.ok) assertEquals(result.reason, "invalid_utf8");
+});
+
+Deno.test("readJsonBodyWithLimit: UTF-8 multi-byte válido (acentuação/emoji) continua funcionando normalmente", async () => {
+  const text = JSON.stringify({ nome: "conexão administrada 🔐" });
+  const req = requestWithBufferedBody(text);
+  const result = await readJsonBodyWithLimit(req, HOOKCLOUD_ADMIN_MAX_BODY_BYTES);
+  assert(result.ok);
+  if (result.ok) assertEquals(result.text, text);
 });
 
 Deno.test("readJsonBodyWithLimit: Content-Length mentiroso (declara menos do que o corpo real) não engana o limite — a leitura do stream real prevalece", async () => {

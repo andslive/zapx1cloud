@@ -397,9 +397,21 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
 // permitido, origem CORS, Content-Type, e tamanho do corpo — nunca
 // autenticação, nunca banco, nunca segredo.
 
-export interface RouteProvisionConnectionRequestDeps extends ProvisionHookCloudConnectionDeps {
+export interface RouteProvisionConnectionRequestDeps {
   /** Allowlist real de origens administrativas — injetável para teste. */
   allowedOrigins: ReadonlySet<string>;
+  /**
+   * FASE 17A (achado de revisão): construído SOB DEMANDA, só depois que
+   * o roteamento já validou método, CORS, Content-Type e corpo — nunca
+   * antes. Antes desta correção, o entry point real construía os
+   * clientes Supabase (incluindo o de `service_role`, o mais
+   * privilegiado do sistema) para TODA requisição recebida, mesmo as
+   * que seriam rejeitadas por método errado, origem fora da allowlist,
+   * ou corpo inválido — desperdício de recurso e superfície
+   * desnecessária. Agora, nenhuma requisição rejeitada chega a
+   * construir nenhum cliente Supabase.
+   */
+  buildHandlerDeps: () => ProvisionHookCloudConnectionDeps;
 }
 
 const ALLOWED_METHODS_HEADER = "POST, OPTIONS";
@@ -450,7 +462,11 @@ export async function routeProvisionConnectionRequest(
   const bodyResult = await readJsonBodyWithLimit(req, HOOKCLOUD_ADMIN_MAX_BODY_BYTES);
   if (!bodyResult.ok) {
     const status = bodyResult.reason === "too_large" ? 413 : 400;
-    const error = bodyResult.reason === "too_large" ? "payload_too_large" : "empty_body";
+    const error = bodyResult.reason === "too_large"
+      ? "payload_too_large"
+      : bodyResult.reason === "invalid_utf8"
+      ? "invalid_encoding"
+      : "empty_body";
     return new Response(JSON.stringify({ error }), {
       status,
       headers: { ...cors.headers, ...NO_STORE_HEADERS, "Content-Type": "application/json" },
@@ -468,7 +484,10 @@ export async function routeProvisionConnectionRequest(
   // integralmente lido em memória (nunca uma segunda leitura do stream
   // original, que já foi consumido acima por `readJsonBodyWithLimit`).
   const forwardedReq = new Request(req.url, { method: "POST", headers: req.headers, body: bodyResult.text });
-  const innerResponse = await handleProvisionRequest(forwardedReq, deps);
+  // FASE 17A: só agora — com método, CORS, Content-Type e corpo já
+  // validados — o cliente privilegiado (service_role) é construído.
+  const handlerDeps = deps.buildHandlerDeps();
+  const innerResponse = await handleProvisionRequest(forwardedReq, handlerDeps);
 
   // Camada final: aplica CORS real + no-store por cima do que o handler
   // já decidiu (status/corpo do handler NUNCA são alterados aqui).
@@ -492,7 +511,7 @@ if (import.meta.main) {
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
-  const callbackBaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+  const callbackBaseUrl = supabaseUrl ?? "";
   const allowedOrigins = resolveHookCloudAdminAllowedOrigins();
 
   Deno.serve(async (req) => {
@@ -505,18 +524,25 @@ if (import.meta.main) {
         headers: { ...NO_STORE_HEADERS, "Content-Type": "application/json" },
       });
     }
-    const authHeader = req.headers.get("authorization") ?? "";
-    const userClient = createClient(supabaseUrl, anonKey, {
-      global: { headers: { Authorization: authHeader } },
-    });
-    const adminClient = createClient(supabaseUrl, serviceRoleKey);
 
     return await routeProvisionConnectionRequest(req, {
-      authClient: userClient.auth as unknown as AuthClientLike,
-      adminClient: adminClient as unknown as AdminSupabaseLike,
-      tokenValidator: createNoopMetaAccessTokenValidator(),
-      callbackBaseUrl,
       allowedOrigins,
+      // FASE 17A: só chamado pelo roteador DEPOIS de método/CORS/
+      // Content-Type/corpo já validados — nenhuma requisição rejeitada
+      // chega a construir o cliente `service_role`.
+      buildHandlerDeps: () => {
+        const authHeader = req.headers.get("authorization") ?? "";
+        const userClient = createClient(supabaseUrl, anonKey, {
+          global: { headers: { Authorization: authHeader } },
+        });
+        const adminClient = createClient(supabaseUrl, serviceRoleKey);
+        return {
+          authClient: userClient.auth as unknown as AuthClientLike,
+          adminClient: adminClient as unknown as AdminSupabaseLike,
+          tokenValidator: createNoopMetaAccessTokenValidator(),
+          callbackBaseUrl,
+        };
+      },
     });
   });
 }

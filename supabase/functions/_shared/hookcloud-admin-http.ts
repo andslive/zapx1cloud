@@ -36,15 +36,51 @@ export const CREDENTIAL_RESPONSE_HEADERS: Readonly<Record<string, string>> = Obj
 });
 
 /**
+ * FASE 17A (achado de revisão): confirma que `candidate` é uma origem
+ * bem formada — exatamente `scheme://host[:port]`, nunca path, query,
+ * fragmento ou credenciais embutidas (uma origem real de navegador,
+ * enviada no header `Origin`, nunca tem nenhum desses componentes; uma
+ * entrada de configuração que os tivesse nunca combinaria com um
+ * `Origin` real de qualquer forma — mas antes desta correção era aceita
+ * silenciosamente na allowlist como uma entrada "morta", em vez de
+ * rejeitada explicitamente). Exige HTTPS, com a MESMA exceção restrita
+ * já usada em `isTrustedCallbackBaseUrl` (`hookcloud-provision-connection`)
+ * para desenvolvimento local — nunca uma heurística ampla, só
+ * `127.0.0.1`/`localhost` em HTTP.
+ */
+function isWellFormedAdministrativeOrigin(candidate: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return false;
+  }
+  if (parsed.pathname !== "/" && parsed.pathname !== "") return false;
+  if (parsed.search !== "") return false;
+  if (parsed.hash !== "") return false;
+  if (parsed.username !== "" || parsed.password !== "") return false;
+  if (parsed.protocol === "https:") return true;
+  if (parsed.protocol === "http:" && (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost")) return true;
+  return false;
+}
+
+/**
  * Allowlist exata de origens administrativas, lida de
  * `HOOKCLOUD_ADMIN_ALLOWED_ORIGINS` (lista separada por vírgulas).
  * Normaliza SOMENTE espaços externos de cada entrada — nunca interpreta
  * substring, wildcard ou regex. Uma entrada literal `"*"` é
  * deliberadamente descartada (defesa contra configuração acidentalmente
  * permissiva) — esta allowlist nunca aceita "qualquer origem" por
- * construção. Variável ausente/vazia => allowlist vazia => toda
- * requisição de navegador com `Origin` falha fechada (nenhuma origem é
- * permitida por padrão).
+ * construção. Entradas malformadas (path/query/fragmento/credenciais
+ * embutidas, esquema inseguro fora da exceção de desenvolvimento local)
+ * são descartadas, nunca aceitas como uma "origem" literal qualquer.
+ * Entradas válidas são normalizadas para a forma canônica
+ * `scheme://host[:port]` via `URL.origin` (nunca reescreve o HOST em si
+ * — só remove uma eventual barra final redundante), que é exatamente o
+ * formato que o header `Origin` real de um navegador sempre tem.
+ * Variável ausente/vazia => allowlist vazia => toda requisição de
+ * navegador com `Origin` falha fechada (nenhuma origem é permitida por
+ * padrão).
  */
 export function resolveHookCloudAdminAllowedOrigins(
   env: { get(key: string): string | undefined } = Deno.env,
@@ -53,7 +89,9 @@ export function resolveHookCloudAdminAllowedOrigins(
   const origins = raw
     .split(",")
     .map((s) => s.trim())
-    .filter((s) => s.length > 0 && s !== "*");
+    .filter((s) => s.length > 0 && s !== "*")
+    .filter(isWellFormedAdministrativeOrigin)
+    .map((s) => new URL(s).origin);
   return new Set(origins);
 }
 
@@ -107,7 +145,7 @@ export function isAcceptableJsonContentType(contentType: string | null): boolean
 
 export type ReadJsonBodyResult =
   | { ok: true; text: string }
-  | { ok: false; reason: "too_large" | "empty" };
+  | { ok: false; reason: "too_large" | "empty" | "invalid_utf8" };
 
 /**
  * Lê o corpo da requisição em bytes REAIS do stream, abortando assim que
@@ -147,7 +185,19 @@ export async function readJsonBodyWithLimit(req: Request, maxBytes: number): Pro
     buffer.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return { ok: true, text: new TextDecoder().decode(buffer) };
+  try {
+    // FASE 17A (achado de revisão): `{ fatal: true }` — sem isso,
+    // `TextDecoder` por padrão SUBSTITUI silenciosamente sequências de
+    // bytes UTF-8 inválidas por U+FFFD em vez de rejeitar, o que
+    // significa que um corpo corrompido/malicioso não seria detectado
+    // aqui (poderia até "acidentalmente" virar JSON válido depois da
+    // substituição silenciosa). Com `fatal: true`, bytes inválidos
+    // lançam, e tratamos isso como rejeição explícita de transporte.
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    return { ok: true, text };
+  } catch {
+    return { ok: false, reason: "invalid_utf8" };
+  }
 }
 
 /** `true` somente se `text` é JSON sintaticamente válido — usado só como gate de transporte (400 cedo), nunca substitui a validação de campos que já acontece dentro dos handlers auditados. */

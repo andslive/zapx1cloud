@@ -258,9 +258,11 @@ export async function handleRotateCredentialsRequest(req: Request, deps: RotateH
 // de `deps` diferentes — só as PRIMITIVAS de baixo nível, sem estado e
 // sem risco de divergência silenciosa, vivem em `hookcloud-admin-http.ts`).
 
-export interface RouteRotateCredentialsRequestDeps extends RotateHookCloudCredentialsDeps {
+export interface RouteRotateCredentialsRequestDeps {
   /** Allowlist real de origens administrativas — injetável para teste. */
   allowedOrigins: ReadonlySet<string>;
+  /** FASE 17A (achado de revisão): construído sob demanda, só depois que o roteamento já validou método, CORS, Content-Type e corpo — nunca antes (mesma correção de `hookcloud-provision-connection`). */
+  buildHandlerDeps: () => RotateHookCloudCredentialsDeps;
 }
 
 const ALLOWED_METHODS_HEADER = "POST, OPTIONS";
@@ -307,7 +309,11 @@ export async function routeRotateCredentialsRequest(
   const bodyResult = await readJsonBodyWithLimit(req, HOOKCLOUD_ADMIN_MAX_BODY_BYTES);
   if (!bodyResult.ok) {
     const status = bodyResult.reason === "too_large" ? 413 : 400;
-    const error = bodyResult.reason === "too_large" ? "payload_too_large" : "empty_body";
+    const error = bodyResult.reason === "too_large"
+      ? "payload_too_large"
+      : bodyResult.reason === "invalid_utf8"
+      ? "invalid_encoding"
+      : "empty_body";
     return new Response(JSON.stringify({ error }), {
       status,
       headers: { ...cors.headers, ...NO_STORE_HEADERS, "Content-Type": "application/json" },
@@ -322,7 +328,10 @@ export async function routeRotateCredentialsRequest(
   }
 
   const forwardedReq = new Request(req.url, { method: "POST", headers: req.headers, body: bodyResult.text });
-  const innerResponse = await handleRotateCredentialsRequest(forwardedReq, deps);
+  // FASE 17A: só agora — com método, CORS, Content-Type e corpo já
+  // validados — o cliente privilegiado (service_role) é construído.
+  const handlerDeps = deps.buildHandlerDeps();
+  const innerResponse = await handleRotateCredentialsRequest(forwardedReq, handlerDeps);
 
   const finalHeaders = new Headers(innerResponse.headers);
   for (const [key, value] of Object.entries(cors.headers)) finalHeaders.set(key, value);
@@ -345,7 +354,7 @@ if (import.meta.main) {
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
-  const callbackBaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+  const callbackBaseUrl = supabaseUrl ?? "";
   const allowedOrigins = resolveHookCloudAdminAllowedOrigins();
 
   Deno.serve(async (req) => {
@@ -356,17 +365,23 @@ if (import.meta.main) {
         headers: { ...NO_STORE_HEADERS, "Content-Type": "application/json" },
       });
     }
-    const authHeader = req.headers.get("authorization") ?? "";
-    const userClient = createClient(supabaseUrl, anonKey, {
-      global: { headers: { Authorization: authHeader } },
-    });
-    const adminClient = createClient(supabaseUrl, serviceRoleKey);
 
     return await routeRotateCredentialsRequest(req, {
-      authClient: userClient.auth as unknown as AuthClientLike,
-      adminClient: adminClient as unknown as AdminSupabaseLike,
-      callbackBaseUrl,
       allowedOrigins,
+      // FASE 17A: só chamado pelo roteador DEPOIS de método/CORS/
+      // Content-Type/corpo já validados.
+      buildHandlerDeps: () => {
+        const authHeader = req.headers.get("authorization") ?? "";
+        const userClient = createClient(supabaseUrl, anonKey, {
+          global: { headers: { Authorization: authHeader } },
+        });
+        const adminClient = createClient(supabaseUrl, serviceRoleKey);
+        return {
+          authClient: userClient.auth as unknown as AuthClientLike,
+          adminClient: adminClient as unknown as AdminSupabaseLike,
+          callbackBaseUrl,
+        };
+      },
     });
   });
 }

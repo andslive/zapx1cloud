@@ -327,11 +327,15 @@ Deno.test("16.direct_meta) rotação nunca aceita uma conexão direct_meta — R
 
 const ALLOWED_ORIGIN = "https://admin.x1zap.com";
 
-function routeDeps(overrides: Partial<RouteRotateCredentialsRequestDeps> = {}): RouteRotateCredentialsRequestDeps {
+// FASE 17A: mesma correção de hookcloud-provision-connection — o cliente
+// privilegiado agora é construído sob demanda (`buildHandlerDeps`).
+function routeDeps(
+  overrides: Partial<RotateHookCloudCredentialsDeps> & { allowedOrigins?: ReadonlySet<string> } = {},
+): RouteRotateCredentialsRequestDeps {
+  const { allowedOrigins, ...handlerOverrides } = overrides;
   return {
-    ...baseDeps(),
-    allowedOrigins: new Set([ALLOWED_ORIGIN]),
-    ...overrides,
+    allowedOrigins: allowedOrigins ?? new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => baseDeps(handlerOverrides),
   };
 }
 
@@ -640,6 +644,96 @@ Deno.test("16B.34) UazAPI continua inalcançável através do roteador (grep est
   for (const forbidden of ["uazapi-send", "uazapi-webhook", "whatsapp-send", "instance_id", "instance_token"]) {
     assertEquals(codeOnly.includes(forbidden), false, `código não deveria referenciar '${forbidden}'`);
   }
+});
+
+// ── FASE 17A (achados de revisão) ────────────────────────────────────────
+
+Deno.test("17A.1) método rejeitado (GET) nunca constrói o cliente privilegiado — buildHandlerDeps nunca é chamado", async () => {
+  let called = false;
+  const res = await routeRotateCredentialsRequest(rawReq({ method: "GET" }), {
+    allowedOrigins: new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => { called = true; return baseDeps(); },
+  });
+  assertEquals(res.status, 405);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.2) OPTIONS nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const res = await routeRotateCredentialsRequest(rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN } }), {
+    allowedOrigins: new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => { called = true; return baseDeps(); },
+  });
+  assertEquals(res.status, 204);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.3) origem fora da allowlist nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const res = await routeRotateCredentialsRequest(validJsonReq({}, { origin: "https://nao-permitida.example.com" }), {
+    allowedOrigins: new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => { called = true; return baseDeps(); },
+  });
+  assertEquals(res.status, 403);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.4) Content-Type inválido nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const res = await routeRotateCredentialsRequest(
+    rawReq({ method: "POST", headers: { "content-type": "text/plain" }, body: "x" }),
+    { allowedOrigins: new Set([ALLOWED_ORIGIN]), buildHandlerDeps: () => { called = true; return baseDeps(); } },
+  );
+  assertEquals(res.status, 415);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.5) corpo acima do limite nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const oversized = "a".repeat(HOOKCLOUD_ADMIN_MAX_BODY_BYTES + 1);
+  const res = await routeRotateCredentialsRequest(
+    rawReq({ method: "POST", headers: { "content-type": "application/json" }, body: oversized }),
+    { allowedOrigins: new Set([ALLOWED_ORIGIN]), buildHandlerDeps: () => { called = true; return baseDeps(); } },
+  );
+  assertEquals(res.status, 413);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.6) JSON malformado nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const res = await routeRotateCredentialsRequest(
+    rawReq({ method: "POST", headers: { "content-type": "application/json" }, body: "{ invalido" }),
+    { allowedOrigins: new Set([ALLOWED_ORIGIN]), buildHandlerDeps: () => { called = true; return baseDeps(); } },
+  );
+  assertEquals(res.status, 400);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.7) requisição válida SEMPRE constrói o cliente privilegiado exatamente uma vez", async () => {
+  let calls = 0;
+  const res = await routeRotateCredentialsRequest(validJsonReq(), {
+    allowedOrigins: new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => { calls++; return baseDeps(); },
+  });
+  assertEquals(res.status, 200);
+  assertEquals(calls, 1);
+});
+
+Deno.test("17A.8) UTF-8 inválido no corpo => 400, nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const invalidUtf8 = new Uint8Array([0x7b, 0x22, 0x61, 0x22, 0x3a, 0xff, 0xfe, 0x7d]);
+  const res = await routeRotateCredentialsRequest(
+    new Request("https://x/hookcloud-rotate-credentials", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: invalidUtf8,
+    }),
+    { allowedOrigins: new Set([ALLOWED_ORIGIN]), buildHandlerDeps: () => { called = true; return baseDeps(); } },
+  );
+  assertEquals(res.status, 400);
+  const body = await res.json();
+  assertEquals(body.error, "invalid_encoding");
+  assertEquals(called, false);
 });
 
 Deno.test("16B.35) direct_meta continua inalcançável através do roteador (mesma resposta uniforme 404 propagada)", async () => {
