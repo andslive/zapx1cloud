@@ -8,6 +8,7 @@
 import { assertEquals } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
   classifyConnectionForDisplay,
+  filterUazapiOnlyConnections,
   isUazapiProvider,
   type ConnectionProviderFields,
   type MetaCloudConfigFields,
@@ -89,4 +90,45 @@ Deno.test("classifyConnectionForDisplay: 'unsupported' e 'hookcloud_pending' nun
     const kind = classifyConnectionForDisplay(instance, config);
     assertEquals(kind === "uazapi", false);
   }
+});
+
+// ── filterUazapiOnlyConnections — usada por FunnelChannelsTab/UserFormDialog/
+// TransferConversationModal/LeadContextPanel/AdminExecutivePanel (Fase 18E) ──
+
+interface FixtureConnection extends ConnectionProviderFields {
+  id: string;
+}
+
+const MIXED_FIXTURE: FixtureConnection[] = [
+  { id: "uazapi-explicit", provider: "uazapi" },
+  { id: "uazapi-legacy-null", provider: null },
+  { id: "uazapi-legacy-undefined" },
+  { id: "hookcloud-pending", provider: "meta_cloud" },
+  { id: "unknown-provider", provider: "chromium" },
+];
+
+Deno.test("filterUazapiOnlyConnections: mantém só UazAPI explícita e legada, remove HookCloud e provider desconhecido", () => {
+  const result = filterUazapiOnlyConnections(MIXED_FIXTURE);
+  assertEquals(
+    result.map((c) => c.id).sort(),
+    ["uazapi-explicit", "uazapi-legacy-null", "uazapi-legacy-undefined"].sort(),
+  );
+});
+
+Deno.test("filterUazapiOnlyConnections: lista vazia continua vazia, nunca lança exceção", () => {
+  assertEquals(filterUazapiOnlyConnections([]), []);
+});
+
+Deno.test("filterUazapiOnlyConnections: só HookCloud/desconhecido resulta em ZERO opções — nunca cai para nenhuma outra coisa como fallback", () => {
+  const onlyIneligible: FixtureConnection[] = [
+    { id: "hookcloud-1", provider: "meta_cloud" },
+    { id: "unknown-1", provider: "evolution" },
+  ];
+  assertEquals(filterUazapiOnlyConnections(onlyIneligible), []);
+});
+
+Deno.test("filterUazapiOnlyConnections: preserva a identidade dos objetos (mesma referência), não clona/transforma", () => {
+  const result = filterUazapiOnlyConnections(MIXED_FIXTURE);
+  const original = MIXED_FIXTURE.find((c) => c.id === "uazapi-explicit");
+  assertEquals(result.find((c) => c.id === "uazapi-explicit"), original);
 });

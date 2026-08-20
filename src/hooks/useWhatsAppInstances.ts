@@ -15,6 +15,14 @@ import { toast } from 'sonner';
 export interface WhatsAppInstanceMetaCloudConfig {
   onboarding_state: string | null;
   onboarding_source: string | null;
+  // FASE 18E — necessário para `isMetaCloudOperationalConnection`
+  // (`connectionEligibility.ts`), que exige o Phone Number ID exato da
+  // PRÓPRIA conexão (nunca `display_phone_number`, que é só um texto
+  // formatado) antes de considerar uma conexão Meta elegível para
+  // seleção operacional. Sem este campo no embed, aquela checagem
+  // ficaria permanentemente inalcançável mesmo quando `onboarding_state`
+  // um dia chegar a `'active'`.
+  phone_number_id: string | null;
 }
 
 export interface WhatsAppInstance {
@@ -174,7 +182,7 @@ export function useWhatsAppInstances() {
       // esse embed vem null (nenhuma linha satélite existe para ela).
       const { data, error } = await supabase
         .from('evolution_instances')
-        .select('*, meta_cloud_config:evolution_instances_meta_cloud(onboarding_state, onboarding_source)')
+        .select('*, meta_cloud_config:evolution_instances_meta_cloud(onboarding_state, onboarding_source, phone_number_id)')
         .eq('organization_id', profile!.organization_id!)
         .order('created_at', { ascending: true });
       if (error) throw error;
@@ -196,7 +204,7 @@ export function useAllWhatsAppInstancesAdmin() {
       // desta tabela satélite (mesma política usada pelo painel org-scoped).
       const { data, error } = await supabase
         .from('evolution_instances')
-        .select('*, organization:organizations(id, name), meta_cloud_config:evolution_instances_meta_cloud(onboarding_state, onboarding_source)')
+        .select('*, organization:organizations(id, name), meta_cloud_config:evolution_instances_meta_cloud(onboarding_state, onboarding_source, phone_number_id)')
         .order('created_at', { ascending: false });
       if (error) throw error;
       return (data || []) as unknown as WhatsAppInstanceWithOrg[];

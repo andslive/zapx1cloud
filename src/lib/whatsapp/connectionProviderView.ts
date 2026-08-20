@@ -48,6 +48,22 @@ export function isUazapiProvider(instance: ConnectionProviderFields | null | und
 }
 
 /**
+ * FASE 18E — função única, testada e REUTILIZADA (não reimplementada
+ * inline em cada tela) pelos seletores operacionais que ainda são
+ * exclusivamente UazAPI e preservam a regra de STATUS já existente em
+ * cada consumidor (por isso não usa `isUazapiOperationalConnection`, que
+ * impõe status conectado/pareado — mudaria comportamento existente em
+ * `FunnelChannelsTab.tsx`/`TransferConversationModal.tsx`/
+ * `UserFormDialog.tsx`, que sempre permitiram escolher uma UazAPI ainda
+ * desconectada). Usada por esses três consumidores via import real — a
+ * prova de comportamento não depende de grep, depende de que a mesma
+ * função testada aqui é a que roda em produção.
+ */
+export function filterUazapiOnlyConnections<T extends ConnectionProviderFields>(instances: readonly T[]): T[] {
+  return instances.filter((instance) => isUazapiProvider(instance));
+}
+
+/**
  * Classifica a linha para renderização. Falha fechada: qualquer
  * combinação não reconhecida (provider desconhecido, ou `meta_cloud` com
  * origem/estado diferentes do único caminho real hoje) vira
