@@ -12,7 +12,10 @@ import {
   handleProvisionRequest,
   type MetaAccessTokenValidator,
   type ProvisionHookCloudConnectionDeps,
+  type RouteProvisionConnectionRequestDeps,
+  routeProvisionConnectionRequest,
 } from "./index.ts";
+import { HOOKCLOUD_ADMIN_MAX_BODY_BYTES } from "../_shared/hookcloud-admin-http.ts";
 import {
   hashHookCloudVerifyToken,
   hashHookCloudWebhookSecret,
@@ -607,6 +610,471 @@ Deno.test("usuário com profiles.is_active=false => 403", async () => {
     );
     assertEquals(res.status, 403);
   });
+});
+
+// ── FASE 16B — roteamento HTTP real (método, CORS, cache, corpo) ────────
+
+const ALLOWED_ORIGIN = "https://admin.x1zap.com";
+const OTHER_ALLOWED_ORIGIN = "https://outra-origem-admin.exemplo.com";
+
+// FASE 17A: `RouteProvisionConnectionRequestDeps` agora constrói o
+// cliente privilegiado sob demanda (`buildHandlerDeps`), só depois que o
+// roteador já validou método/CORS/Content-Type/corpo. `routeDeps` aqui
+// aceita as MESMAS chaves de antes (nível do handler + `allowedOrigins`)
+// num único objeto de overrides, e internamente as separa — nenhum dos
+// testes abaixo precisou mudar por causa dessa correção.
+function routeDeps(
+  overrides: Partial<ProvisionHookCloudConnectionDeps> & { allowedOrigins?: ReadonlySet<string> } = {},
+): RouteProvisionConnectionRequestDeps {
+  const { allowedOrigins, ...handlerOverrides } = overrides;
+  return {
+    allowedOrigins: allowedOrigins ?? new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => baseDeps(handlerOverrides),
+  };
+}
+
+function rawReq(opts: { method?: string; headers?: Record<string, string>; body?: BodyInit | null }): Request {
+  return new Request("https://x/hookcloud-provision-connection", {
+    method: opts.method ?? "POST",
+    headers: opts.headers ?? {},
+    body: opts.body ?? undefined,
+  });
+}
+
+function validJsonReq(overrides: Record<string, unknown> = {}, headers: Record<string, string> = {}): Request {
+  return rawReq({
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(validPayload(overrides)),
+  });
+}
+
+Deno.test("16B.1) importar o módulo não inicia servidor algum — toda a suíte roda sem --allow-net (prova estrutural: import.meta.main nunca é verdadeiro sob `deno test`)", () => {
+  // Nenhuma asserção de execução aqui além da própria suíte já ter
+  // rodado até este ponto sem `--allow-net`: se `Deno.serve` fosse
+  // chamado incondicionalmente no carregamento do módulo, TODOS os
+  // testes deste arquivo teriam falhado com erro de permissão antes de
+  // chegar aqui.
+  assert(true);
+});
+
+Deno.test("16B.2) entrypoint de roteamento delega ao handler correto (POST válido => mesmo resultado de handleProvisionRequest direto)", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(validJsonReq(), routeDeps());
+    assertEquals(res.status, 201);
+    const body = await res.json();
+    assert(typeof body.callback_url === "string");
+    assert(typeof body.verify_token === "string");
+  });
+});
+
+Deno.test("16B.3) OPTIONS com origem permitida => 204, sem autenticar/consultar banco/RPC", async () => {
+  const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  const deps = routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) });
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN } }),
+    deps,
+  );
+  assertEquals(res.status, 204);
+  assertEquals(rpcCalls.length, 0, "OPTIONS nunca deve chamar a RPC");
+});
+
+Deno.test("16B.4) OPTIONS não autentica — authClient nunca é consultado", async () => {
+  let authCalled = false;
+  const spyAuth: AuthClientLike = { auth: { getUser: async () => { authCalled = true; return { data: { user: null } }; } } };
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN } }),
+    routeDeps({ authClient: spyAuth }),
+  );
+  assertEquals(res.status, 204);
+  assertEquals(authCalled, false, "OPTIONS nunca deve chamar auth.getUser()");
+});
+
+Deno.test("16B.5) OPTIONS não chama banco/RPC (reforço — nenhuma chamada a adminClient.rpc)", async () => {
+  const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN }, body: JSON.stringify({ ignored: true }) }),
+    routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+  );
+  assertEquals(res.status, 204);
+  assertEquals(rpcCalls.length, 0);
+});
+
+Deno.test("16B.6) POST é permitido (roteamento não bloqueia o método correto)", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(validJsonReq(), routeDeps());
+    assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("16B.7) GET => 405", async () => {
+  const res = await routeProvisionConnectionRequest(rawReq({ method: "GET" }), routeDeps());
+  assertEquals(res.status, 405);
+});
+
+Deno.test("16B.8) PUT => 405", async () => {
+  const res = await routeProvisionConnectionRequest(rawReq({ method: "PUT" }), routeDeps());
+  assertEquals(res.status, 405);
+});
+
+Deno.test("16B.9) DELETE => 405", async () => {
+  const res = await routeProvisionConnectionRequest(rawReq({ method: "DELETE" }), routeDeps());
+  assertEquals(res.status, 405);
+});
+
+Deno.test("16B.10) header Allow correto em 405 e em OPTIONS", async () => {
+  const res405 = await routeProvisionConnectionRequest(rawReq({ method: "GET" }), routeDeps());
+  assertEquals(res405.headers.get("Allow"), "POST, OPTIONS");
+  const resOptions = await routeProvisionConnectionRequest(rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN } }), routeDeps());
+  assertEquals(resOptions.headers.get("Allow"), "POST, OPTIONS");
+});
+
+Deno.test("16B.11) origem exata permitida => Access-Control-Allow-Origin igual à origem, requisição prossegue", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(validJsonReq({}, { origin: ALLOWED_ORIGIN }), routeDeps());
+    assertEquals(res.headers.get("Access-Control-Allow-Origin"), ALLOWED_ORIGIN);
+    assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("16B.12) origem semelhante/maliciosa é rejeitada (403), antes de qualquer autenticação/RPC", async () => {
+  const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  let authCalled = false;
+  const spyAuth: AuthClientLike = { auth: { getUser: async () => { authCalled = true; return { data: { user: { id: CALLER_ID } } }; } } };
+  const res = await routeProvisionConnectionRequest(
+    validJsonReq({}, { origin: "https://admin.x1zap.com.attacker.com" }),
+    routeDeps({ authClient: spyAuth, adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+  );
+  assertEquals(res.status, 403);
+  assertEquals(authCalled, false, "origem rejeitada nunca deve chegar a autenticar");
+  assertEquals(rpcCalls.length, 0);
+});
+
+Deno.test("16B.13) wildcard não é aceito como origem — allowlist contendo só '*' rejeita qualquer origem real", async () => {
+  const res = await routeProvisionConnectionRequest(
+    validJsonReq({}, { origin: "https://qualquer-origem.example.com" }),
+    routeDeps({ allowedOrigins: new Set(["*"]) }),
+  );
+  assertEquals(res.status, 403);
+});
+
+Deno.test("16B.14) allowlist vazia (variável ausente) => requisição de navegador com Origin falha fechada", async () => {
+  const res = await routeProvisionConnectionRequest(
+    validJsonReq({}, { origin: ALLOWED_ORIGIN }),
+    routeDeps({ allowedOrigins: new Set() }),
+  );
+  assertEquals(res.status, 403);
+});
+
+Deno.test("16B.15) requisição sem Origin (servidor-servidor) ainda exige JWT normalmente", async () => {
+  const res = await routeProvisionConnectionRequest(
+    validJsonReq(), // sem header origin
+    routeDeps({ authClient: authClient(null) }),
+  );
+  assertEquals(res.status, 401);
+});
+
+Deno.test("16B.16) Vary: Origin presente quando a origem é aceita", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(validJsonReq({}, { origin: ALLOWED_ORIGIN }), routeDeps());
+    assertEquals(res.headers.get("Vary"), "Origin");
+  });
+});
+
+Deno.test("16B.17) nenhuma resposta contém Access-Control-Allow-Origin: * em nenhum cenário", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const scenarios = [
+      await routeProvisionConnectionRequest(validJsonReq({}, { origin: ALLOWED_ORIGIN }), routeDeps()),
+      await routeProvisionConnectionRequest(validJsonReq(), routeDeps()),
+      await routeProvisionConnectionRequest(rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN } }), routeDeps()),
+      await routeProvisionConnectionRequest(rawReq({ method: "GET" }), routeDeps()),
+    ];
+    for (const res of scenarios) {
+      assert(res.headers.get("Access-Control-Allow-Origin") !== "*", "nenhuma resposta pode conter Allow-Origin '*'");
+    }
+  });
+});
+
+Deno.test("16B.18) Cache-Control: no-store em resposta de sucesso", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(validJsonReq(), routeDeps());
+    assertEquals(res.headers.get("Cache-Control"), "no-store");
+  });
+});
+
+Deno.test("16B.19) Cache-Control: no-store em respostas de erro (401, 403, 405, 400, 413, 415)", async () => {
+  const cases: Response[] = [
+    await routeProvisionConnectionRequest(validJsonReq(), routeDeps({ authClient: authClient(null) })), // 401
+    await routeProvisionConnectionRequest(validJsonReq({}, { origin: "https://nao-permitida.example.com" }), routeDeps()), // 403
+    await routeProvisionConnectionRequest(rawReq({ method: "GET" }), routeDeps()), // 405
+    await routeProvisionConnectionRequest(rawReq({ method: "POST", headers: { "content-type": "application/json" }, body: "{ nao e json" }), routeDeps()), // 400
+    await routeProvisionConnectionRequest(rawReq({ method: "POST", headers: { "content-type": "application/json", "content-length": String(HOOKCLOUD_ADMIN_MAX_BODY_BYTES + 10) }, body: "a".repeat(HOOKCLOUD_ADMIN_MAX_BODY_BYTES + 10) }), routeDeps()), // 413
+    await routeProvisionConnectionRequest(rawReq({ method: "POST", headers: { "content-type": "text/plain" }, body: "x" }), routeDeps()), // 415
+  ];
+  for (const res of cases) {
+    assertEquals(res.headers.get("Cache-Control"), "no-store", `esperado no-store, status=${res.status}`);
+  }
+});
+
+Deno.test("16B.20) Pragma: no-cache na resposta de sucesso (que carrega credenciais brutas)", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(validJsonReq(), routeDeps());
+    assertEquals(res.headers.get("Pragma"), "no-cache");
+  });
+});
+
+Deno.test("16B.21) Expires: 0 na resposta de sucesso (que carrega credenciais brutas)", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(validJsonReq(), routeDeps());
+    assertEquals(res.headers.get("Expires"), "0");
+  });
+});
+
+Deno.test("16B.22) JSON válido é aceito normalmente", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(validJsonReq(), routeDeps());
+    assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("16B.23) JSON inválido => 400", async () => {
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "POST", headers: { "content-type": "application/json" }, body: "{ isso nao e json valido" }),
+    routeDeps(),
+  );
+  assertEquals(res.status, 400);
+});
+
+Deno.test("16B.24) body vazio => 400", async () => {
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "POST", headers: { "content-type": "application/json" } }),
+    routeDeps(),
+  );
+  assertEquals(res.status, 400);
+});
+
+Deno.test("16B.25) Content-Type ausente => 415", async () => {
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "POST", body: JSON.stringify(validPayload()) }),
+    routeDeps(),
+  );
+  assertEquals(res.status, 415);
+});
+
+Deno.test("16B.26) Content-Type incorreto => 415", async () => {
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "POST", headers: { "content-type": "text/plain" }, body: JSON.stringify(validPayload()) }),
+    routeDeps(),
+  );
+  assertEquals(res.status, 415);
+});
+
+Deno.test("16B.27) charset válido (application/json; charset=utf-8) é aceito", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await routeProvisionConnectionRequest(
+      rawReq({ method: "POST", headers: { "content-type": "application/json; charset=utf-8" }, body: JSON.stringify(validPayload()) }),
+      routeDeps(),
+    );
+    assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("16B.28) body exatamente no limite (16 KiB) é aceito", async () => {
+  await withHookCloudPilotEnv(async () => {
+    // Preenche até bater exatamente no limite via um campo de padding
+    // dentro de um valor opaco de negócio já aceito (businessId, até 64
+    // chars) não serviria — em vez disso, o padding vai só no JSON
+    // (espaços dentro da string de connectionName truncada pela
+    // validação de negócio, então testamos só a camada de transporte
+    // isoladamente: um JSON com whitespace de padding, ainda válido).
+    const base = JSON.stringify(validPayload());
+    const padding = " ".repeat(HOOKCLOUD_ADMIN_MAX_BODY_BYTES - base.length - 1); // -1 pelo espaço extra abaixo
+    const padded = base + padding + " ";
+    assertEquals(new TextEncoder().encode(padded).byteLength, HOOKCLOUD_ADMIN_MAX_BODY_BYTES);
+    const res = await routeProvisionConnectionRequest(
+      rawReq({ method: "POST", headers: { "content-type": "application/json" }, body: padded }),
+      routeDeps(),
+    );
+    // JSON.parse tolera espaços em branco à volta — deve passar da
+    // camada de transporte e chegar ao handler normalmente.
+    assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("16B.29) body acima do limite COM Content-Length correto => 413", async () => {
+  const oversized = "a".repeat(HOOKCLOUD_ADMIN_MAX_BODY_BYTES + 1);
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "POST", headers: { "content-type": "application/json", "content-length": String(oversized.length) }, body: oversized }),
+    routeDeps(),
+  );
+  assertEquals(res.status, 413);
+});
+
+Deno.test("16B.30) body acima do limite SEM Content-Length (stream chunked) => 413 — leitura real do stream, nunca confia só no header", async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let i = 0; i < 20; i++) controller.enqueue(new TextEncoder().encode("x".repeat(1000)));
+      controller.close();
+    },
+  });
+  const req2 = new Request("https://x/hookcloud-provision-connection", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: stream,
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+  assertEquals(req2.headers.get("content-length"), null);
+  const res = await routeProvisionConnectionRequest(req2, routeDeps());
+  assertEquals(res.status, 413);
+});
+
+Deno.test("16B.31) nenhum body/segredo sensível aparece em console.* durante todo o roteamento (sucesso ou erro)", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const originalLog = console.log, originalWarn = console.warn, originalError = console.error;
+    const calls: unknown[] = [];
+    console.log = (...a: unknown[]) => calls.push(a);
+    console.warn = (...a: unknown[]) => calls.push(a);
+    console.error = (...a: unknown[]) => calls.push(a);
+    const secretToken = "token-de-transporte-que-nao-pode-vazar-em-log-16b";
+    let rawCallbackSecret = "";
+    let rawVerifyToken = "";
+    try {
+      const res = await routeProvisionConnectionRequest(validJsonReq({ accessToken: secretToken }), routeDeps());
+      const body = await res.json();
+      rawCallbackSecret = new URL(body.callback_url).searchParams.get("hcs")!;
+      rawVerifyToken = body.verify_token;
+      // também exercita um caminho de erro de transporte
+      await routeProvisionConnectionRequest(
+        rawReq({ method: "POST", headers: { "content-type": "application/json" }, body: "{ malformado" }),
+        routeDeps(),
+      );
+    } finally {
+      console.log = originalLog;
+      console.warn = originalWarn;
+      console.error = originalError;
+    }
+    const serialized = JSON.stringify(calls);
+    assertEquals(serialized.includes(secretToken), false);
+    assertEquals(serialized.includes(rawCallbackSecret), false);
+    assertEquals(serialized.includes(rawVerifyToken), false);
+  });
+});
+
+Deno.test("16B.32) autenticação e autorização já auditadas continuam passando através do roteador (não autenticado => 401)", async () => {
+  const res = await routeProvisionConnectionRequest(validJsonReq(), routeDeps({ authClient: authClient(null) }));
+  assertEquals(res.status, 401);
+});
+
+Deno.test("16B.33) cross-tenant continua bloqueado através do roteador", async () => {
+  const res = await routeProvisionConnectionRequest(
+    rawReq({
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...validPayload(), organizationId: "org-de-outra-organizacao" }),
+    }),
+    routeDeps(),
+  );
+  assertEquals(res.status, 403);
+});
+
+Deno.test("16B.34) UazAPI continua inalcançável através do roteador (grep estrutural do arquivo completo, incluindo a nova camada de roteamento)", async () => {
+  const source = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  const codeOnly = source.replace(/\/\*[\s\S]*?\*\//g, "").split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  for (const forbidden of ["uazapi-send", "uazapi-webhook", "whatsapp-send", "instance_id", "instance_token"]) {
+    assertEquals(codeOnly.includes(forbidden), false, `código não deveria referenciar '${forbidden}'`);
+  }
+});
+
+// ── FASE 17A (achados de revisão) ────────────────────────────────────────
+
+Deno.test("17A.1) método rejeitado (GET) nunca constrói o cliente privilegiado — buildHandlerDeps nunca é chamado", async () => {
+  let called = false;
+  const res = await routeProvisionConnectionRequest(rawReq({ method: "GET" }), {
+    allowedOrigins: new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => { called = true; return baseDeps(); },
+  });
+  assertEquals(res.status, 405);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.2) OPTIONS nunca constrói o cliente privilegiado — buildHandlerDeps nunca é chamado", async () => {
+  let called = false;
+  const res = await routeProvisionConnectionRequest(rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN } }), {
+    allowedOrigins: new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => { called = true; return baseDeps(); },
+  });
+  assertEquals(res.status, 204);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.3) origem fora da allowlist nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const res = await routeProvisionConnectionRequest(validJsonReq({}, { origin: "https://nao-permitida.example.com" }), {
+    allowedOrigins: new Set([ALLOWED_ORIGIN]),
+    buildHandlerDeps: () => { called = true; return baseDeps(); },
+  });
+  assertEquals(res.status, 403);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.4) Content-Type inválido nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "POST", headers: { "content-type": "text/plain" }, body: "x" }),
+    { allowedOrigins: new Set([ALLOWED_ORIGIN]), buildHandlerDeps: () => { called = true; return baseDeps(); } },
+  );
+  assertEquals(res.status, 415);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.5) corpo acima do limite nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const oversized = "a".repeat(HOOKCLOUD_ADMIN_MAX_BODY_BYTES + 1);
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "POST", headers: { "content-type": "application/json" }, body: oversized }),
+    { allowedOrigins: new Set([ALLOWED_ORIGIN]), buildHandlerDeps: () => { called = true; return baseDeps(); } },
+  );
+  assertEquals(res.status, 413);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.6) JSON malformado nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const res = await routeProvisionConnectionRequest(
+    rawReq({ method: "POST", headers: { "content-type": "application/json" }, body: "{ invalido" }),
+    { allowedOrigins: new Set([ALLOWED_ORIGIN]), buildHandlerDeps: () => { called = true; return baseDeps(); } },
+  );
+  assertEquals(res.status, 400);
+  assertEquals(called, false);
+});
+
+Deno.test("17A.7) requisição válida (POST, origem permitida, JSON dentro do limite) SEMPRE constrói o cliente privilegiado exatamente uma vez", async () => {
+  await withHookCloudPilotEnv(async () => {
+    let calls = 0;
+    const res = await routeProvisionConnectionRequest(validJsonReq(), {
+      allowedOrigins: new Set([ALLOWED_ORIGIN]),
+      buildHandlerDeps: () => { calls++; return baseDeps(); },
+    });
+    assertEquals(res.status, 201);
+    assertEquals(calls, 1);
+  });
+});
+
+Deno.test("17A.8) UTF-8 inválido no corpo => 400, nunca constrói o cliente privilegiado", async () => {
+  let called = false;
+  const invalidUtf8 = new Uint8Array([0x7b, 0x22, 0x61, 0x22, 0x3a, 0xff, 0xfe, 0x7d]);
+  const res = await routeProvisionConnectionRequest(
+    new Request("https://x/hookcloud-provision-connection", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: invalidUtf8,
+    }),
+    { allowedOrigins: new Set([ALLOWED_ORIGIN]), buildHandlerDeps: () => { called = true; return baseDeps(); } },
+  );
+  assertEquals(res.status, 400);
+  const body = await res.json();
+  assertEquals(body.error, "invalid_encoding");
+  assertEquals(called, false);
 });
 
 Deno.test("usuário ativo (disabled=false, is_active=true) continua permitido", async () => {

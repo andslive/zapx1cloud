@@ -41,11 +41,22 @@ import {
 } from "../_shared/meta-webhook-hookcloud-secret.ts";
 import { resolveHookCloudWebhookMode } from "../_shared/meta-webhook-hookcloud-mode.ts";
 import { isMetaCloudApiEnabled } from "../_shared/meta-cloud-flags.ts";
+import {
+  buildCorsDecision,
+  CREDENTIAL_RESPONSE_HEADERS,
+  HOOKCLOUD_ADMIN_MAX_BODY_BYTES,
+  isAcceptableJsonContentType,
+  isSyntacticallyValidJson,
+  NO_STORE_HEADERS,
+  readJsonBodyWithLimit,
+  resolveHookCloudAdminAllowedOrigins,
+} from "../_shared/hookcloud-admin-http.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
+// FASE 16B — o antigo `corsHeaders` (`Access-Control-Allow-Origin: "*"`)
+// foi removido por completo. CORS agora vem exclusivamente de
+// `buildCorsDecision` (allowlist exata de `hookcloud-admin-http.ts`),
+// aplicado só quando há um `Origin` de navegador real e permitido —
+// nunca um valor estático, nunca `*`.
 
 // Papel mínimo exigido — mais restrito que create-team-member (que aceita
 // 'manager' para a maioria das operações). Provisionar uma conexão com um
@@ -124,10 +135,17 @@ export interface ProvisionHookCloudConnectionInput {
   accessToken: string;
 }
 
-function jsonResponse(status: number, body: Record<string, unknown>): Response {
+/**
+ * FASE 16B: nunca inclui `Access-Control-Allow-Origin` (isso agora é
+ * responsabilidade exclusiva do roteador — `routeProvisionConnectionRequest`
+ * — que mescla a decisão de CORS baseada na allowlist real DEPOIS que
+ * este handler já decidiu status/corpo). Sempre `Cache-Control: no-store`
+ * — nenhuma resposta deste endpoint é cacheável, sucesso ou erro.
+ */
+function jsonResponse(status: number, body: Record<string, unknown>, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: { ...NO_STORE_HEADERS, ...extraHeaders, "Content-Type": "application/json" },
   });
 }
 
@@ -347,7 +365,7 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
       "Nenhum dos dois valores será mostrado novamente. Se perdidos, será necessário rotacionar numa fase futura.",
       "A conexão foi criada como 'pending' — nenhuma mensagem pode ser enviada ou recebida até uma verificação posterior.",
     ],
-  });
+  }, CREDENTIAL_RESPONSE_HEADERS);
 }
 
 // ── Nota sobre o GET verify_token — RESOLVIDO para HookCloud na Fase 14A ─
@@ -371,19 +389,168 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
 // intocado e continua sendo a única opção para o caminho `direct_meta` —
 // não foi removido, pois pode haver consumidor legado.
 
-// ── Nota de integração (deliberadamente NÃO feita nesta fase) ───────────
+// ── FASE 16B — roteamento HTTP real (método, CORS, cache, corpo) ────────
 //
-// Este arquivo exporta `handleProvisionRequest` já com TODAS as
-// checagens (autenticação, organização, papel, as duas feature flags,
-// validação de identificadores, geração/hash do segredo, chamada à RPC
-// atômica) como função pura testável (deps injetadas) — mas NÃO inclui um
-// bloco `Deno.serve`/`import.meta.main` real com clientes Supabase de
-// produção — ainda não há nenhuma conexão HookCloud real para
-// provisionar, e as flags (HOOKCLOUD_WEBHOOK_MODE,
-// meta_cloud_feature_flags) permanecem desligadas em toda esta linha de
-// trabalho. Compor o entry point real (só autenticação via ANON_KEY/
-// SERVICE_ROLE_KEY reais + `Deno.serve`, chamando `handleProvisionRequest`
-// com os clientes reais) é trabalho de uma fase de deploy futura, com sua
-// própria autorização — mesmo padrão incremental já usado em
-// meta-webhook-hookcloud-gate.ts (Fase 11A) antes de ser conectado ao
-// handler real (Fase 12A).
+// `handleProvisionRequest` (acima) permanece INTOCADO — mesma assinatura,
+// mesma lógica de autenticação/autorização/RPC já auditada nas Fases
+// 13A/13B/16A. Esta camada nova só decide, ANTES de chegar lá: método
+// permitido, origem CORS, Content-Type, e tamanho do corpo — nunca
+// autenticação, nunca banco, nunca segredo.
+
+export interface RouteProvisionConnectionRequestDeps {
+  /** Allowlist real de origens administrativas — injetável para teste. */
+  allowedOrigins: ReadonlySet<string>;
+  /**
+   * FASE 17A (achado de revisão): construído SOB DEMANDA, só depois que
+   * o roteamento já validou método, CORS, Content-Type e corpo — nunca
+   * antes. Antes desta correção, o entry point real construía os
+   * clientes Supabase (incluindo o de `service_role`, o mais
+   * privilegiado do sistema) para TODA requisição recebida, mesmo as
+   * que seriam rejeitadas por método errado, origem fora da allowlist,
+   * ou corpo inválido — desperdício de recurso e superfície
+   * desnecessária. Agora, nenhuma requisição rejeitada chega a
+   * construir nenhum cliente Supabase.
+   */
+  buildHandlerDeps: () => ProvisionHookCloudConnectionDeps;
+}
+
+const ALLOWED_METHODS_HEADER = "POST, OPTIONS";
+
+export async function routeProvisionConnectionRequest(
+  req: Request,
+  deps: RouteProvisionConnectionRequestDeps,
+): Promise<Response> {
+  const origin = req.headers.get("origin");
+  const cors = buildCorsDecision(origin, deps.allowedOrigins);
+
+  // OPTIONS: SOMENTE validação CORS. Nunca autentica, nunca consulta
+  // banco, nunca gera segredo, nunca chama RPC, nunca lê/loga o corpo.
+  if (req.method === "OPTIONS") {
+    if (origin !== null && !cors.allowed) {
+      return new Response(null, { status: 403, headers: { ...NO_STORE_HEADERS } });
+    }
+    return new Response(null, {
+      status: 204,
+      headers: { ...cors.headers, ...NO_STORE_HEADERS, "Allow": ALLOWED_METHODS_HEADER },
+    });
+  }
+
+  if (req.method !== "POST") {
+    return new Response(JSON.stringify({ error: "method_not_allowed" }), {
+      status: 405,
+      headers: { ...cors.headers, ...NO_STORE_HEADERS, "Allow": ALLOWED_METHODS_HEADER, "Content-Type": "application/json" },
+    });
+  }
+
+  // Origem de navegador presente mas fora da allowlist — falha fechada,
+  // ANTES de qualquer autenticação/banco/RPC.
+  if (origin !== null && !cors.allowed) {
+    return new Response(JSON.stringify({ error: "origin_not_allowed" }), {
+      status: 403,
+      headers: { ...NO_STORE_HEADERS, "Content-Type": "application/json" },
+    });
+  }
+
+  const contentType = req.headers.get("content-type");
+  if (!isAcceptableJsonContentType(contentType)) {
+    return new Response(JSON.stringify({ error: "unsupported_media_type" }), {
+      status: 415,
+      headers: { ...cors.headers, ...NO_STORE_HEADERS, "Content-Type": "application/json" },
+    });
+  }
+
+  const bodyResult = await readJsonBodyWithLimit(req, HOOKCLOUD_ADMIN_MAX_BODY_BYTES);
+  if (!bodyResult.ok) {
+    const status = bodyResult.reason === "too_large" ? 413 : 400;
+    const error = bodyResult.reason === "too_large"
+      ? "payload_too_large"
+      : bodyResult.reason === "invalid_utf8"
+      ? "invalid_encoding"
+      : "empty_body";
+    return new Response(JSON.stringify({ error }), {
+      status,
+      headers: { ...cors.headers, ...NO_STORE_HEADERS, "Content-Type": "application/json" },
+    });
+  }
+
+  if (!isSyntacticallyValidJson(bodyResult.text)) {
+    return new Response(JSON.stringify({ error: "malformed_json" }), {
+      status: 400,
+      headers: { ...cors.headers, ...NO_STORE_HEADERS, "Content-Type": "application/json" },
+    });
+  }
+
+  // Repassa ao handler já auditado — um Request NOVO, com o corpo já
+  // integralmente lido em memória (nunca uma segunda leitura do stream
+  // original, que já foi consumido acima por `readJsonBodyWithLimit`).
+  const forwardedReq = new Request(req.url, { method: "POST", headers: req.headers, body: bodyResult.text });
+  // FASE 17A: só agora — com método, CORS, Content-Type e corpo já
+  // validados — o cliente privilegiado (service_role) é construído.
+  const handlerDeps = deps.buildHandlerDeps();
+  const innerResponse = await handleProvisionRequest(forwardedReq, handlerDeps);
+
+  // Camada final: aplica CORS real + no-store por cima do que o handler
+  // já decidiu (status/corpo do handler NUNCA são alterados aqui).
+  const finalHeaders = new Headers(innerResponse.headers);
+  for (const [key, value] of Object.entries(cors.headers)) finalHeaders.set(key, value);
+  finalHeaders.set("Cache-Control", "no-store");
+  return new Response(innerResponse.body, { status: innerResponse.status, headers: finalHeaders });
+}
+
+// ── Entry point real ──────────────────────────────────────────────────
+// `import.meta.main` evita que `Deno.serve` tente abrir uma porta de
+// rede quando este arquivo é apenas IMPORTADO (ex.: pelos testes, que
+// rodam sem `--allow-net`) — mesmo padrão já usado em
+// `meta-cloud-webhook/index.ts` desde a Fase 2A. Nenhum código roda no
+// carregamento do módulo além de literais estáticos (`corsHeaders`
+// removido, `REQUIRED_ROLES`) — nenhuma chamada de banco, nenhuma
+// geração de credencial, nenhuma leitura de body acontece até que uma
+// requisição HTTP real chegue.
+
+if (import.meta.main) {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
+  const callbackBaseUrl = supabaseUrl ?? "";
+  const allowedOrigins = resolveHookCloudAdminAllowedOrigins();
+
+  Deno.serve(async (req) => {
+    if (!supabaseUrl || !serviceRoleKey || !anonKey) {
+      // Falha de configuração de servidor — nunca expõe QUAL variável
+      // está ausente, nunca ecoa valor algum.
+      console.error("[hookcloud-provision-connection] configuração de ambiente incompleta");
+      return new Response(JSON.stringify({ error: "server_misconfigured" }), {
+        status: 500,
+        headers: { ...NO_STORE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    return await routeProvisionConnectionRequest(req, {
+      allowedOrigins,
+      // FASE 17A: só chamado pelo roteador DEPOIS de método/CORS/
+      // Content-Type/corpo já validados — nenhuma requisição rejeitada
+      // chega a construir o cliente `service_role`.
+      buildHandlerDeps: () => {
+        const authHeader = req.headers.get("authorization") ?? "";
+        const userClient = createClient(supabaseUrl, anonKey, {
+          global: { headers: { Authorization: authHeader } },
+        });
+        const adminClient = createClient(supabaseUrl, serviceRoleKey);
+        return {
+          authClient: userClient.auth as unknown as AuthClientLike,
+          adminClient: adminClient as unknown as AdminSupabaseLike,
+          tokenValidator: createNoopMetaAccessTokenValidator(),
+          callbackBaseUrl,
+        };
+      },
+    });
+  });
+}
+
+// ── Nota histórica ────────────────────────────────────────────────────
+// O padrão incremental usado aqui (função pura testável primeiro, entry
+// point real só numa fase de deploy posterior) é o mesmo já usado em
+// `meta-webhook-hookcloud-gate.ts` (Fase 11A) antes de ser conectado ao
+// handler real (Fase 12A). A Fase 16B completa esse padrão para este
+// endpoint: o entry point real acima usa exatamente `handleProvisionRequest`,
+// sem nenhuma alteração na lógica de negócio já auditada.
