@@ -21,6 +21,22 @@
 
 const MAX_OPAQUE_ID_LENGTH = 64; // mesmo limite de isPlausibleOpaqueId no backend
 
+/**
+ * Timeout real da chamada de rede (Fase 18B, verificação obrigatória):
+ * confirmado, lendo `FunctionsClient.ts` da versão instalada do SDK
+ * (`@supabase/supabase-js@2.90.1`), que `invoke()` aceita uma opção
+ * `timeout` (milissegundos) e internamente cria um `AbortController`
+ * próprio — não é uma afirmação sem lastro, é um recurso real desta
+ * versão do SDK. 20s é generoso o bastante para uma rede lenta sem
+ * deixar o administrador esperando indefinidamente por uma função que
+ * já deveria responder em segundos. Nunca há retry automático depois de
+ * um timeout.
+ */
+export const HOOKCLOUD_PROVISION_TIMEOUT_MS = 20_000;
+
+/** Estado sensível comunicado ao componente proprietário do drawer — NUNCA carrega o segredo em si, só o que precisa ser protegido. */
+export type HookCloudSensitiveLifecycle = 'idle' | 'submitting' | 'secret_unacknowledged';
+
 /** Mesma regra do backend: string não vazia, comprimento razoável, NUNCA convertida para número. */
 export function isPlausibleOpaqueId(value: string): boolean {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_OPAQUE_ID_LENGTH;
@@ -115,7 +131,7 @@ export type ProvisionResultOutcome =
  * `https://` e contendo o caminho real do webhook com o parâmetro `hcs`,
  * `verify_token` não vazio.
  */
-export function parseHookCloudProvisionSuccessBody(body: unknown): ProvisionResultOutcome {
+export function parseHookCloudProvisionSuccessBody(body: unknown, expectedCallbackOrigin: string): ProvisionResultOutcome {
   if (typeof body !== 'object' || body === null) return { kind: 'unexpected_response' };
   const b = body as Record<string, unknown>;
 
@@ -127,7 +143,7 @@ export function parseHookCloudProvisionSuccessBody(body: unknown): ProvisionResu
   if (typeof connectionId !== 'string' || connectionId.trim().length === 0) {
     return { kind: 'unexpected_response' };
   }
-  if (typeof callbackUrl !== 'string' || !isTrustedHookCloudCallbackUrl(callbackUrl)) {
+  if (typeof callbackUrl !== 'string' || !isTrustedHookCloudCallbackUrl(callbackUrl, expectedCallbackOrigin)) {
     return { kind: 'unexpected_response' };
   }
   if (typeof verifyToken !== 'string' || verifyToken.trim().length === 0) {
@@ -144,13 +160,20 @@ export function parseHookCloudProvisionSuccessBody(body: unknown): ProvisionResu
 }
 
 /**
- * A UI recusa exibir uma callback URL que não seja HTTPS e que não
- * aponte para o caminho real do webhook com o parâmetro `hcs` — mesmo
- * que, por alguma falha, o backend algum dia devolvesse algo diferente
- * (defesa em profundidade do lado do cliente; o backend já é auditado
- * para nunca fazer isso, mas a UI nunca confia cegamente).
+ * A UI recusa exibir uma callback URL que não pertença EXATAMENTE ao
+ * projeto Supabase configurado neste frontend — não basta ser HTTPS com
+ * o caminho certo (Fase 18B, achado 4: uma URL `https://dominio-
+ * falso.example/functions/v1/meta-cloud-webhook?hcs=x` passava na
+ * checagem anterior). `expectedOrigin` é o origin canônico do projeto
+ * (`new URL(import.meta.env.VITE_SUPABASE_URL).origin`, resolvido pelo
+ * chamador — este módulo continua sem depender de env/DOM para
+ * permanecer testável via Deno). Exige, sem exceção por sufixo/
+ * subdomínio: protocolo https, origin idêntico, nenhuma credencial
+ * embutida na URL, pathname EXATO (não apenas terminando com o
+ * caminho), nenhum fragmento, e exatamente um parâmetro `hcs` não
+ * vazio — nenhum parâmetro adicional.
  */
-export function isTrustedHookCloudCallbackUrl(url: string): boolean {
+export function isTrustedHookCloudCallbackUrl(url: string, expectedOrigin: string): boolean {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -158,20 +181,46 @@ export function isTrustedHookCloudCallbackUrl(url: string): boolean {
     return false;
   }
   if (parsed.protocol !== 'https:') return false;
-  if (!parsed.pathname.endsWith('/functions/v1/meta-cloud-webhook')) return false;
-  if (!parsed.searchParams.has('hcs') || parsed.searchParams.get('hcs')!.trim().length === 0) return false;
+  if (parsed.origin !== expectedOrigin) return false;
+  if (parsed.username !== '' || parsed.password !== '') return false;
+  if (parsed.pathname !== '/functions/v1/meta-cloud-webhook') return false;
+  if (parsed.hash !== '') return false;
+  const hcsValues = parsed.searchParams.getAll('hcs');
+  if (hcsValues.length !== 1) return false;
+  if (hcsValues[0].trim().length === 0) return false;
+  if (Array.from(parsed.searchParams.keys()).length !== 1) return false;
   return true;
 }
 
 /**
  * Classifica o resultado de uma chamada a `supabase.functions.invoke`.
- * NUNCA ecoa `error.message`/`error.context` bruto do SDK na interface —
- * só um código curto e seguro. Erro de rede/timeout é tratado como
- * AMBÍGUO (nunca "falhou"), porque o provisionamento já pode ter
- * commitado no banco antes da resposta se perder — ver Fase 18A, Parte 5.
+ *
+ * Fase 18B, achado 5 (comportamento real do SDK, verificado lendo
+ * `node_modules/@supabase/functions-js/src/FunctionsClient.ts` da versão
+ * instalada — `@supabase/supabase-js@2.90.1`): quando `invoke()` lança
+ * `FunctionsHttpError` (status HTTP não-2xx), o SDK retorna `data: null`
+ * SEMPRE — o corpo JSON do erro NUNCA vem em `data`, só em
+ * `error.context`, que é o objeto `Response` real (ainda não lido, então
+ * seguro ler `.json()` uma única vez aqui). A implementação anterior
+ * (Fase 18A) assumia, incorretamente, que o código de erro viria em
+ * `data.error` — na prática isso nunca acontecia, e todo erro HTTP
+ * virava sempre `unknown_error`. `error.name` distingue as 3 classes
+ * reais exportadas por `@supabase/supabase-js`
+ * (`FunctionsHttpError`/`FunctionsFetchError`/`FunctionsRelayError`) sem
+ * precisar de `instanceof` — o que mantém este módulo testável via Deno
+ * sem importar o SDK inteiro (os testes passam objetos simples com
+ * `name`/`context` no mesmo formato).
+ *
+ * `FunctionsFetchError` (falha de rede/DNS/CORS antes de qualquer
+ * resposta) e `FunctionsRelayError` (o gateway da Supabase não
+ * conseguiu alcançar a função — nível de infraestrutura, não é a
+ * resposta da nossa função) são tratados como AMBÍGUOS, nunca "falhou"
+ * — o provisionamento pode já ter commitado no banco antes da resposta
+ * se perder. Timeout (via `AbortController`/opção `timeout` do
+ * `invoke`) produz `FunctionsFetchError`/`AbortError` pelo mesmo
+ * caminho — também ambíguo. Ver Fase 18A, Parte 5.
  */
-/** Lê `context.status` de um erro do SDK de forma segura, sem `any` — o SDK tipa `context` como `any`, mas em runtime é um objeto com `status?: number` para `FunctionsHttpError`. */
-function extractHttpStatus(context: unknown): number | undefined {
+function extractResponseStatus(context: unknown): number | undefined {
   if (context && typeof context === 'object' && 'status' in context) {
     const status = (context as Record<string, unknown>).status;
     return typeof status === 'number' ? status : undefined;
@@ -179,24 +228,43 @@ function extractHttpStatus(context: unknown): number | undefined {
   return undefined;
 }
 
-export function classifyProvisionInvokeResult(
-  data: unknown,
-  error: { message?: string; context?: unknown } | null,
-): ProvisionResultOutcome {
-  if (error) {
-    const status = extractHttpStatus(error.context);
-    if (typeof status !== 'number') {
-      // Sem status HTTP identificável — falha de rede/timeout, nunca
-      // presumida como "não criou nada".
-      return { kind: 'network_or_timeout' };
+/** Lê o corpo JSON do `Response` de erro UMA ÚNICA VEZ — nunca relê, nunca expõe o corpo bruto, só o campo `error` (código curto). */
+async function extractErrorCodeFromResponse(context: unknown): Promise<string> {
+  if (!context || typeof context !== 'object' || typeof (context as Record<string, unknown>).json !== 'function') {
+    return 'unknown_error';
+  }
+  try {
+    const body: unknown = await (context as { json: () => Promise<unknown> }).json();
+    if (body && typeof body === 'object' && 'error' in body) {
+      const code = (body as Record<string, unknown>).error;
+      if (typeof code === 'string' && code.trim().length > 0) return code;
     }
-    const errorField = typeof data === 'object' && data !== null && 'error' in data
-      ? (data as Record<string, unknown>).error
-      : undefined;
-    const code = typeof errorField === 'string' ? errorField : 'unknown_error';
+    return 'unknown_error';
+  } catch {
+    return 'unknown_error';
+  }
+}
+
+export async function classifyProvisionInvokeResult(
+  data: unknown,
+  error: { name?: string; message?: string; context?: unknown } | null,
+  expectedCallbackOrigin: string,
+): Promise<ProvisionResultOutcome> {
+  if (!error) {
+    return parseHookCloudProvisionSuccessBody(data, expectedCallbackOrigin);
+  }
+
+  if (error.name === 'FunctionsHttpError') {
+    const status = extractResponseStatus(error.context);
+    if (typeof status !== 'number') return { kind: 'network_or_timeout' };
+    const code = await extractErrorCodeFromResponse(error.context);
     return { kind: 'http_error', status, code };
   }
-  return parseHookCloudProvisionSuccessBody(data);
+
+  // FunctionsFetchError, FunctionsRelayError, AbortError (nosso próprio
+  // timeout) ou qualquer erro não reconhecido: sempre ambíguo, nunca
+  // tratado como falha definitiva.
+  return { kind: 'network_or_timeout' };
 }
 
 /** Mensagem pública curta e segura por código de erro conhecido — nunca texto interno do backend. */
