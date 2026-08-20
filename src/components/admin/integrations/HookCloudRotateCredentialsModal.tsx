@@ -159,7 +159,11 @@ export function HookCloudRotateCredentialsModal({ connectionId }: HookCloudRotat
 
   return (
     <>
-      <Button variant="outline" size="sm" className="gap-2" onClick={() => setFormOpen(true)}>
+      {/* Defesa adicional (além do overlay do modal, que já bloqueia
+          ponteiro sobre este botão enquanto um segredo está visível):
+          nunca inicia uma segunda rotação enquanto a anterior ainda não
+          foi confirmada como salva. */}
+      <Button variant="outline" size="sm" className="gap-2" onClick={() => setFormOpen(true)} disabled={isSensitive}>
         <RefreshCw className="h-3.5 w-3.5" />
         Rotacionar credenciais
       </Button>

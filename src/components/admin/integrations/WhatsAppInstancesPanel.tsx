@@ -79,6 +79,9 @@ function WebhookStatusBadge({ status }: { status?: string }) {
 // renderizam QR Code, nunca chamam `whatsapp-proxy`, nunca oferecem
 // Conectar/Pausar/Desvincular/Verificar webhook/Reparar webhook — essas
 // ações continuam existindo SOMENTE no card UazAPI, inalterado, abaixo.
+// FASE 18G: o card `HookCloudPendingCard` ganhou UMA ação própria,
+// exclusiva de HookCloud (`HookCloudRotateCredentialsModal`, chama só
+// `hookcloud-rotate-credentials`) — nunca toca em `whatsapp-proxy`/UazAPI.
 function HookCloudPendingCard({ inst }: { inst: WhatsAppInstance }) {
   return (
     <Card key={inst.id}>
