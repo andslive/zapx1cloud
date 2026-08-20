@@ -37,6 +37,23 @@ export const HOOKCLOUD_PROVISION_TIMEOUT_MS = 20_000;
 /** Estado sensível comunicado ao componente proprietário do drawer — NUNCA carrega o segredo em si, só o que precisa ser protegido. */
 export type HookCloudSensitiveLifecycle = 'idle' | 'submitting' | 'secret_unacknowledged';
 
+/**
+ * FASE 18F — decisão ÚNICA e testada sobre se uma tentativa de sair do
+ * estado sensível deve ser bloqueada, e qual aviso mostrar. Extraída de
+ * `IntegrationsManager.tsx` (onde vivia inline, sem teste próprio) para
+ * ser a mesma função usada nos 3 pontos de interceptação — fechar o
+ * drawer, trocar de item, e (novo nesta fase) clicar num link de
+ * navegação interna — em vez de reimplementar a mesma regra 3 vezes.
+ * `null` significa "não bloquear".
+ */
+export function hookCloudLifecycleBlockMessage(state: HookCloudSensitiveLifecycle): string | null {
+  if (state === 'submitting') return 'Aguarde a conclusão do provisionamento HookCloud antes de continuar.';
+  if (state === 'secret_unacknowledged') {
+    return 'Confirme, na janela já aberta, que você salvou o callback e o verify token antes de continuar.';
+  }
+  return null;
+}
+
 /** Mesma regra do backend: string não vazia, comprimento razoável, NUNCA convertida para número. */
 export function isPlausibleOpaqueId(value: string): boolean {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_OPAQUE_ID_LENGTH;

@@ -25,6 +25,7 @@ import {
   buildHookCloudProvisionRequestBody,
   classifyProvisionInvokeResult,
   hasFieldErrors,
+  hookCloudLifecycleBlockMessage,
   isPlausibleOpaqueId,
   isTrustedHookCloudCallbackUrl,
   parseHookCloudProvisionSuccessBody,
@@ -349,4 +350,23 @@ Deno.test("publicErrorMessageForCode: nunca ecoa o código bruto na mensagem exi
     const msg = publicErrorMessageForCode(400, code);
     assertFalse(msg.includes(code));
   }
+});
+
+// ── hookCloudLifecycleBlockMessage — Fase 18F, decisão única usada nos 3
+// pontos de interceptação (fechar drawer, trocar de item, navegação interna) ──
+
+Deno.test("hookCloudLifecycleBlockMessage: 'idle' nunca bloqueia", () => {
+  assertEquals(hookCloudLifecycleBlockMessage("idle"), null);
+});
+
+Deno.test("hookCloudLifecycleBlockMessage: 'submitting' bloqueia com mensagem específica", () => {
+  const msg = hookCloudLifecycleBlockMessage("submitting");
+  assert(msg !== null);
+  assert(msg!.length > 0);
+});
+
+Deno.test("hookCloudLifecycleBlockMessage: 'secret_unacknowledged' bloqueia com mensagem específica e diferente de 'submitting'", () => {
+  const msg = hookCloudLifecycleBlockMessage("secret_unacknowledged");
+  assert(msg !== null);
+  assert(msg !== hookCloudLifecycleBlockMessage("submitting"));
 });

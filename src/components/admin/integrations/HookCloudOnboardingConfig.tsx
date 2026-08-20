@@ -427,7 +427,12 @@ export function HookCloudOnboardingConfig({ onSensitiveLifecycleChange }: HookCl
               </Alert>
             )}
 
-            <Button type="submit" disabled={isSubmitting || !hookCloudVisible} className="gap-2">
+            {/* FASE 18F — desabilitado também durante `secret_unacknowledged`
+                (não só `isSubmitting`): defesa em profundidade além do
+                overlay do modal, que já bloqueia ponteiro sobre o
+                formulário enquanto o segredo não foi confirmado — impede
+                um segundo provisionamento mesmo se essa barreira falhar. */}
+            <Button type="submit" disabled={isSubmitting || !!successResult || !hookCloudVisible} className="gap-2">
               {isSubmitting && <Loader2 className="h-4 w-4 animate-spin" />}
               {isSubmitting ? 'Provisionando…' : 'Provisionar conexão'}
             </Button>

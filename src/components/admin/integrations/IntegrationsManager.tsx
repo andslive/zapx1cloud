@@ -25,7 +25,8 @@ import { supabase } from '@/integrations/supabase/client';
 import { useQuery } from '@tanstack/react-query';
 import { useAuth } from '@/hooks/useAuth';
 import { useHookCloudPilotAccess } from '@/hooks/useHookCloudPilotAccess';
-import type { HookCloudSensitiveLifecycle } from '@/lib/hookcloud/hookcloudProvisioning';
+import { useBlockInternalNavigationWhileSensitive } from '@/hooks/useBlockInternalNavigationWhileSensitive';
+import { hookCloudLifecycleBlockMessage, type HookCloudSensitiveLifecycle } from '@/lib/hookcloud/hookcloudProvisioning';
 
 type StatusFilter = 'all' | 'active' | 'inactive' | 'coming_soon';
 type CategoryFilter = 'all' | string;
@@ -64,17 +65,9 @@ export function IntegrationsManager() {
   // recebe o segredo em si, só este estado não sensível.
   const [hookCloudLifecycle, setHookCloudLifecycle] = useState<HookCloudSensitiveLifecycle>('idle');
 
-  const hookCloudLifecycleWarning = (state: HookCloudSensitiveLifecycle): string | null => {
-    if (state === 'submitting') return 'Aguarde a conclusão do provisionamento HookCloud antes de continuar.';
-    if (state === 'secret_unacknowledged') {
-      return 'Confirme, na janela já aberta, que você salvou o callback e o verify token antes de continuar.';
-    }
-    return null;
-  };
-
   const guardedSetDrawerOpen = (open: boolean) => {
     if (!open) {
-      const warning = hookCloudLifecycleWarning(hookCloudLifecycle);
+      const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
       if (warning) {
         toast.warning(warning);
         return;
@@ -82,6 +75,18 @@ export function IntegrationsManager() {
     }
     setDrawerOpen(open);
   };
+
+  // FASE 18F — bloqueia também a navegação para OUTRA ROTA (sidebar,
+  // breadcrumbs, qualquer link interno) enquanto o segredo HookCloud não
+  // foi confirmado como salvo ou uma submissão está em andamento — sem
+  // isso, sair desta página inteira (não só fechar o drawer) desmontava
+  // tudo silenciosamente, perdendo o segredo. Ver
+  // `useBlockInternalNavigationWhileSensitive` para o porquê do
+  // mecanismo (roteador declarativo, sem `useBlocker` disponível).
+  useBlockInternalNavigationWhileSensitive(hookCloudLifecycle !== 'idle', () => {
+    const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
+    if (warning) toast.warning(warning);
+  });
 
   useIntegrations();
   const { data: configuredMap = {} } = useAllConfiguredIntegrations();
@@ -117,7 +122,7 @@ export function IntegrationsManager() {
     // desmontaria `HookCloudOnboardingConfig` silenciosamente, perdendo o
     // segredo (ou a submissão em andamento) para sempre. Bloqueado
     // independentemente de qual card foi clicado.
-    const warning = hookCloudLifecycleWarning(hookCloudLifecycle);
+    const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
     if (warning) {
       toast.warning(warning);
       return;
