@@ -27,7 +27,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
 import { useQuery } from '@tanstack/react-query';
 import { useToast } from '@/hooks/use-toast';
-import { isUazapiProvider } from '@/lib/whatsapp/connectionProviderView';
+import { filterUazapiOnlyConnections } from '@/lib/whatsapp/connectionProviderView';
 
 interface TransferConversationModalProps {
   open: boolean;
@@ -179,13 +179,13 @@ export function TransferConversationModal({
       // Filtra só por provider, sem alterar a regra de status já existente
       // (o seletor sempre permitiu escolher uma UazAPI desconectada,
       // mostrando o status como aviso visual — isso é preservado).
-      return ((data || []) as Array<{
+      return filterUazapiOnlyConnections((data || []) as Array<{
         id: string;
         name: string;
         phone_number: string | null;
         status: string;
         provider?: string | null;
-      }>).filter((inst) => isUazapiProvider(inst));
+      }>);
     },
     enabled: !!profile?.organization_id && open && isWhatsApp,
   });

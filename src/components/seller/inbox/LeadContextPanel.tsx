@@ -36,6 +36,7 @@ import {
 import { useSetConversationSector, useUpdateWebChatWidget } from '@/hooks/useWebChat';
 import { useSectors } from '@/hooks/useSectors';
 import { useWhatsAppInstances } from '@/hooks/useWhatsAppInstances';
+import { filterUazapiOnlyConnections } from '@/lib/whatsapp/connectionProviderView';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from '@/hooks/use-toast';
 
@@ -141,6 +142,15 @@ export function LeadContextPanel({
 
   const [isEditingConnection, setIsEditingConnection] = useState(false);
   const { data: whatsappInstances = [] } = useWhatsAppInstances();
+  // FASE 18E — este seletor persiste `connection_id`/`evolution_instance_id`
+  // no lead/conversa (`leads.connection_id`, `webchat_conversations.
+  // evolution_instance_id`). Uma conexão Meta/HookCloud pendente nunca pode
+  // aparecer como OPÇÃO — `eligibleWhatsappInstances` filtra só por
+  // provider, preservando a regra de status já existente (badge verde/
+  // vermelho continua indicando conectado/desconectado). A lista COMPLETA
+  // (`whatsappInstances`) continua usada só para exibir o nome da conexão
+  // JÁ salva, mesmo que ela tenha deixado de ser elegível.
+  const eligibleWhatsappInstances = filterUazapiOnlyConnections(whatsappInstances);
   const updateConversation = useUpdateWebChatWidget();
 
   const setSector = useSetConversationSector();
@@ -477,7 +487,7 @@ export function LeadContextPanel({
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="none">Sem conexão</SelectItem>
-                        {whatsappInstances.map((inst: any) => (
+                        {eligibleWhatsappInstances.map((inst: any) => (
                           <SelectItem key={inst.id} value={inst.id}>
                             <span className="flex items-center gap-2">
                               {inst.status === 'connected' ? (

@@ -23,6 +23,7 @@ import {
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { Database as DatabaseIcon, ShieldCheck } from 'lucide-react';
+import { filterUazapiOnlyConnections } from '@/lib/whatsapp/connectionProviderView';
 
 const DOW_LABELS = ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
 
@@ -109,10 +110,17 @@ export function AdminExecutivePanel({ compact = false }: AdminExecutivePanelProp
       if (!profile?.organization_id) return [];
       const { data } = await supabase
         .from('evolution_instances')
-        .select('id, name, status, is_default, phone_number')
+        .select('id, name, status, is_default, phone_number, provider')
         .eq('organization_id', profile.organization_id)
         .order('is_default', { ascending: false });
-      return data ?? [];
+      // FASE 18E — este painel envia uma mensagem de teste REAL via
+      // `admin-agent-handle-inbound` usando `instance_id` (inclusive por
+      // um fallback "primeira conexão conectada / primeira disponível" —
+      // exatamente o anti-padrão que este filtro elimina). Uma conexão
+      // Meta/HookCloud nunca pode aparecer aqui nem ser escolhida por
+      // fallback; preserva a regra de status já existente (só filtra
+      // provider).
+      return filterUazapiOnlyConnections(data ?? []);
     },
     enabled: !!profile?.organization_id,
   });

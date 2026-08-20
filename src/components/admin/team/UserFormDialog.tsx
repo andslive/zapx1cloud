@@ -18,7 +18,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { TeamMember } from '@/hooks/useTeam';
 import { useUserPermissions, useUpdateUserPermissions, useInitializePermissions, PERMISSION_LABELS, PermissionKey } from '@/hooks/useUserPermissions';
 import { useNotificationSettings, useUpsertNotificationSettings, NOTIFICATION_LABELS } from '@/hooks/useNotificationSettings';
-import { isUazapiProvider } from '@/lib/whatsapp/connectionProviderView';
+import { filterUazapiOnlyConnections } from '@/lib/whatsapp/connectionProviderView';
 
 interface UserFormDialogProps {
   member?: TeamMember | null; // null/undefined = create mode
@@ -77,7 +77,7 @@ export function UserFormDialog({ member, open, onOpenChange }: UserFormDialogPro
       // alimenta o auto-preenchimento abaixo — uma conexão Meta/HookCloud
       // pendente nunca pode aparecer aqui nem ser pré-selecionada
       // automaticamente.
-      return (data || []).filter((inst: { provider?: string | null }) => isUazapiProvider(inst));
+      return filterUazapiOnlyConnections(data || []);
     },
     enabled: !!profile?.organization_id,
   });
