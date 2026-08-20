@@ -103,14 +103,24 @@ Deno.serve(async (req) => {
     const qrMatch = path.match(/\/instances\/qr\/(.+)/);
     const qrId = qrMatch ? qrMatch[1] : (action === "qr" ? body.id : null);
     if (qrId) {
-      const { data: inst } = await supabase.from("evolution_instances").select("*").eq("id", qrId).single();
+      // FASE 18D — escopado pela organização do usuário autenticado (nunca
+      // por texto do body): sem este filtro, qualquer usuário logado de
+      // QUALQUER organização podia ler `qr_code`/dados de uma conexão de
+      // outra organização só sabendo o UUID.
+      const { data: inst } = await supabase.from("evolution_instances").select("*")
+        .eq("id", qrId).eq("organization_id", profile.organization_id).maybeSingle();
       if (!inst) return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: corsHeaders });
 
+      // `organization_id` repassado explicitamente: este client usa a
+      // service role, então `whatsapp-proxy` trata a chamada como service
+      // role real — o escopo de organização precisa vir daqui, já
+      // comprovado pelo `profile.organization_id` do usuário autenticado
+      // acima, nunca inventado pelo cliente final.
       const { data, error } = await supabase.functions.invoke("whatsapp-proxy", {
-        body: { action: "connect_instance", id: qrId }
+        body: { action: "connect_instance", id: qrId, organization_id: profile.organization_id }
       });
       if (error) throw error;
-      
+
       return new Response(JSON.stringify({ qr: data.qr_code || inst.qr_code }), { headers: corsHeaders });
     }
 
@@ -119,7 +129,7 @@ Deno.serve(async (req) => {
     const startId = startMatch ? startMatch[1] : (action === "start" ? body.id : null);
     if (startId && req.method === "POST") {
       const { data, error } = await supabase.functions.invoke("whatsapp-proxy", {
-        body: { action: "connect_instance", id: startId }
+        body: { action: "connect_instance", id: startId, organization_id: profile.organization_id }
       });
       if (error) throw error;
       return new Response(JSON.stringify(data), { headers: corsHeaders });
@@ -130,7 +140,7 @@ Deno.serve(async (req) => {
     const deleteId = deleteMatch ? deleteMatch[1] : (action === "delete" ? body.id : null);
     if (deleteId && (req.method === "DELETE" || (req.method === "POST" && action === "delete"))) {
       const { data, error } = await supabase.functions.invoke("whatsapp-proxy", {
-        body: { action: "delete_instance_self", id: deleteId }
+        body: { action: "delete_instance_self", id: deleteId, organization_id: profile.organization_id }
       });
       if (error) throw error;
       return new Response(JSON.stringify(data), { headers: corsHeaders });
