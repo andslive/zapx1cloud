@@ -18,6 +18,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { TeamMember } from '@/hooks/useTeam';
 import { useUserPermissions, useUpdateUserPermissions, useInitializePermissions, PERMISSION_LABELS, PermissionKey } from '@/hooks/useUserPermissions';
 import { useNotificationSettings, useUpsertNotificationSettings, NOTIFICATION_LABELS } from '@/hooks/useNotificationSettings';
+import { isUazapiProvider } from '@/lib/whatsapp/connectionProviderView';
 
 interface UserFormDialogProps {
   member?: TeamMember | null; // null/undefined = create mode
@@ -68,10 +69,15 @@ export function UserFormDialog({ member, open, onOpenChange }: UserFormDialogPro
       if (!profile?.organization_id) return [];
       const { data, error } = await supabase
         .from('evolution_instances')
-        .select('id, name, phone_number')
+        .select('id, name, phone_number, provider')
         .eq('organization_id', profile.organization_id);
       if (error) return [];
-      return data || [];
+      // FASE 18D — este seletor persiste `default_connection_id` (o
+      // vendedor manda mensagem por essa conexão por padrão) e também
+      // alimenta o auto-preenchimento abaixo — uma conexão Meta/HookCloud
+      // pendente nunca pode aparecer aqui nem ser pré-selecionada
+      // automaticamente.
+      return (data || []).filter((inst: { provider?: string | null }) => isUazapiProvider(inst));
     },
     enabled: !!profile?.organization_id,
   });
@@ -108,7 +114,13 @@ export function UserFormDialog({ member, open, onOpenChange }: UserFormDialogPro
     setTab('general');
   }, [member, open]);
 
-  // Pre-select first available connection when creating a new user
+  // Pre-select first available connection when creating a new user.
+  // FASE 18D: `connections` já vem filtrada só para provider UazAPI (ver
+  // useQuery acima) — este fallback nunca pode mais escolher uma conexão
+  // Meta/HookCloud pendente. Mantido como estava para usuários NOVOS
+  // (conveniência de criação, não uma configuração salva que ficou
+  // inválida — esse caso, coberto na Parte 7, é tratado de outra forma:
+  // nunca reescolhe sozinho um valor JÁ salvo).
   useEffect(() => {
     if (!open || isEdit) return;
     if (!general.default_connection_id && connections && connections.length > 0) {

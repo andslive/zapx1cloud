@@ -27,6 +27,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
 import { useQuery } from '@tanstack/react-query';
 import { useToast } from '@/hooks/use-toast';
+import { isUazapiProvider } from '@/lib/whatsapp/connectionProviderView';
 
 interface TransferConversationModalProps {
   open: boolean;
@@ -166,17 +167,25 @@ export function TransferConversationModal({
       if (!profile?.organization_id) return [];
       const { data, error } = await supabase
         .from('evolution_instances')
-        .select('id, name, phone_number, status')
+        .select('id, name, phone_number, status, provider')
         .eq('organization_id', profile.organization_id)
         .order('is_default', { ascending: false })
         .order('name', { ascending: true });
       if (error) throw error;
-      return (data || []) as Array<{
+      // FASE 18D — esta seleção troca a conexão de uma conversa AO VIVO
+      // (`updateData.evolution_instance_id`) — uma conexão Meta/HookCloud
+      // pendente nunca pode aparecer aqui, ou o agente poderia transferir
+      // uma conversa real para uma conexão sem transporte funcional.
+      // Filtra só por provider, sem alterar a regra de status já existente
+      // (o seletor sempre permitiu escolher uma UazAPI desconectada,
+      // mostrando o status como aviso visual — isso é preservado).
+      return ((data || []) as Array<{
         id: string;
         name: string;
         phone_number: string | null;
         status: string;
-      }>;
+        provider?: string | null;
+      }>).filter((inst) => isUazapiProvider(inst));
     },
     enabled: !!profile?.organization_id && open && isWhatsApp,
   });

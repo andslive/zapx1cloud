@@ -24,6 +24,8 @@ import { MessageTemplateEditor } from './MessageTemplateEditor';
 import { MessagePreview } from './MessagePreview';
 import { RemindersList } from './RemindersList';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
+import { isUazapiProvider } from '@/lib/whatsapp/connectionProviderView';
+import { AlertTriangle } from 'lucide-react';
 
 interface Props {
   eventTypeId: string;
@@ -57,7 +59,15 @@ export function NotificationsAutomationTab({ eventTypeId }: Props) {
     value: BookingNotificationSettings[K],
   ) => setDraft((prev) => ({ ...prev, [key]: value }));
 
+  // FASE 18D — `selectedInstance` continua lendo de `instances` SEM
+  // filtro, propositalmente: precisa conseguir resolver e exibir uma
+  // configuração já salva mesmo que ela tenha se tornado inelegível
+  // (para mostrar o aviso abaixo), em vez de simplesmente "sumir". Só a
+  // lista de OPÇÕES do seletor (`eligibleInstances`) é filtrada — nunca
+  // reescolhe automaticamente outra conexão no lugar da salva.
   const selectedInstance = instances.find((i) => i.id === draft.whatsapp_instance_id);
+  const eligibleInstances = instances.filter((i) => isUazapiProvider(i));
+  const selectedInstanceIneligible = !!draft.whatsapp_instance_id && !!selectedInstance && !isUazapiProvider(selectedInstance);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-6">
@@ -114,7 +124,7 @@ export function NotificationsAutomationTab({ eventTypeId }: Props) {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="none">Nenhuma</SelectItem>
-                  {instances.map((i) => (
+                  {eligibleInstances.map((i) => (
                     <SelectItem key={i.id} value={i.id}>
                       <div className="flex items-center gap-2">
                         <MessageCircle className="h-4 w-4 text-emerald-500" />
@@ -127,9 +137,17 @@ export function NotificationsAutomationTab({ eventTypeId }: Props) {
                   ))}
                 </SelectContent>
               </Select>
-              <p className="text-xs text-muted-foreground">
-                As mensagens serão enviadas por esta instância.
-              </p>
+              {selectedInstanceIneligible ? (
+                <p className="text-xs text-destructive flex items-center gap-1">
+                  <AlertTriangle className="h-3 w-3 shrink-0" />
+                  A conexão salva não está mais disponível para disparo automático (ex.: pendente de configuração).
+                  Selecione outra instância.
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  As mensagens serão enviadas por esta instância.
+                </p>
+              )}
             </div>
           </div>
         </div>
