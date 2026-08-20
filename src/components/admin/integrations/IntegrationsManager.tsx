@@ -17,13 +17,14 @@ import {
 import { Search, Plug, Sparkles, LayoutGrid, Menu } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
-import { integrationsCatalog, type IntegrationItem } from '@/config/integrationsCatalog';
+import { integrationsCatalog, injectHookCloudItem, type IntegrationItem } from '@/config/integrationsCatalog';
 import { IntegrationCard } from './IntegrationCard';
 import { IntegrationConfigDrawer } from './IntegrationConfigDrawer';
 import { useIntegrations } from '@/hooks/useIntegrations';
 import { supabase } from '@/integrations/supabase/client';
 import { useQuery } from '@tanstack/react-query';
 import { useAuth } from '@/hooks/useAuth';
+import { useHookCloudPilotAccess } from '@/hooks/useHookCloudPilotAccess';
 
 type StatusFilter = 'all' | 'active' | 'inactive' | 'coming_soon';
 type CategoryFilter = 'all' | string;
@@ -59,6 +60,19 @@ export function IntegrationsManager() {
   useIntegrations();
   const { data: configuredMap = {} } = useAllConfiguredIntegrations();
 
+  // FASE 18A — o card comercial HookCloud só existe no catálogo
+  // renderizado quando a flag REAL da organização (tabela
+  // `meta_cloud_feature_flags`, RLS já restrita a admin/manager da
+  // própria organização) está ligada E o usuário autenticado é
+  // admin/super_admin. Nunca hardcoded, nunca confiado só no frontend —
+  // o backend (`hookcloud-provision-connection`) revalida tudo de forma
+  // independente.
+  const { visible: hookCloudVisible } = useHookCloudPilotAccess();
+  const visibleCatalog = useMemo(
+    () => injectHookCloudItem(integrationsCatalog, hookCloudVisible),
+    [hookCloudVisible],
+  );
+
   const isItemActive = (item: IntegrationItem) => {
     if (item.alwaysActive) return true;
     if (configuredMap[item.id]) return true;
@@ -84,7 +98,7 @@ export function IntegrationsManager() {
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
-    return integrationsCatalog
+    return visibleCatalog
       .map((cat) => {
         const items = cat.items.filter((item) => {
           if (statusFilter === 'coming_soon' && !item.comingSoon) return false;
@@ -106,24 +120,24 @@ export function IntegrationsManager() {
         return { ...cat, items };
       })
       .filter((cat) => cat.items.length > 0);
-  }, [search, statusFilter, categoryFilter, configuredMap]);
+  }, [search, statusFilter, categoryFilter, configuredMap, visibleCatalog]);
 
   const totals = useMemo(() => {
-    const all = integrationsCatalog.flatMap((c) => c.items);
+    const all = visibleCatalog.flatMap((c) => c.items);
     const available = all.filter((i) => !i.comingSoon).length;
     const active = all.filter((i) => !i.comingSoon && isItemActive(i)).length;
     return { active, available, total: all.length };
-  }, [configuredMap]);
+  }, [configuredMap, visibleCatalog]);
 
   const categoryCounts = useMemo(() => {
     const map: Record<string, { total: number; active: number }> = {};
-    integrationsCatalog.forEach((cat) => {
+    visibleCatalog.forEach((cat) => {
       const total = cat.items.length;
       const active = cat.items.filter((i) => !i.comingSoon && isItemActive(i)).length;
       map[cat.id] = { total, active };
     });
     return map;
-  }, [configuredMap]);
+  }, [configuredMap, visibleCatalog]);
 
   const renderSidebar = (onSelect?: () => void) => (
     <nav className="space-y-1">
@@ -155,7 +169,7 @@ export function IntegrationsManager() {
         </p>
       </div>
 
-      {integrationsCatalog.map((cat) => {
+      {visibleCatalog.map((cat) => {
         const Icon = cat.icon;
         const isActive = categoryFilter === cat.id;
         const counts = categoryCounts[cat.id];
@@ -190,7 +204,7 @@ export function IntegrationsManager() {
   const activeCategoryLabel =
     categoryFilter === 'all'
       ? 'Todas as integrações'
-      : integrationsCatalog.find((c) => c.id === categoryFilter)?.label ?? 'Integrações';
+      : visibleCatalog.find((c) => c.id === categoryFilter)?.label ?? 'Integrações';
 
   return (
     <div className="space-y-6">

@@ -5,6 +5,7 @@ import { ApiKeysManager } from './ApiKeysManager';
 import { WhatsAppConfig } from './WhatsAppConfig';
 import { MetaCloudApiConfig } from './MetaCloudApiConfig';
 import { BotConversaConfig } from './BotConversaConfig';
+import { HookCloudOnboardingConfig } from './HookCloudOnboardingConfig';
 import { FacebookLeadsConfig } from './FacebookLeadsConfig';
 import { EmailConfigManager } from './EmailConfigManager';
 import { EmailTemplatesManager } from './EmailTemplatesManager';
@@ -44,6 +45,15 @@ export function IntegrationConfigDrawer({ item, open, onOpenChange }: Integratio
         return META_CLOUD_API_ENABLED ? <MetaCloudApiConfig /> : null;
       case 'botconversa':
         return <BotConversaConfig />;
+      case 'hookcloud-onboarding':
+        // FASE 18A — defesa adicional, mesmo padrão do caso 'meta-cloud-api'
+        // acima: o item já só entra no catálogo renderizado quando a
+        // consulta real de `useHookCloudPilotAccess` resolve `visible=true`
+        // (flag da organização + papel admin/super_admin) — este painel
+        // não tem nenhuma checagem própria adicional porque a AUTORIDADE
+        // real de autorização é sempre o backend (`hookcloud-provision-connection`,
+        // já auditado), nunca o frontend.
+        return <HookCloudOnboardingConfig />;
       case 'facebook':
         return <FacebookLeadsConfig />;
       case 'email-config':
