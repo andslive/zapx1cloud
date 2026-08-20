@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isUazapiInstance, UNSUPPORTED_PROVIDER_RESPONSE } from "./provider-guard.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -235,6 +236,9 @@ Deno.serve(async (req) => {
       
       const { data: instance } = await supabase.from("evolution_instances").select("*").or(`id.eq.${id},instance_id.eq.${id}`).single();
       if (!instance) return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: corsHeaders });
+      if (!isUazapiInstance(instance)) {
+        return new Response(JSON.stringify(UNSUPPORTED_PROVIDER_RESPONSE), { status: 409, headers: corsHeaders });
+      }
 
       if (action === "repair_webhook") {
         const res = await waFetch(config, `/webhook/set`, {
@@ -305,6 +309,9 @@ Deno.serve(async (req) => {
       if (!id) return new Response(JSON.stringify({ error: "ID is required" }), { status: 400, headers: corsHeaders });
       const { data: instance } = await supabase.from("evolution_instances").select("*").eq("id", id).single();
       if (!instance) return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: corsHeaders });
+      if (!isUazapiInstance(instance)) {
+        return new Response(JSON.stringify(UNSUPPORTED_PROVIDER_RESPONSE), { status: 409, headers: corsHeaders });
+      }
 
       const res = await waFetch(config, "/instance/connect", { method: "POST", body: JSON.stringify({ browser: "auto" }) }, instance.instance_token);
       if (res.ok) {
@@ -320,6 +327,13 @@ Deno.serve(async (req) => {
     if (action === "delete_instance_self") {
       const id = body.id;
       const { data: instance } = await supabase.from("evolution_instances").select("*").eq("id", id).single();
+      if (instance && !isUazapiInstance(instance)) {
+        // Fase 18C: nenhum caminho de exclusão dedicado para conexões
+        // Meta/HookCloud existe ainda neste proxy — falha fechada em vez
+        // de apagar a linha e/ou disparar uma remoção remota na UazAPI
+        // para uma conexão que nunca existiu lá.
+        return new Response(JSON.stringify(UNSUPPORTED_PROVIDER_RESPONSE), { status: 409, headers: corsHeaders });
+      }
       if (instance) {
         // 1) Remove do banco primeiro (fonte da verdade do painel)
         const { error: dbErr } = await supabase.from("evolution_instances").delete().eq("id", id);
