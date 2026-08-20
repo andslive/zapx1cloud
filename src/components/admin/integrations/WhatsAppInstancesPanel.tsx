@@ -43,6 +43,7 @@ import { toast } from 'sonner';
 import { PresenceTestButton } from './PresenceTestButton';
 import { AdminStatusNotificationConfig } from './AdminStatusNotificationConfig';
 import { classifyConnectionForDisplay } from '@/lib/whatsapp/connectionProviderView';
+import { HookCloudRotateCredentialsModal } from './HookCloudRotateCredentialsModal';
 
 
 function StatusBadge({ status }: { status: string }) {
@@ -104,6 +105,11 @@ function HookCloudPendingCard({ inst }: { inst: WhatsAppInstance }) {
               </p>
             </div>
           </div>
+          {/* FASE 18G — recuperação segura (Alternativa B): se o admin
+              perdeu o callback URL/verify token, pode gerar um par novo
+              chamando o endpoint já auditado `hookcloud-rotate-credentials`,
+              em vez de depender só do bloqueio de navegação. */}
+          <HookCloudRotateCredentialsModal connectionId={inst.id} />
         </div>
       </CardContent>
     </Card>
