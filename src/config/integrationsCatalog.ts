@@ -57,7 +57,8 @@ export interface IntegrationItem {
     | 'cakto'
     | 'hotmart'
     | 'doppus'
-    | 'webhooks-link';
+    | 'webhooks-link'
+    | 'hookcloud-onboarding';
   /** Marks the card visually but still opens config (e.g. native always-on services) */
   alwaysActive?: boolean;
   comingSoon?: boolean;
@@ -65,6 +66,14 @@ export interface IntegrationItem {
   keywords?: string[];
   /** Optional brand logo (overrides Lucide icon when present) */
   logoSrc?: string;
+  /**
+   * FASE 18A — quando presente, substitui completamente o badge padrão
+   * (Ativo/Configurar/Em breve) por este texto (ex.: "Piloto"). Usado só
+   * pelo card HookCloud — garante estruturalmente que ele nunca mostre o
+   * badge verde "Ativo", mesmo que uma conexão pending exista (uma
+   * conexão pending nunca deve parecer ativa/conectada).
+   */
+  pilotLabel?: string;
 }
 
 export interface IntegrationCategory {
@@ -493,3 +502,59 @@ export const integrationsCatalog: IntegrationCategory[] = filterIntegrationsCata
   rawIntegrationsCatalog,
   META_CLOUD_API_ENABLED,
 );
+
+// ══════════════════════════════════════════════════════════════════════
+// FASE 18A — card comercial "HookCloud — WhatsApp Oficial"
+// ══════════════════════════════════════════════════════════════════════
+//
+// Deliberadamente NÃO adicionado a `rawIntegrationsCatalog` acima: sua
+// visibilidade depende de uma consulta ASSÍNCRONA por organização
+// (`useHookCloudPilotAccess`, tabela real `meta_cloud_feature_flags` +
+// papel admin/super_admin do usuário autenticado) — não de uma constante
+// síncrona conhecida no carregamento do módulo, como `META_CLOUD_API_ENABLED`.
+// `IntegrationsManager.tsx` injeta este item via `injectHookCloudItem`
+// (abaixo) só depois que a consulta resolve `visible=true`. Nunca reaparece
+// como uma "terceira opção" ao lado do card técnico Meta (que continua
+// oculto, inalterado) — é a ÚNICA opção comercial de API oficial da Meta
+// disponível, com nome comercial próprio.
+
+export const hookCloudOnboardingItem: IntegrationItem = {
+  id: 'hookcloud-onboarding',
+  name: 'HookCloud — WhatsApp Oficial',
+  description: 'Conecte um número pela API oficial do WhatsApp, com configuração assistida pela HookCloud.',
+  icon: Facebook,
+  color: 'bg-blue-500/10 text-blue-500',
+  configKey: 'hookcloud-onboarding',
+  pilotLabel: 'Piloto',
+  keywords: ['hookcloud', 'meta', 'oficial', 'cloud api', 'whatsapp business platform'],
+};
+
+/**
+ * Insere `hookCloudOnboardingItem` na categoria `whatsapp` de `catalog`
+ * quando `visible=true` — nunca quando `false` (ausência completa, mesmo
+ * idioma de `filterIntegrationsCatalogByMetaFlag`: não é "coming soon",
+ * é inexistente). Função pura, testável com os dois estados sem
+ * depender de nenhuma consulta real ao Supabase.
+ */
+export function injectHookCloudItem(
+  catalog: IntegrationCategory[],
+  visible: boolean,
+): IntegrationCategory[] {
+  if (!visible) return catalog;
+  const alreadyPresent = catalog.some((cat) => cat.items.some((item) => item.id === hookCloudOnboardingItem.id));
+  if (alreadyPresent) return catalog;
+
+  let injected = false;
+  const next = catalog.map((cat) => {
+    if (cat.id !== 'whatsapp') return cat;
+    injected = true;
+    return { ...cat, items: [hookCloudOnboardingItem, ...cat.items] };
+  });
+  if (injected) return next;
+
+  // Categoria 'whatsapp' ausente do catálogo (não deveria acontecer,
+  // mas nunca perde o item silenciosamente): cria a categoria mínima.
+  const whatsappCategory = rawIntegrationsCatalog.find((c) => c.id === 'whatsapp');
+  if (!whatsappCategory) return catalog;
+  return [...catalog, { ...whatsappCategory, items: [hookCloudOnboardingItem] }];
+}

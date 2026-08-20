@@ -46,7 +46,15 @@ export function IntegrationCard({ item, isActive, onClick }: IntegrationCardProp
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-2">
             <h4 className="text-sm font-semibold leading-tight truncate">{item.name}</h4>
-            {item.comingSoon ? (
+            {item.pilotLabel ? (
+              // FASE 18A: substitui completamente o badge padrão — nunca
+              // mostra "Ativo" para um card em piloto, mesmo que uma
+              // conexão pending associada exista.
+              <Badge variant="secondary" className="shrink-0 gap-1 text-[10px]">
+                <Settings className="h-3 w-3" />
+                {item.pilotLabel}
+              </Badge>
+            ) : item.comingSoon ? (
               <Badge variant="outline" className="shrink-0 gap-1 text-[10px]">
                 <Clock className="h-3 w-3" />
                 Em breve
