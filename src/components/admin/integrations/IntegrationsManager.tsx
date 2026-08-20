@@ -25,6 +25,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { useQuery } from '@tanstack/react-query';
 import { useAuth } from '@/hooks/useAuth';
 import { useHookCloudPilotAccess } from '@/hooks/useHookCloudPilotAccess';
+import type { HookCloudSensitiveLifecycle } from '@/lib/hookcloud/hookcloudProvisioning';
 
 type StatusFilter = 'all' | 'active' | 'inactive' | 'coming_soon';
 type CategoryFilter = 'all' | string;
@@ -56,6 +57,31 @@ export function IntegrationsManager() {
   const [selected, setSelected] = useState<IntegrationItem | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  // FASE 18B, achado 3 — `IntegrationsManager` é o dono real do estado do
+  // drawer (`selected`/`drawerOpen`), então é aqui que o fechamento/troca
+  // de item precisa ser recusado enquanto o formulário HookCloud está
+  // submetendo ou com um segredo ainda não confirmado como salvo. Nunca
+  // recebe o segredo em si, só este estado não sensível.
+  const [hookCloudLifecycle, setHookCloudLifecycle] = useState<HookCloudSensitiveLifecycle>('idle');
+
+  const hookCloudLifecycleWarning = (state: HookCloudSensitiveLifecycle): string | null => {
+    if (state === 'submitting') return 'Aguarde a conclusão do provisionamento HookCloud antes de continuar.';
+    if (state === 'secret_unacknowledged') {
+      return 'Confirme, na janela já aberta, que você salvou o callback e o verify token antes de continuar.';
+    }
+    return null;
+  };
+
+  const guardedSetDrawerOpen = (open: boolean) => {
+    if (!open) {
+      const warning = hookCloudLifecycleWarning(hookCloudLifecycle);
+      if (warning) {
+        toast.warning(warning);
+        return;
+      }
+    }
+    setDrawerOpen(open);
+  };
 
   useIntegrations();
   const { data: configuredMap = {} } = useAllConfiguredIntegrations();
@@ -86,6 +112,16 @@ export function IntegrationsManager() {
   };
 
   const handleClick = (item: IntegrationItem) => {
+    // FASE 18B, achado 3 — trocar de item enquanto o formulário HookCloud
+    // está submetendo ou com um segredo pendente de confirmação
+    // desmontaria `HookCloudOnboardingConfig` silenciosamente, perdendo o
+    // segredo (ou a submissão em andamento) para sempre. Bloqueado
+    // independentemente de qual card foi clicado.
+    const warning = hookCloudLifecycleWarning(hookCloudLifecycle);
+    if (warning) {
+      toast.warning(warning);
+      return;
+    }
     if (item.comingSoon) {
       toast.info(`${item.name} estará disponível em breve!`, {
         description: 'Vamos avisar você assim que liberarmos.',
@@ -327,7 +363,8 @@ export function IntegrationsManager() {
       <IntegrationConfigDrawer
         item={selected}
         open={drawerOpen}
-        onOpenChange={setDrawerOpen}
+        onOpenChange={guardedSetDrawerOpen}
+        onHookCloudLifecycleChange={setHookCloudLifecycle}
       />
     </div>
   );
