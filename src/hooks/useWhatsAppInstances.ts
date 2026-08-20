@@ -4,9 +4,24 @@ import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
 import { toast } from 'sonner';
 
+// FASE 18C — `provider` é a única fonte de verdade sobre o transporte
+// desta conexão (ver `_shared/whatsapp-provider/resolve.ts` e
+// `src/lib/whatsapp/connectionProviderView.ts`). `meta_cloud_config` é o
+// registro 1:1 satélite (`evolution_instances_meta_cloud`), embutido só
+// para exibição segura (nunca usado para decidir se uma ação de
+// transporte UazAPI é permitida — essa decisão depende SOMENTE de
+// `provider`). Nunca contém token — `access_token_secret_ref` é uma
+// referência opaca a um secret no Vault, não o segredo em si.
+export interface WhatsAppInstanceMetaCloudConfig {
+  onboarding_state: string | null;
+  onboarding_source: string | null;
+}
+
 export interface WhatsAppInstance {
   id: string;
   organization_id: string;
+  provider?: string | null;
+  meta_cloud_config?: WhatsAppInstanceMetaCloudConfig | null;
   name: string;
   custom_name: string | null;
   offer_name: string | null;
@@ -152,13 +167,18 @@ export function useWhatsAppInstances() {
   return useQuery({
     queryKey: ['whatsapp-instances', profile?.organization_id],
     queryFn: async (): Promise<WhatsAppInstance[]> => {
+      // FASE 18C: embute o registro 1:1 de `evolution_instances_meta_cloud`
+      // (só para exibição segura — "Pendente de configuração" — nunca para
+      // decidir se uma ação UazAPI é permitida; essa decisão usa só
+      // `provider`, já presente em `select('*')`). Para uma linha UazAPI,
+      // esse embed vem null (nenhuma linha satélite existe para ela).
       const { data, error } = await supabase
         .from('evolution_instances')
-        .select('*')
+        .select('*, meta_cloud_config:evolution_instances_meta_cloud(onboarding_state, onboarding_source)')
         .eq('organization_id', profile!.organization_id!)
         .order('created_at', { ascending: true });
       if (error) throw error;
-      return (data || []) as WhatsAppInstance[];
+      return (data || []) as unknown as WhatsAppInstance[];
     },
     enabled: !!profile?.organization_id,
     refetchInterval: 300000, // 60s -> 5min (Realtime de evolution_instances cobre mudanças)
@@ -171,12 +191,15 @@ export function useAllWhatsAppInstancesAdmin() {
   return useQuery({
     queryKey: ['whatsapp-instances-all'],
     queryFn: async (): Promise<WhatsAppInstanceWithOrg[]> => {
+      // FASE 18C: mesmo embed de `useWhatsAppInstances` — só para exibição
+      // segura, RLS já concede `is_super_admin` acesso a todas as linhas
+      // desta tabela satélite (mesma política usada pelo painel org-scoped).
       const { data, error } = await supabase
         .from('evolution_instances')
-        .select('*, organization:organizations(id, name)')
+        .select('*, organization:organizations(id, name), meta_cloud_config:evolution_instances_meta_cloud(onboarding_state, onboarding_source)')
         .order('created_at', { ascending: false });
       if (error) throw error;
-      return (data || []) as WhatsAppInstanceWithOrg[];
+      return (data || []) as unknown as WhatsAppInstanceWithOrg[];
     },
   });
 }

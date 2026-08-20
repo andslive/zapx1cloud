@@ -39,6 +39,7 @@ import {
   type WhatsAppInstanceWithOrg,
 } from '@/hooks/useWhatsAppInstances';
 import { useQuery } from '@tanstack/react-query';
+import { classifyConnectionForDisplay } from '@/lib/whatsapp/connectionProviderView';
 
 function StatusBadge({ status }: { status: string }) {
   const map: Record<string, { label: string; variant: 'default' | 'secondary' | 'destructive' | 'outline' }> = {
@@ -481,9 +482,22 @@ function InstancesTable({ provider }: { provider: 'evolution' | 'uazapi' }) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filtered.map((inst) => (
+              {filtered.map((inst) => {
+                // FASE 18C — mesma classificação usada no painel org-scoped
+                // (`WhatsAppInstancesPanel.tsx`): nenhuma ação de transporte
+                // UazAPI (Conectar/QR, Pausar, Desvincular) é oferecida para
+                // uma conexão que não seja `provider='uazapi'`. Renomear/
+                // Atribuir/Excluir continuam disponíveis (não chamam a
+                // UazAPI para decidir NADA sobre transporte).
+                const isUazapi = classifyConnectionForDisplay(inst, inst.meta_cloud_config) === 'uazapi';
+                return (
                 <TableRow key={inst.id} className={!inst.organization_id ? 'bg-amber-500/5' : ''}>
-                  <TableCell className="font-medium">{inst.name}</TableCell>
+                  <TableCell className="font-medium">
+                    <div className="flex items-center gap-2">
+                      {inst.name}
+                      {!isUazapi && <Badge variant="secondary" className="text-[10px]">HookCloud</Badge>}
+                    </div>
+                  </TableCell>
                   <TableCell className="text-sm">
                     {inst.organization?.name ? (
                       inst.organization.name
@@ -494,18 +508,24 @@ function InstancesTable({ provider }: { provider: 'evolution' | 'uazapi' }) {
                     )}
                   </TableCell>
                   <TableCell className="text-sm">{inst.phone_number ? `+${inst.phone_number}` : '—'}</TableCell>
-                  <TableCell><StatusBadge status={inst.status} /></TableCell>
+                  <TableCell>{isUazapi ? <StatusBadge status={inst.status} /> : (
+                    <Badge variant="outline" className="text-amber-600 border-amber-500/30 bg-amber-500/5">Pendente de configuração</Badge>
+                  )}</TableCell>
                   <TableCell>
-                    {inst.webhook_subscribed ? (
-                      <Badge variant="default" className="gap-1"><CheckCircle2 className="h-3 w-3" /> OK</Badge>
+                    {isUazapi ? (
+                      inst.webhook_subscribed ? (
+                        <Badge variant="default" className="gap-1"><CheckCircle2 className="h-3 w-3" /> OK</Badge>
+                      ) : (
+                        <Badge variant="outline" className="text-amber-600 border-amber-500/40">Pendente</Badge>
+                      )
                     ) : (
-                      <Badge variant="outline" className="text-amber-600 border-amber-500/40">Pendente</Badge>
+                      <span className="text-muted-foreground text-xs">—</span>
                     )}
                   </TableCell>
                   <TableCell>
                     {inst.is_default ? (
                       <Star className="h-4 w-4 fill-yellow-400 text-yellow-400" />
-                    ) : inst.organization_id ? (
+                    ) : inst.organization_id && isUazapi ? (
                       <Button variant="ghost" size="sm" onClick={() => setDefaultMut.mutate(inst.id)}>
                         <Star className="h-4 w-4" />
                       </Button>
@@ -515,15 +535,15 @@ function InstancesTable({ provider }: { provider: 'evolution' | 'uazapi' }) {
                   </TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-2">
-                       {inst.status !== 'connected' && inst.status !== 'paired' && inst.status === 'qr_pending' && (
+                      {isUazapi && inst.status !== 'connected' && inst.status !== 'paired' && inst.status === 'qr_pending' && (
                         <Button variant="outline" size="sm" onClick={() => setEditing(inst)}>
                           <Eye className="h-4 w-4 mr-2" /> QR Code
                         </Button>
                       )}
-                      {inst.status !== 'connected' && inst.status !== 'paired' && inst.status === 'disconnected' && (
-                        <Button 
-                          variant="outline" 
-                          size="sm" 
+                      {isUazapi && inst.status !== 'connected' && inst.status !== 'paired' && inst.status === 'disconnected' && (
+                        <Button
+                          variant="outline"
+                          size="sm"
                           onClick={() => handleConnect(inst)}
                           disabled={connectMut.isPending}
                         >
@@ -536,7 +556,7 @@ function InstancesTable({ provider }: { provider: 'evolution' | 'uazapi' }) {
                         </Button>
                       )}
 
-                      {(inst.status === 'connected' || inst.status === 'paired') && (
+                      {isUazapi && (inst.status === 'connected' || inst.status === 'paired') && (
                         <>
                           <Button variant="ghost" size="sm" onClick={() => setPausing(inst)} title="Pausar sessão">
                             <Pause className="h-4 w-4" />
@@ -549,13 +569,16 @@ function InstancesTable({ provider }: { provider: 'evolution' | 'uazapi' }) {
                       <Button variant="ghost" size="sm" onClick={() => setEditing(inst)} title="Editar / Atribuir">
                         <Pencil className="h-4 w-4" />
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => deleteMut.mutate(inst.id)} title="Excluir">
-                        <Trash2 className="h-4 w-4 text-destructive" />
-                      </Button>
+                      {isUazapi && (
+                        <Button variant="ghost" size="sm" onClick={() => deleteMut.mutate(inst.id)} title="Excluir">
+                          <Trash2 className="h-4 w-4 text-destructive" />
+                        </Button>
+                      )}
                     </div>
                   </TableCell>
                 </TableRow>
-              ))}
+                );
+              })}
             </TableBody>
           </Table>
         </div>

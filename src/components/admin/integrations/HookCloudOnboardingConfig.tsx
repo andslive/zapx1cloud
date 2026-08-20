@@ -403,9 +403,8 @@ export function HookCloudOnboardingConfig({ onSensitiveLifecycleChange }: HookCl
                 <button
                   type="button"
                   onClick={() => setShowToken((s) => !s)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded-sm text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   aria-label={showToken ? 'Ocultar token' : 'Mostrar token'}
-                  tabIndex={-1}
                 >
                   {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </button>
