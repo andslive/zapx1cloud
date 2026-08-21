@@ -76,3 +76,54 @@ Deno.test("padrão de fallback (find + isUazapiInstance): organização sem nenh
   const firstEligible: { id: string; provider?: string | null } | undefined = [].find((inst: { id: string; provider?: string | null }) => isUazapiInstance(inst));
   assertEquals(firstEligible, undefined);
 });
+
+// ── Fase 18I — mesmo padrão usado em uazapi-webhook/index.ts (resolução
+// de instância do evento inbound real da UazAPI: candidatos vêm de uma
+// consulta por `instance_id`/`name`/`id`, SEM filtro de provider — o
+// filtro `isUazapiInstance` é aplicado como um passo próprio, ANTES de
+// qualquer lógica de prioridade `is_active`/`status`, para que uma linha
+// Meta/HookCloud nunca possa vencer essa prioridade e ser tratada como
+// se fosse a conexão UazAPI real do evento.
+
+interface FakeUazapiWebhookCandidate {
+  id: string;
+  provider?: string | null;
+  is_active: boolean;
+  status: string;
+  phone_number?: string | null;
+}
+
+function resolveByPriority(candidates: FakeUazapiWebhookCandidate[]): FakeUazapiWebhookCandidate | undefined {
+  const eligible = candidates.filter((i) => isUazapiInstance(i));
+  return eligible.find((i) => i.is_active && i.status === "connected")
+    || eligible.find((i) => i.is_active)
+    || eligible[0];
+}
+
+Deno.test("resolução do webhook UazAPI: candidato HookCloud (is_active=true, status='disconnected') nunca vence a prioridade sobre uma UazAPI real, mesmo desconectada", () => {
+  const candidates: FakeUazapiWebhookCandidate[] = [
+    { id: "hookcloud-1", provider: "meta_cloud", is_active: true, status: "disconnected" },
+    { id: "uazapi-1", provider: "uazapi", is_active: true, status: "disconnected" },
+  ];
+  const resolved = resolveByPriority(candidates);
+  assertEquals(resolved?.id, "uazapi-1");
+});
+
+Deno.test("resolução do webhook UazAPI: só existe candidato HookCloud/desconhecido para o identificador => nenhuma instância resolvida (evento é descartado, nunca tratado como UazAPI)", () => {
+  const candidates: FakeUazapiWebhookCandidate[] = [
+    { id: "hookcloud-1", provider: "meta_cloud", is_active: true, status: "disconnected" },
+    { id: "unknown-1", provider: "chromium", is_active: true, status: "connected" },
+  ];
+  const resolved = resolveByPriority(candidates);
+  assertEquals(resolved, undefined);
+});
+
+Deno.test("resolução do webhook UazAPI: UazAPI ativa e conectada continua vencendo exatamente como antes (nenhuma regressão de prioridade)", () => {
+  const candidates: FakeUazapiWebhookCandidate[] = [
+    { id: "uazapi-inactive", provider: "uazapi", is_active: false, status: "disconnected" },
+    { id: "uazapi-active-connected", provider: null, is_active: true, status: "connected" },
+    { id: "uazapi-active-disconnected", provider: "uazapi", is_active: true, status: "disconnected" },
+  ];
+  const resolved = resolveByPriority(candidates);
+  assertEquals(resolved?.id, "uazapi-active-connected");
+});

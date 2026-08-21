@@ -17,6 +17,7 @@ import {
   resolveOriginalEventTime,
 } from "../_shared/receipt-recovery.ts";
 import { resolveEvolutionProviderConfig } from "../_shared/evolution-provider-config.ts";
+import { isUazapiInstance } from "../whatsapp-proxy/provider-guard.ts";
 import { renderMessageTextOrSkip } from "./message-render.ts";
 import {
   buildTransactionFingerprint,
@@ -3339,7 +3340,7 @@ Deno.serve(async (req) => {
     if (uuidRegex.test(norm.instance)) {
       query += `,id.eq.${norm.instance}`;
     }
-    const { data: instances } = await supabase
+    const { data: rawInstances } = await supabase
       .from("evolution_instances")
       .select("*")
       .or(query)
@@ -3347,10 +3348,32 @@ Deno.serve(async (req) => {
       .order("status", { ascending: true })
       .order("created_at", { ascending: false });
 
+    // FASE 18I — este é o webhook INBOUND da UazAPI: um evento real dela
+    // nunca pode legitimamente identificar uma conexão Meta/HookCloud.
+    // Sem este filtro, uma linha `provider='meta_cloud'` (sempre
+    // `is_active=true` por padrão, `status='disconnected'`) podia entrar
+    // nos candidatos por colisão de `name`/`instance_id` (a consulta
+    // acima não filtra organização nem provider) e vencer o segundo
+    // nível de prioridade (`i.is_active`) quando não houvesse nenhuma
+    // UazAPI "ativa e conectada" com o mesmo identificador — associando a
+    // mensagem/lead/conversa inbound a uma conexão pendente, sem
+    // transporte real. Corrigido excluindo candidatos não-UazAPI ANTES de
+    // qualquer lógica de prioridade (nunca depois — nunca deixa uma
+    // linha Meta/HookCloud ser escolhida e só bloqueada no envio).
+    //
+    // Isto NÃO corrige o achado mais amplo, pré-existente e fora do
+    // escopo desta PR: a consulta acima ainda resolve por `name`/
+    // `instance_id` sem filtro de `organization_id`, então uma colisão
+    // de nome ENTRE DUAS ORGANIZAÇÕES UazAPI continua teoricamente
+    // possível — ver relatório da Fase 18I para o plano de correção
+    // separado (exigiria autenticação real do webhook e/ou constraint de
+    // unicidade, fora do escopo de "isolamento HookCloud" desta PR).
+    const instances = (rawInstances || []).filter((i) => isUazapiInstance(i));
+
     console.log("[uazapi-webhook] candidates found:", instances?.length || 0, "for", norm.instance);
 
     // Filtragem rigorosa por prioridade
-    let instance = instances?.find(i => i.is_active && i.status === 'connected') 
+    let instance = instances?.find(i => i.is_active && i.status === 'connected')
                 || instances?.find(i => i.is_active)
                 || instances?.[0];
 
@@ -3367,14 +3390,17 @@ Deno.serve(async (req) => {
         `[uazapi-webhook] instance not found by instance_id or name: ${norm.instance}. Trying secondary lookups...`,
       );
       // Last-resort: try metadata.instance_name / metadata.instance_uuid
-      const { data: byMeta } = await supabase
+      const { data: rawByMeta } = await supabase
         .from("evolution_instances")
         .select("*")
         .or(
           `metadata->>instance_name.eq.${norm.instance},metadata->>instance_uuid.eq.${norm.instance}`,
         )
         .order("is_active", { ascending: false });
-      instance = byMeta?.find(i => i.is_active && i.status === 'connected') 
+      // FASE 18I — mesmo filtro do lookup primário: um evento real da
+      // UazAPI nunca pode resolver para uma conexão Meta/HookCloud.
+      const byMeta = (rawByMeta || []).filter((i) => isUazapiInstance(i));
+      instance = byMeta?.find(i => i.is_active && i.status === 'connected')
               || byMeta?.find(i => i.is_active)
               || byMeta?.[0];
     }
