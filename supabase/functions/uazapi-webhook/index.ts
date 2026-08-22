@@ -18,11 +18,15 @@ import {
 } from "../_shared/receipt-recovery.ts";
 import { resolveEvolutionProviderConfig } from "../_shared/evolution-provider-config.ts";
 import { isUazapiInstance } from "../whatsapp-proxy/provider-guard.ts";
+import { redactUazapiWebhookPayloadForLog } from "../_shared/uazapi-webhook-token-auth.ts";
 import {
-  extractUazapiWebhookToken,
-  redactUazapiWebhookPayloadForLog,
-  resolveUazapiInstanceByToken,
-} from "../_shared/uazapi-webhook-token-auth.ts";
+  evaluateUazapiWebhookTokenAuth,
+  logUazapiWebhookTokenAuthTelemetry,
+  parseUazapiWebhookTokenAuthMode,
+  sanitizeUazapiWebhookEventTypeForTelemetry,
+  selectCandidatesForProcessing,
+  UnknownUazapiWebhookTokenAuthModeError,
+} from "../_shared/uazapi-webhook-token-auth-rollout.ts";
 import { renderMessageTextOrSkip } from "./message-render.ts";
 import {
   buildTransactionFingerprint,
@@ -2377,6 +2381,32 @@ Deno.serve(async (req) => {
     const payload = await req.json().catch(() => ({}));
     const action = queryAction || payload.action;
 
+    // FASE 18N — modo de rollout da autenticação por token de instância
+    // (Fase 18K): `observe` mede compatibilidade com tráfego real sem
+    // bloquear nada; `enforce` é o comportamento incondicional
+    // introduzido na Fase 18K. Um valor de configuração desconhecido
+    // NUNCA vira `observe`/`enforce` por adivinhação — rejeita a
+    // requisição com um erro uniforme de configuração (nunca um erro
+    // específico de conexão/organização, e nunca 200 disfarçando uma
+    // falha operacional real). Ver `_shared/uazapi-webhook-token-auth-rollout.ts`
+    // para a semântica completa e as limitações do modo `observe`.
+    let uazapiWebhookTokenAuthMode: ReturnType<typeof parseUazapiWebhookTokenAuthMode>;
+    try {
+      uazapiWebhookTokenAuthMode = parseUazapiWebhookTokenAuthMode(
+        Deno.env.get("UAZAPI_WEBHOOK_TOKEN_AUTH_MODE"),
+      );
+    } catch (modeError) {
+      if (modeError instanceof UnknownUazapiWebhookTokenAuthModeError) {
+        console.error("[UAZAPI_WEBHOOK_TOKEN_AUTH_MODE_INVALID]", {
+          message: modeError.message,
+        });
+      }
+      return new Response(
+        JSON.stringify({ ok: false, error: "configuration_error" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     let healthId: string | null = null;
     let norm: Normalized | null = null;
 
@@ -3385,30 +3415,49 @@ Deno.serve(async (req) => {
     // `token` chega no corpo de todo evento UazAPI e é o mesmo segredo
     // já armazenado em `evolution_instances.instance_token` (usado hoje
     // para autenticar chamadas de SAÍDA). Comparação em tempo constante,
-    // nunca via filtro SQL. Falha fechada em 0 ou >1 correspondências —
-    // nunca escolhe "o primeiro" nem "o mais recente" por omissão. A
-    // partir daqui, `instances` contém no máximo UMA linha, já
-    // autenticada; toda a lógica de prioridade abaixo (is_active/status)
-    // e o redirecionamento para "parceiro ativo" continuam operando
-    // exatamente como antes, mas agora sobre um conjunto pré-autenticado
-    // em vez de um conjunto ambíguo resolvido só por nome/instance_id.
-    // Ver `_shared/uazapi-webhook-token-auth.ts` para o modelo de
-    // segurança completo (classificação: SHARED_SECRET_INSTANCE_AUTHENTICATION,
-    // não HMAC — ver relatório da Fase 18K).
-    const receivedUazapiToken = extractUazapiWebhookToken(payload);
-    const primaryTokenAuth = resolveUazapiInstanceByToken(textCandidates, receivedUazapiToken);
-    if (primaryTokenAuth.outcome !== "matched") {
+    // nunca via filtro SQL. Ver `_shared/uazapi-webhook-token-auth.ts`
+    // para o modelo de segurança completo (classificação:
+    // SHARED_SECRET_INSTANCE_AUTHENTICATION, não HMAC).
+    //
+    // FASE 18N — a avaliação acontece SEMPRE, nos dois modos, para gerar
+    // telemetria comparável entre `observe` e `enforce`; quem decide se
+    // ela BLOQUEIA o processamento é exclusivamente `selectCandidatesForProcessing`,
+    // por modo:
+    //  - `enforce`: idêntico ao comportamento incondicional da Fase 18K —
+    //    `instances` contém no máximo UMA linha, já autenticada.
+    //  - `observe`: `instances` é o mesmo conjunto pré-Fase-18K (todos os
+    //    candidatos textuais já filtrados por `isUazapiInstance`, Fase
+    //    18I) — a avaliação do token NUNCA reduz nem reordena esse
+    //    conjunto; só é usada para log. A lógica de prioridade abaixo
+    //    (is_active/status) e o redirecionamento para "parceiro ativo"
+    //    continuam operando exatamente como sempre, em qualquer modo.
+    const primaryTokenAuthEvaluation = evaluateUazapiWebhookTokenAuth(
+      rawInstances || [],
+      payload,
+      isUazapiInstance,
+    );
+    logUazapiWebhookTokenAuthTelemetry({
+      code: primaryTokenAuthEvaluation.code,
+      mode: uazapiWebhookTokenAuthMode,
+      sanitizedEventType: sanitizeUazapiWebhookEventTypeForTelemetry(payload),
+    });
+    if (primaryTokenAuthEvaluation.code !== "token_auth_match") {
       console.warn("[UAZAPI_WEBHOOK_TOKEN_AUTH_REJECTED]", {
         stage: "primary",
-        reason: primaryTokenAuth.reason,
-        matchCount: primaryTokenAuth.matchCount,
+        mode: uazapiWebhookTokenAuthMode,
+        code: primaryTokenAuthEvaluation.code,
         candidateCount: textCandidates.length,
         instanceIdentifier: norm.instance,
       });
     }
-    const instances = primaryTokenAuth.outcome === "matched" ? [primaryTokenAuth.instance] : [];
+    const instances = selectCandidatesForProcessing(
+      uazapiWebhookTokenAuthMode,
+      textCandidates,
+      primaryTokenAuthEvaluation,
+      isUazapiInstance,
+    );
 
-    // Filtragem rigorosa por prioridade (agora sobre no máximo 1 candidato autenticado)
+    // Filtragem rigorosa por prioridade (em `enforce`, no máximo 1 candidato autenticado; em `observe`, inalterado)
     let instance = instances?.find(i => i.is_active && i.status === 'connected')
                 || instances?.find(i => i.is_active)
                 || instances?.[0];
@@ -3436,18 +3485,33 @@ Deno.serve(async (req) => {
       // FASE 18I — mesmo filtro do lookup primário: um evento real da
       // UazAPI nunca pode resolver para uma conexão Meta/HookCloud.
       const byMetaTextCandidates = (rawByMeta || []).filter((i) => isUazapiInstance(i));
-      // FASE 18K — mesma autenticação por token do lookup primário.
-      const secondaryTokenAuth = resolveUazapiInstanceByToken(byMetaTextCandidates, receivedUazapiToken);
-      if (secondaryTokenAuth.outcome !== "matched") {
+      // FASE 18K/18N — mesma autenticação por token e mesma política por
+      // modo do lookup primário.
+      const secondaryTokenAuthEvaluation = evaluateUazapiWebhookTokenAuth(
+        rawByMeta || [],
+        payload,
+        isUazapiInstance,
+      );
+      logUazapiWebhookTokenAuthTelemetry({
+        code: secondaryTokenAuthEvaluation.code,
+        mode: uazapiWebhookTokenAuthMode,
+        sanitizedEventType: sanitizeUazapiWebhookEventTypeForTelemetry(payload),
+      });
+      if (secondaryTokenAuthEvaluation.code !== "token_auth_match") {
         console.warn("[UAZAPI_WEBHOOK_TOKEN_AUTH_REJECTED]", {
           stage: "secondary_by_meta",
-          reason: secondaryTokenAuth.reason,
-          matchCount: secondaryTokenAuth.matchCount,
+          mode: uazapiWebhookTokenAuthMode,
+          code: secondaryTokenAuthEvaluation.code,
           candidateCount: byMetaTextCandidates.length,
           instanceIdentifier: norm.instance,
         });
       }
-      const byMeta = secondaryTokenAuth.outcome === "matched" ? [secondaryTokenAuth.instance] : [];
+      const byMeta = selectCandidatesForProcessing(
+        uazapiWebhookTokenAuthMode,
+        byMetaTextCandidates,
+        secondaryTokenAuthEvaluation,
+        isUazapiInstance,
+      );
       instance = byMeta?.find(i => i.is_active && i.status === 'connected')
               || byMeta?.find(i => i.is_active)
               || byMeta?.[0];
