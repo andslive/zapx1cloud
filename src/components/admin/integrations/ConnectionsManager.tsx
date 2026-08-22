@@ -53,6 +53,7 @@ import { AdminStatusNotificationConfig } from './AdminStatusNotificationConfig';
 import { SimulateOutageModal } from './SimulateOutageModal';
 import { supabase } from '@/integrations/supabase/client';
 import type { Funnel } from '@/types/funnel';
+import { classifyConnectionForDisplay } from '@/lib/whatsapp/connectionProviderView';
 
 
 
@@ -424,7 +425,15 @@ export default function ConnectionsManager() {
   };
 
   const mergedConnections = useMemo(() => {
-    const uaz = uazInstances || [];
+    // FASE 18C — esta tela mescla sessões Chromium (VPS) com conexões
+    // UazAPI; não foi projetada para conexões Meta/HookCloud (que não têm
+    // QR Code Chromium, não têm `instance_token` UazAPI, e as ações desta
+    // tabela chamam `whatsapp-proxy` por `id` sem checar provider). Uma
+    // conexão HookCloud pendente é excluída aqui na origem, antes de
+    // qualquer merge/ação — nunca aparece nesta tela, em vez de aparecer
+    // e receber uma ação UazAPI. Continua visível/gerenciável só no
+    // painel de Integrações → HookCloud (`WhatsAppInstancesPanel.tsx`).
+    const uaz = (uazInstances || []).filter((u) => classifyConnectionForDisplay(u, u.meta_cloud_config) === 'uazapi');
     const chrom = chromiumInstances || [];
 
     console.log('[AUDIT] UAZAPI CONNECTIONS', { count: uaz.length, items: uaz });

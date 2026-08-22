@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import { isUazapiInstance } from "../whatsapp-proxy/provider-guard.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -125,16 +126,29 @@ Deno.serve(async (req) => {
     const newUserId = created.user.id;
     const orgId = callerProfile.organization_id;
 
-    // Fallback: if caller didn't provide a connection, pick the first instance of the org
+    // Fallback: if caller didn't provide a connection, pick the first
+    // UazAPI instance of the org.
+    //
+    // FASE 18G — achado real de auditoria: esta consulta não filtrava
+    // `provider`, então uma conexão Meta/HookCloud (provider='meta_cloud',
+    // sempre pendente) podia ser escolhida como `default_connection_id`
+    // de um vendedor novo sempre que o admin não selecionasse
+    // explicitamente uma conexão na criação do usuário. Corrigido
+    // reutilizando `isUazapiInstance` (já testada em
+    // `whatsapp-proxy/provider-guard.test.ts`) — nunca reimplementa a
+    // regra de retrocompatibilidade (provider ausente/nulo = 'uazapi')
+    // numa segunda vez. Nenhuma alteração para as conexões UazAPI reais
+    // existentes (todas continuam elegíveis exatamente como antes).
     let resolvedConnectionId: string | null = body.default_connection_id || null;
     if (!resolvedConnectionId) {
-      const { data: firstInstance } = await admin
+      const { data: orgInstances } = await admin
         .from('evolution_instances')
-        .select('id')
+        .select('id, provider')
         .eq('organization_id', orgId)
-        .limit(1)
-        .maybeSingle();
-      resolvedConnectionId = firstInstance?.id || null;
+        .order('created_at', { ascending: true })
+        .limit(50);
+      const firstEligible = (orgInstances || []).find((inst) => isUazapiInstance(inst));
+      resolvedConnectionId = firstEligible?.id || null;
     }
 
     // Update profile (handle_new_user trigger inserted basic record)

@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { authorizationFailureResponseBody, authorizeUazapiConnectionAccess } from "./connection-authorization.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -232,9 +233,20 @@ Deno.serve(async (req) => {
     if (action === "repair_webhook" || action === "check_webhook") {
       const id = body.id || body.instance_id;
       if (!id) return new Response(JSON.stringify({ error: "ID is required" }), { status: 400, headers: corsHeaders });
-      
-      const { data: instance } = await supabase.from("evolution_instances").select("*").or(`id.eq.${id},instance_id.eq.${id}`).single();
-      if (!instance) return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: corsHeaders });
+
+      // FASE 18D — gates obrigatórios, nesta ordem: autenticação → perfil/
+      // papel/organização (ou service role real, escopado) → busca da
+      // conexão DENTRO do escopo autorizado → provider. `instance_token`
+      // só é lido depois disso (ver uso abaixo), nunca antes.
+      const auth = await authorizeUazapiConnectionAccess({
+        supabase, connectionId: String(id), isServiceRole, userId: user?.id ?? null,
+        bodyOrganizationId: body.organization_id, alsoMatchInstanceId: true,
+      });
+      if (auth.kind !== "authorized") {
+        const { status, body: failBody } = authorizationFailureResponseBody(auth);
+        return new Response(JSON.stringify(failBody), { status, headers: corsHeaders });
+      }
+      const instance = auth.instance;
 
       if (action === "repair_webhook") {
         const res = await waFetch(config, `/webhook/set`, {
@@ -303,8 +315,16 @@ Deno.serve(async (req) => {
     if (action === "connect_instance") {
       const id = body.id;
       if (!id) return new Response(JSON.stringify({ error: "ID is required" }), { status: 400, headers: corsHeaders });
-      const { data: instance } = await supabase.from("evolution_instances").select("*").eq("id", id).single();
-      if (!instance) return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: corsHeaders });
+
+      const auth = await authorizeUazapiConnectionAccess({
+        supabase, connectionId: String(id), isServiceRole, userId: user?.id ?? null,
+        bodyOrganizationId: body.organization_id,
+      });
+      if (auth.kind !== "authorized") {
+        const { status, body: failBody } = authorizationFailureResponseBody(auth);
+        return new Response(JSON.stringify(failBody), { status, headers: corsHeaders });
+      }
+      const instance = auth.instance;
 
       const res = await waFetch(config, "/instance/connect", { method: "POST", body: JSON.stringify({ browser: "auto" }) }, instance.instance_token);
       if (res.ok) {
@@ -319,35 +339,53 @@ Deno.serve(async (req) => {
 
     if (action === "delete_instance_self") {
       const id = body.id;
-      const { data: instance } = await supabase.from("evolution_instances").select("*").eq("id", id).single();
-      if (instance) {
-        // 1) Remove do banco primeiro (fonte da verdade do painel)
-        const { error: dbErr } = await supabase.from("evolution_instances").delete().eq("id", id);
-        if (dbErr) {
-          console.error(`[${requestId}] [DELETE_SELF] DB delete failed:`, dbErr);
-          return new Response(JSON.stringify({ ok: false, error: dbErr.message }), { status: 500, headers: corsHeaders });
-        }
-        console.log(`[${requestId}] [DELETE_SELF] DB row deleted: ${id} (${instance.name})`);
+      if (!id) return new Response(JSON.stringify({ error: "ID is required" }), { status: 400, headers: corsHeaders });
 
-        // 2) Remoção remota na UazAPI: best-effort com timeout de 10s (não bloqueia a limpeza)
-        let remote: { ok: boolean; status?: number; message?: string } = { ok: false };
-        try {
-          const res = await waFetch(
-            config,
-            `/instance/remove/${instance.name}`,
-            { method: "DELETE", signal: AbortSignal.timeout(10000) },
-            instance.instance_token,
-            true
-          );
-          remote = { ok: res.ok, status: res.status, message: res.message };
-        } catch (err: any) {
-          console.error(`[${requestId}] [DELETE_SELF] Remote remove failed/timeout:`, err?.message);
-          remote = { ok: false, message: err?.message || "timeout" };
-        }
-        console.log(`[${requestId}] [DELETE_SELF] Remote result:`, JSON.stringify(remote));
-        return new Response(JSON.stringify({ ok: true, remote }), { headers: corsHeaders });
+      // FASE 18D — nota de comportamento: antes desta fase, um `id`
+      // inexistente respondia 200 `{ ok:true, alreadyGone:true }`
+      // (exclusão idempotente). Isso agora responde 404, igual a uma
+      // conexão de outra organização — a Parte 3 desta fase exige
+      // explicitamente que conexão inexistente e conexão cross-tenant
+      // sejam INDISTINGUÍVEIS pelo chamador (nunca permitir enumeração
+      // de IDs entre organizações). Efeito colateral aceito: um duplo
+      // clique em "excluir" que antes era silencioso agora mostra um
+      // erro — trade-off deliberado, priorizando a garantia de
+      // isolamento sobre essa idempotência cosmética.
+      const auth = await authorizeUazapiConnectionAccess({
+        supabase, connectionId: String(id), isServiceRole, userId: user?.id ?? null,
+        bodyOrganizationId: body.organization_id,
+      });
+      if (auth.kind !== "authorized") {
+        const { status, body: failBody } = authorizationFailureResponseBody(auth);
+        return new Response(JSON.stringify(failBody), { status, headers: corsHeaders });
       }
-      return new Response(JSON.stringify({ ok: true, alreadyGone: true }), { headers: corsHeaders });
+      const instance = auth.instance;
+
+      // 1) Remove do banco primeiro (fonte da verdade do painel)
+      const { error: dbErr } = await supabase.from("evolution_instances").delete().eq("id", id);
+      if (dbErr) {
+        console.error(`[${requestId}] [DELETE_SELF] DB delete failed:`, dbErr);
+        return new Response(JSON.stringify({ ok: false, error: dbErr.message }), { status: 500, headers: corsHeaders });
+      }
+      console.log(`[${requestId}] [DELETE_SELF] DB row deleted: ${id} (${instance.name})`);
+
+      // 2) Remoção remota na UazAPI: best-effort com timeout de 10s (não bloqueia a limpeza)
+      let remote: { ok: boolean; status?: number; message?: string } = { ok: false };
+      try {
+        const res = await waFetch(
+          config,
+          `/instance/remove/${instance.name}`,
+          { method: "DELETE", signal: AbortSignal.timeout(10000) },
+          instance.instance_token,
+          true
+        );
+        remote = { ok: res.ok, status: res.status, message: res.message };
+      } catch (err: any) {
+        console.error(`[${requestId}] [DELETE_SELF] Remote remove failed/timeout:`, err?.message);
+        remote = { ok: false, message: err?.message || "timeout" };
+      }
+      console.log(`[${requestId}] [DELETE_SELF] Remote result:`, JSON.stringify(remote));
+      return new Response(JSON.stringify({ ok: true, remote }), { headers: corsHeaders });
     }
 
     if (action === "sync_instances") {

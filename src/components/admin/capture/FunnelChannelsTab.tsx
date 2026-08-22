@@ -22,6 +22,7 @@ import { Funnel, FunnelChannelConfig } from '@/types/funnel';
 import { useUpdateFunnel } from '@/hooks/useFunnels';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
+import { filterUazapiOnlyConnections } from '@/lib/whatsapp/connectionProviderView';
 
 interface FunnelChannelsTabProps {
   funnel: Funnel;
@@ -40,10 +41,18 @@ export function FunnelChannelsTab({ funnel }: FunnelChannelsTabProps) {
     (async () => {
       const { data } = await supabase
         .from('evolution_instances')
-        .select('id, name, phone_number, status, organization_id, is_active')
+        .select('id, name, phone_number, status, provider, organization_id, is_active')
         .eq('organization_id', funnel.organization_id)
         .eq('is_active', true);
-      if (!cancelled) setEvolutionInstances((data || []) as any);
+      // FASE 18D — este seletor persiste `evolution_instance_id` no funil
+      // (o funil VAI enviar mensagens por essa conexão). Uma conexão
+      // Meta/HookCloud pendente (ou provider desconhecido) nunca pode
+      // aparecer aqui. Filtra só por PROVIDER (`filterUazapiOnlyConnections`), sem
+      // adicionar nenhuma regra nova de status — este seletor sempre
+      // permitiu escolher uma UazAPI ainda desconectada como canal futuro
+      // do funil, e essa regra é preservada exatamente como estava.
+      const eligible = filterUazapiOnlyConnections(data || []);
+      if (!cancelled) setEvolutionInstances(eligible as any);
     })();
     return () => { cancelled = true; };
   }, [funnel.organization_id]);

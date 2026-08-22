@@ -37,6 +37,7 @@ import type { WebhookAction, WebhookActionConfig, FollowupStep } from '@/types/w
 import { ACTION_TYPES } from '@/types/webhook';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Trash2, Clock } from 'lucide-react';
+import { isUazapiProvider } from '@/lib/whatsapp/connectionProviderView';
 import {
   Tooltip,
   TooltipContent,
@@ -952,7 +953,11 @@ export function ActionConfigDialog({
   const renderTriggerFlowConfig = () => {
     const channel = config.flow_channel || 'whatsapp';
     const activeFunnels = (funnels || []).filter((f: any) => f.status === 'active' || f.status === 'draft');
-    const connectedInstances = (evolutionInstances || []).filter((i) => i.status === 'connected');
+    // FASE 18E — persiste `flow_evolution_instance_id` (conexão real usada
+    // para enviar o fluxo desta ação de webhook) — uma conexão Meta/
+    // HookCloud nunca pode aparecer aqui. Preserva a regra de status já
+    // existente (só conectadas), só adiciona o filtro de provider.
+    const connectedInstances = (evolutionInstances || []).filter((i) => i.status === 'connected' && isUazapiProvider(i));
 
     return (
       <div className="space-y-5">

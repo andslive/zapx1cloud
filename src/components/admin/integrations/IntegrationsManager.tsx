@@ -17,13 +17,17 @@ import {
 import { Search, Plug, Sparkles, LayoutGrid, Menu } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
-import { integrationsCatalog, type IntegrationItem } from '@/config/integrationsCatalog';
+import { integrationsCatalog, injectHookCloudItem, type IntegrationItem } from '@/config/integrationsCatalog';
 import { IntegrationCard } from './IntegrationCard';
 import { IntegrationConfigDrawer } from './IntegrationConfigDrawer';
 import { useIntegrations } from '@/hooks/useIntegrations';
 import { supabase } from '@/integrations/supabase/client';
 import { useQuery } from '@tanstack/react-query';
 import { useAuth } from '@/hooks/useAuth';
+import { useHookCloudPilotAccess } from '@/hooks/useHookCloudPilotAccess';
+import { useBlockInternalNavigationWhileSensitive } from '@/hooks/useBlockInternalNavigationWhileSensitive';
+import { useBlockBrowserHistoryWhileSensitive } from '@/hooks/useBlockBrowserHistoryWhileSensitive';
+import { hookCloudLifecycleBlockMessage, type HookCloudSensitiveLifecycle } from '@/lib/hookcloud/hookcloudProvisioning';
 
 type StatusFilter = 'all' | 'active' | 'inactive' | 'coming_soon';
 type CategoryFilter = 'all' | string;
@@ -55,9 +59,60 @@ export function IntegrationsManager() {
   const [selected, setSelected] = useState<IntegrationItem | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  // FASE 18B, achado 3 — `IntegrationsManager` é o dono real do estado do
+  // drawer (`selected`/`drawerOpen`), então é aqui que o fechamento/troca
+  // de item precisa ser recusado enquanto o formulário HookCloud está
+  // submetendo ou com um segredo ainda não confirmado como salvo. Nunca
+  // recebe o segredo em si, só este estado não sensível.
+  const [hookCloudLifecycle, setHookCloudLifecycle] = useState<HookCloudSensitiveLifecycle>('idle');
+
+  const guardedSetDrawerOpen = (open: boolean) => {
+    if (!open) {
+      const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
+      if (warning) {
+        toast.warning(warning);
+        return;
+      }
+    }
+    setDrawerOpen(open);
+  };
+
+  // FASE 18F — bloqueia também a navegação para OUTRA ROTA (sidebar,
+  // breadcrumbs, qualquer link interno) enquanto o segredo HookCloud não
+  // foi confirmado como salvo ou uma submissão está em andamento — sem
+  // isso, sair desta página inteira (não só fechar o drawer) desmontava
+  // tudo silenciosamente, perdendo o segredo. Ver
+  // `useBlockInternalNavigationWhileSensitive` para o porquê do
+  // mecanismo (roteador declarativo, sem `useBlocker` disponível).
+  useBlockInternalNavigationWhileSensitive(hookCloudLifecycle !== 'idle', () => {
+    const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
+    if (warning) toast.warning(warning);
+  });
+
+  // FASE 18G — também intercepta voltar/avançar do navegador enquanto o
+  // segredo não foi confirmado. Ver `useBlockBrowserHistoryWhileSensitive`
+  // para o mecanismo exato (uso normal e público de `history.pushState`,
+  // nunca um monkey-patch da função nativa).
+  useBlockBrowserHistoryWhileSensitive(hookCloudLifecycle !== 'idle', () => {
+    const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
+    if (warning) toast.warning(warning);
+  });
 
   useIntegrations();
   const { data: configuredMap = {} } = useAllConfiguredIntegrations();
+
+  // FASE 18A — o card comercial HookCloud só existe no catálogo
+  // renderizado quando a flag REAL da organização (tabela
+  // `meta_cloud_feature_flags`, RLS já restrita a admin/manager da
+  // própria organização) está ligada E o usuário autenticado é
+  // admin/super_admin. Nunca hardcoded, nunca confiado só no frontend —
+  // o backend (`hookcloud-provision-connection`) revalida tudo de forma
+  // independente.
+  const { visible: hookCloudVisible } = useHookCloudPilotAccess();
+  const visibleCatalog = useMemo(
+    () => injectHookCloudItem(integrationsCatalog, hookCloudVisible),
+    [hookCloudVisible],
+  );
 
   const isItemActive = (item: IntegrationItem) => {
     if (item.alwaysActive) return true;
@@ -72,6 +127,16 @@ export function IntegrationsManager() {
   };
 
   const handleClick = (item: IntegrationItem) => {
+    // FASE 18B, achado 3 — trocar de item enquanto o formulário HookCloud
+    // está submetendo ou com um segredo pendente de confirmação
+    // desmontaria `HookCloudOnboardingConfig` silenciosamente, perdendo o
+    // segredo (ou a submissão em andamento) para sempre. Bloqueado
+    // independentemente de qual card foi clicado.
+    const warning = hookCloudLifecycleBlockMessage(hookCloudLifecycle);
+    if (warning) {
+      toast.warning(warning);
+      return;
+    }
     if (item.comingSoon) {
       toast.info(`${item.name} estará disponível em breve!`, {
         description: 'Vamos avisar você assim que liberarmos.',
@@ -84,7 +149,7 @@ export function IntegrationsManager() {
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
-    return integrationsCatalog
+    return visibleCatalog
       .map((cat) => {
         const items = cat.items.filter((item) => {
           if (statusFilter === 'coming_soon' && !item.comingSoon) return false;
@@ -106,24 +171,24 @@ export function IntegrationsManager() {
         return { ...cat, items };
       })
       .filter((cat) => cat.items.length > 0);
-  }, [search, statusFilter, categoryFilter, configuredMap]);
+  }, [search, statusFilter, categoryFilter, configuredMap, visibleCatalog]);
 
   const totals = useMemo(() => {
-    const all = integrationsCatalog.flatMap((c) => c.items);
+    const all = visibleCatalog.flatMap((c) => c.items);
     const available = all.filter((i) => !i.comingSoon).length;
     const active = all.filter((i) => !i.comingSoon && isItemActive(i)).length;
     return { active, available, total: all.length };
-  }, [configuredMap]);
+  }, [configuredMap, visibleCatalog]);
 
   const categoryCounts = useMemo(() => {
     const map: Record<string, { total: number; active: number }> = {};
-    integrationsCatalog.forEach((cat) => {
+    visibleCatalog.forEach((cat) => {
       const total = cat.items.length;
       const active = cat.items.filter((i) => !i.comingSoon && isItemActive(i)).length;
       map[cat.id] = { total, active };
     });
     return map;
-  }, [configuredMap]);
+  }, [configuredMap, visibleCatalog]);
 
   const renderSidebar = (onSelect?: () => void) => (
     <nav className="space-y-1">
@@ -155,7 +220,7 @@ export function IntegrationsManager() {
         </p>
       </div>
 
-      {integrationsCatalog.map((cat) => {
+      {visibleCatalog.map((cat) => {
         const Icon = cat.icon;
         const isActive = categoryFilter === cat.id;
         const counts = categoryCounts[cat.id];
@@ -190,7 +255,7 @@ export function IntegrationsManager() {
   const activeCategoryLabel =
     categoryFilter === 'all'
       ? 'Todas as integrações'
-      : integrationsCatalog.find((c) => c.id === categoryFilter)?.label ?? 'Integrações';
+      : visibleCatalog.find((c) => c.id === categoryFilter)?.label ?? 'Integrações';
 
   return (
     <div className="space-y-6">
@@ -313,7 +378,8 @@ export function IntegrationsManager() {
       <IntegrationConfigDrawer
         item={selected}
         open={drawerOpen}
-        onOpenChange={setDrawerOpen}
+        onOpenChange={guardedSetDrawerOpen}
+        onHookCloudLifecycleChange={setHookCloudLifecycle}
       />
     </div>
   );

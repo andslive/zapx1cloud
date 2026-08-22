@@ -42,6 +42,8 @@ import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
 import { PresenceTestButton } from './PresenceTestButton';
 import { AdminStatusNotificationConfig } from './AdminStatusNotificationConfig';
+import { classifyConnectionForDisplay } from '@/lib/whatsapp/connectionProviderView';
+import { HookCloudRotateCredentialsModal } from './HookCloudRotateCredentialsModal';
 
 
 function StatusBadge({ status }: { status: string }) {
@@ -72,6 +74,71 @@ function WebhookStatusBadge({ status }: { status?: string }) {
   );
 }
 
+
+// FASE 18C — cards dedicados para linhas que NÃO são UazAPI. Nunca
+// renderizam QR Code, nunca chamam `whatsapp-proxy`, nunca oferecem
+// Conectar/Pausar/Desvincular/Verificar webhook/Reparar webhook — essas
+// ações continuam existindo SOMENTE no card UazAPI, inalterado, abaixo.
+// FASE 18G: o card `HookCloudPendingCard` ganhou UMA ação própria,
+// exclusiva de HookCloud (`HookCloudRotateCredentialsModal`, chama só
+// `hookcloud-rotate-credentials`) — nunca toca em `whatsapp-proxy`/UazAPI.
+function HookCloudPendingCard({ inst }: { inst: WhatsAppInstance }) {
+  return (
+    <Card key={inst.id}>
+      <CardContent className="pt-6">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-3 flex-1 min-w-0">
+            <div className="h-10 w-10 rounded-lg bg-blue-500/10 flex items-center justify-center shrink-0">
+              <Smartphone className="h-5 w-5 text-blue-500" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <p className="font-medium truncate">{inst.metadata?.display_name || inst.name}</p>
+                <Badge variant="secondary">HookCloud — WhatsApp Oficial</Badge>
+                <Badge variant="outline" className="text-amber-600 border-amber-500/30 bg-amber-500/5 gap-1">
+                  <AlertTriangle className="h-3 w-3" /> Pendente de configuração
+                </Badge>
+              </div>
+              <p className="text-sm text-muted-foreground truncate">
+                {inst.phone_number ? `+${inst.phone_number}` : 'Número ainda não confirmado'}
+              </p>
+              <p className="text-xs text-muted-foreground mt-1">
+                Conclua o callback e o verify token no painel HookCloud para ativar esta conexão. Nenhuma
+                mensagem pode ser enviada ou recebida enquanto ela estiver pendente.
+              </p>
+            </div>
+          </div>
+          {/* FASE 18G — recuperação segura (Alternativa B): se o admin
+              perdeu o callback URL/verify token, pode gerar um par novo
+              chamando o endpoint já auditado `hookcloud-rotate-credentials`,
+              em vez de depender só do bloqueio de navegação. */}
+          <HookCloudRotateCredentialsModal connectionId={inst.id} />
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function UnsupportedConnectionCard({ inst }: { inst: WhatsAppInstance }) {
+  return (
+    <Card key={inst.id}>
+      <CardContent className="pt-6">
+        <div className="flex items-center gap-3">
+          <div className="h-10 w-10 rounded-lg bg-muted flex items-center justify-center shrink-0">
+            <Info className="h-5 w-5 text-muted-foreground" />
+          </div>
+          <div className="min-w-0">
+            <p className="font-medium truncate">{inst.metadata?.display_name || inst.name}</p>
+            <Badge variant="outline">Conexão não suportada nesta tela</Badge>
+            <p className="text-xs text-muted-foreground mt-1">
+              Fale com o suporte para revisar esta conexão.
+            </p>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
 
 function ConnectDialog({ instance, onClose }: { instance: WhatsAppInstance; onClose: () => void }) {
   const connectMut = useConnectWhatsAppInstance();
@@ -397,7 +464,16 @@ export function WhatsAppInstancesPanel() {
 
       ) : (
         <div className="grid gap-3">
-          {instances.map((inst) => (
+          {instances.map((inst) => {
+            // FASE 18C — decide, por linha, se esta é uma conexão UazAPI
+            // real (único caso com o card completo de ações abaixo, sem
+            // NENHUMA alteração de comportamento) ou uma conexão Meta/
+            // HookCloud/desconhecida (nunca recebe ação de transporte
+            // UazAPI, nunca chama `whatsapp-proxy`, nunca mostra QR Code).
+            const kind = classifyConnectionForDisplay(inst, inst.meta_cloud_config);
+            if (kind === 'hookcloud_pending') return <HookCloudPendingCard key={inst.id} inst={inst} />;
+            if (kind === 'unsupported') return <UnsupportedConnectionCard key={inst.id} inst={inst} />;
+            return (
             <Card key={inst.id}>
               <CardContent className="pt-6">
                 <div className="flex items-center justify-between gap-4 flex-wrap">
@@ -579,7 +655,8 @@ export function WhatsAppInstancesPanel() {
                 </div>
               </CardContent>
             </Card>
-          ))}
+            );
+          })}
         </div>
       )}
 

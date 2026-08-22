@@ -21,6 +21,8 @@ import {
   filterIntegrationsCatalogByMetaFlag,
   rawIntegrationsCatalog,
   integrationsCatalog,
+  injectHookCloudItem,
+  hookCloudOnboardingItem,
 } from "./integrationsCatalog.ts";
 import { META_CLOUD_API_ENABLED } from "./metaCloudApiFeatureFlag.ts";
 import { assert, assertEquals, assertFalse } from "https://deno.land/std@0.208.0/assert/mod.ts";
@@ -117,4 +119,58 @@ Deno.test("flag ausente/não-booleana nunca inclui o item por omissão (falha fe
   const out = filterIntegrationsCatalogByMetaFlag(rawIntegrationsCatalog, undefined as any);
   const meta = findItem(out, META_ID);
   assertEquals(meta, undefined, "valor não-true para a flag nunca deve incluir o item Meta");
+});
+
+// ── FASE 18A — card comercial HookCloud (injeção dinâmica) ──────────────
+
+const HOOKCLOUD_ID = "hookcloud-onboarding";
+
+Deno.test("injectHookCloudItem: visible=false nunca inclui o card (ausência completa, não 'em breve')", () => {
+  const out = injectHookCloudItem(integrationsCatalog, false);
+  assertEquals(findItem(out, HOOKCLOUD_ID), undefined);
+});
+
+Deno.test("injectHookCloudItem: visible=true inclui o card na categoria whatsapp", () => {
+  const out = injectHookCloudItem(integrationsCatalog, true);
+  const item = findItem(out, HOOKCLOUD_ID);
+  assert(item, "card HookCloud ausente mesmo com visible=true");
+  assertEquals(item?.name, "HookCloud — WhatsApp Oficial");
+});
+
+Deno.test("injectHookCloudItem: nunca duplica o card em chamadas repetidas", () => {
+  const once = injectHookCloudItem(integrationsCatalog, true);
+  const twice = injectHookCloudItem(once, true);
+  const count = twice.reduce((n, cat) => n + cat.items.filter((i) => i.id === HOOKCLOUD_ID).length, 0);
+  assertEquals(count, 1);
+});
+
+Deno.test("injectHookCloudItem: UazAPI (whatsapp-config) nunca é removida ou alterada pela injeção", () => {
+  const before = findItem(integrationsCatalog, UAZAPI_ID);
+  const out = injectHookCloudItem(integrationsCatalog, true);
+  const after = findItem(out, UAZAPI_ID);
+  assert(before && after);
+  assertEquals(before, after);
+});
+
+Deno.test("injectHookCloudItem: card técnico Meta (meta-cloud-api-config) NUNCA aparece junto com o card HookCloud — sempre no máximo uma opção comercial de Meta oficial visível", () => {
+  const out = injectHookCloudItem(integrationsCatalog, true);
+  const metaTecnico = findItem(out, META_ID);
+  const hookcloud = findItem(out, HOOKCLOUD_ID);
+  assert(hookcloud, "card HookCloud deveria estar presente");
+  // Com META_CLOUD_API_ENABLED=false (estado real hoje), o item técnico
+  // nunca está no catálogo de origem — este teste falharia alto e claro
+  // se algum dia alguém ligasse as duas flags ao mesmo tempo sem revisão.
+  assertEquals(metaTecnico, undefined, "o card técnico Meta nunca deve coexistir com o card comercial HookCloud");
+});
+
+Deno.test("hookCloudOnboardingItem: nunca solicita configKey de outro provider, tem pilotLabel definido (nunca badge 'Ativo')", () => {
+  assertEquals(hookCloudOnboardingItem.configKey, "hookcloud-onboarding");
+  assert(hookCloudOnboardingItem.pilotLabel, "pilotLabel ausente — o card poderia mostrar o badge verde 'Ativo'");
+  assertEquals(hookCloudOnboardingItem.alwaysActive, undefined);
+});
+
+Deno.test("hookCloudOnboardingItem: nome e descrição não mencionam EvoHub nem 'Meta Cloud API' como opção comercial separada", () => {
+  const haystack = `${hookCloudOnboardingItem.name} ${hookCloudOnboardingItem.description}`.toLowerCase();
+  assertFalse(haystack.includes("evohub"));
+  assertFalse(haystack.includes("meta cloud api"));
 });

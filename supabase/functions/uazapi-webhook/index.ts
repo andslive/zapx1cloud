@@ -17,6 +17,12 @@ import {
   resolveOriginalEventTime,
 } from "../_shared/receipt-recovery.ts";
 import { resolveEvolutionProviderConfig } from "../_shared/evolution-provider-config.ts";
+import { isUazapiInstance } from "../whatsapp-proxy/provider-guard.ts";
+import {
+  extractUazapiWebhookToken,
+  redactUazapiWebhookPayloadForLog,
+  resolveUazapiInstanceByToken,
+} from "../_shared/uazapi-webhook-token-auth.ts";
 import { renderMessageTextOrSkip } from "./message-render.ts";
 import {
   buildTransactionFingerprint,
@@ -1395,7 +1401,7 @@ function normalizePayload(payload: any): Normalized | null {
       try {
         console.warn(
           "[uazapi-webhook] QRCode event sem QR extraível — payload:",
-          JSON.stringify(payload).slice(0, 2000),
+          JSON.stringify(redactUazapiWebhookPayloadForLog(payload)).slice(0, 2000),
         );
       } catch { /* ignore */ }
     }
@@ -2375,7 +2381,11 @@ Deno.serve(async (req) => {
     let norm: Normalized | null = null;
 
     // 1. RAW WEBHOOK LOG FIRST (PERSISTÊNCIA BRUTA)
-    console.log('[UAZAPI_INBOUND_RAW_PAYLOAD]', JSON.stringify(payload).slice(0, 5000));
+    // FASE 18K — `payload` pode conter o campo `token` (segredo por
+    // instância usado na autenticação do webhook, ver
+    // `_shared/uazapi-webhook-token-auth.ts`); nunca logar o corpo bruto
+    // sem antes redigir esse campo.
+    console.log('[UAZAPI_INBOUND_RAW_PAYLOAD]', JSON.stringify(redactUazapiWebhookPayloadForLog(payload)).slice(0, 5000));
     let logRecordId: string | null = null;
     try {
       const rawEventType = payload.event || payload.type || payload.Event || payload.EventType || "unknown";
@@ -3188,7 +3198,7 @@ Deno.serve(async (req) => {
       try {
         console.log(
           "[uazapi-webhook] incoming payload dump:",
-          JSON.stringify(payload).slice(0, 4000),
+          JSON.stringify(redactUazapiWebhookPayloadForLog(payload)).slice(0, 4000),
         );
       } catch (e) {
         console.warn("[uazapi-webhook] payload dump error:", e);
@@ -3312,7 +3322,7 @@ Deno.serve(async (req) => {
       
       // Log full payload (truncated) so we can identify where the instance name lives
       try {
-        const dump = JSON.stringify(payload).slice(0, 4000);
+        const dump = JSON.stringify(redactUazapiWebhookPayloadForLog(payload)).slice(0, 4000);
         console.warn("[uazapi-webhook] missing instance — payload dump:", dump);
       } catch {
         console.warn(
@@ -3339,7 +3349,7 @@ Deno.serve(async (req) => {
     if (uuidRegex.test(norm.instance)) {
       query += `,id.eq.${norm.instance}`;
     }
-    const { data: instances } = await supabase
+    const { data: rawInstances } = await supabase
       .from("evolution_instances")
       .select("*")
       .or(query)
@@ -3347,10 +3357,59 @@ Deno.serve(async (req) => {
       .order("status", { ascending: true })
       .order("created_at", { ascending: false });
 
-    console.log("[uazapi-webhook] candidates found:", instances?.length || 0, "for", norm.instance);
+    // FASE 18I — este é o webhook INBOUND da UazAPI: um evento real dela
+    // nunca pode legitimamente identificar uma conexão Meta/HookCloud.
+    // Sem este filtro, uma linha `provider='meta_cloud'` (sempre
+    // `is_active=true` por padrão, `status='disconnected'`) podia entrar
+    // nos candidatos por colisão de `name`/`instance_id` (a consulta
+    // acima não filtra organização nem provider) e vencer o segundo
+    // nível de prioridade (`i.is_active`) quando não houvesse nenhuma
+    // UazAPI "ativa e conectada" com o mesmo identificador — associando a
+    // mensagem/lead/conversa inbound a uma conexão pendente, sem
+    // transporte real. Corrigido excluindo candidatos não-UazAPI ANTES de
+    // qualquer lógica de prioridade (nunca depois — nunca deixa uma
+    // linha Meta/HookCloud ser escolhida e só bloqueada no envio).
+    //
+    // Isto NÃO corrige o achado mais amplo, pré-existente e fora do
+    // escopo desta PR: a consulta acima ainda resolve por `name`/
+    // `instance_id` sem filtro de `organization_id`, então uma colisão
+    // de nome ENTRE DUAS ORGANIZAÇÕES UazAPI continua teoricamente
+    // possível — ver relatório da Fase 18I para o plano de correção
+    // separado (exigiria autenticação real do webhook e/ou constraint de
+    // unicidade, fora do escopo de "isolamento HookCloud" desta PR).
+    const textCandidates = (rawInstances || []).filter((i) => isUazapiInstance(i));
 
-    // Filtragem rigorosa por prioridade
-    let instance = instances?.find(i => i.is_active && i.status === 'connected') 
+    console.log("[uazapi-webhook] candidates found:", textCandidates?.length || 0, "for", norm.instance);
+
+    // FASE 18K — autenticação por segredo compartilhado por instância.
+    // `token` chega no corpo de todo evento UazAPI e é o mesmo segredo
+    // já armazenado em `evolution_instances.instance_token` (usado hoje
+    // para autenticar chamadas de SAÍDA). Comparação em tempo constante,
+    // nunca via filtro SQL. Falha fechada em 0 ou >1 correspondências —
+    // nunca escolhe "o primeiro" nem "o mais recente" por omissão. A
+    // partir daqui, `instances` contém no máximo UMA linha, já
+    // autenticada; toda a lógica de prioridade abaixo (is_active/status)
+    // e o redirecionamento para "parceiro ativo" continuam operando
+    // exatamente como antes, mas agora sobre um conjunto pré-autenticado
+    // em vez de um conjunto ambíguo resolvido só por nome/instance_id.
+    // Ver `_shared/uazapi-webhook-token-auth.ts` para o modelo de
+    // segurança completo (classificação: SHARED_SECRET_INSTANCE_AUTHENTICATION,
+    // não HMAC — ver relatório da Fase 18K).
+    const receivedUazapiToken = extractUazapiWebhookToken(payload);
+    const primaryTokenAuth = resolveUazapiInstanceByToken(textCandidates, receivedUazapiToken);
+    if (primaryTokenAuth.outcome !== "matched") {
+      console.warn("[UAZAPI_WEBHOOK_TOKEN_AUTH_REJECTED]", {
+        stage: "primary",
+        reason: primaryTokenAuth.reason,
+        matchCount: primaryTokenAuth.matchCount,
+        candidateCount: textCandidates.length,
+        instanceIdentifier: norm.instance,
+      });
+    }
+    const instances = primaryTokenAuth.outcome === "matched" ? [primaryTokenAuth.instance] : [];
+
+    // Filtragem rigorosa por prioridade (agora sobre no máximo 1 candidato autenticado)
+    let instance = instances?.find(i => i.is_active && i.status === 'connected')
                 || instances?.find(i => i.is_active)
                 || instances?.[0];
 
@@ -3367,14 +3426,29 @@ Deno.serve(async (req) => {
         `[uazapi-webhook] instance not found by instance_id or name: ${norm.instance}. Trying secondary lookups...`,
       );
       // Last-resort: try metadata.instance_name / metadata.instance_uuid
-      const { data: byMeta } = await supabase
+      const { data: rawByMeta } = await supabase
         .from("evolution_instances")
         .select("*")
         .or(
           `metadata->>instance_name.eq.${norm.instance},metadata->>instance_uuid.eq.${norm.instance}`,
         )
         .order("is_active", { ascending: false });
-      instance = byMeta?.find(i => i.is_active && i.status === 'connected') 
+      // FASE 18I — mesmo filtro do lookup primário: um evento real da
+      // UazAPI nunca pode resolver para uma conexão Meta/HookCloud.
+      const byMetaTextCandidates = (rawByMeta || []).filter((i) => isUazapiInstance(i));
+      // FASE 18K — mesma autenticação por token do lookup primário.
+      const secondaryTokenAuth = resolveUazapiInstanceByToken(byMetaTextCandidates, receivedUazapiToken);
+      if (secondaryTokenAuth.outcome !== "matched") {
+        console.warn("[UAZAPI_WEBHOOK_TOKEN_AUTH_REJECTED]", {
+          stage: "secondary_by_meta",
+          reason: secondaryTokenAuth.reason,
+          matchCount: secondaryTokenAuth.matchCount,
+          candidateCount: byMetaTextCandidates.length,
+          instanceIdentifier: norm.instance,
+        });
+      }
+      const byMeta = secondaryTokenAuth.outcome === "matched" ? [secondaryTokenAuth.instance] : [];
+      instance = byMeta?.find(i => i.is_active && i.status === 'connected')
               || byMeta?.find(i => i.is_active)
               || byMeta?.[0];
     }
@@ -11356,7 +11430,7 @@ FORMATO JSON:
     if (norm.instance) {
       console.log(
         "[uazapi-webhook] unknown event payload dump:",
-        JSON.stringify(payload).slice(0, 1000),
+        JSON.stringify(redactUazapiWebhookPayloadForLog(payload)).slice(0, 1000),
       );
     }
     return new Response(JSON.stringify({ ok: true }), {
