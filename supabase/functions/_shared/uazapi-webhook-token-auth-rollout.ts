@@ -237,3 +237,54 @@ export function selectCandidatesForProcessing<T extends UazapiWebhookTokenAuthCa
   }
   return rawTextCandidates.filter(isUazapiInstanceFn);
 }
+
+// ── Persistência consultável (Fase 18S) ────────────────────────────────
+
+/**
+ * Versão do schema do objeto `token_auth` gravado em
+ * `webhook_logs.parsed_fields`. Incrementar só se o formato mudar de
+ * forma incompatível com consultas já escritas contra a versão 1.
+ */
+export const TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION = 1;
+
+export interface UazapiWebhookTokenAuthTelemetryRecord {
+  token_auth: {
+    schema_version: number;
+    mode: UazapiWebhookTokenAuthMode;
+    code: UazapiWebhookTokenAuthTelemetryCode;
+    event_type: string;
+    connection_id: string | null;
+  };
+}
+
+/**
+ * Constrói o objeto sanitizado a persistir em `webhook_logs.parsed_fields`
+ * (Fase 18S — menor extensão consultável por SQL da telemetria já emitida
+ * pela Fase 18N). Função pura: nunca recebe `payload`/token/candidatos
+ * crus — só o já-computado `mode`/`evaluation`/`sanitizedEventType` — o
+ * que torna estruturalmente impossível vazar um campo não permitido por
+ * aqui, não apenas por convenção.
+ *
+ * `connection_id` só é preenchido quando `evaluation.code ===
+ * "token_auth_match"` e vem exclusivamente de `evaluation.authenticatedInstance.id`
+ * (a linha já autenticada pelo banco) — nunca de qualquer identificador
+ * fornecido pelo payload. Para qualquer outro código, `connection_id` é
+ * sempre `null`.
+ */
+export function buildUazapiWebhookTokenAuthTelemetryRecord<T extends UazapiWebhookTokenAuthCandidate>(
+  mode: UazapiWebhookTokenAuthMode,
+  evaluation: UazapiWebhookTokenAuthEvaluation<T>,
+  sanitizedEventType: string,
+): UazapiWebhookTokenAuthTelemetryRecord {
+  return {
+    token_auth: {
+      schema_version: TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION,
+      mode,
+      code: evaluation.code,
+      event_type: sanitizedEventType,
+      connection_id: evaluation.code === "token_auth_match" && evaluation.authenticatedInstance
+        ? evaluation.authenticatedInstance.id
+        : null,
+    },
+  };
+}

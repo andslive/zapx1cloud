@@ -20,6 +20,7 @@ import { resolveEvolutionProviderConfig } from "../_shared/evolution-provider-co
 import { isUazapiInstance } from "../whatsapp-proxy/provider-guard.ts";
 import { redactUazapiWebhookPayloadForLog } from "../_shared/uazapi-webhook-token-auth.ts";
 import {
+  buildUazapiWebhookTokenAuthTelemetryRecord,
   evaluateUazapiWebhookTokenAuth,
   logUazapiWebhookTokenAuthTelemetry,
   parseUazapiWebhookTokenAuthMode,
@@ -3436,6 +3437,11 @@ Deno.serve(async (req) => {
       payload,
       isUazapiInstance,
     );
+    // FASE 18S — captura qual avaliação (primária ou, se ela não achar
+    // nada, a secundária por metadata) é a que realmente determinou o
+    // resultado desta requisição, para persistir uma única vez ao final
+    // da resolução (ver 18S abaixo, perto do fim deste bloco).
+    let finalTokenAuthEvaluation = primaryTokenAuthEvaluation;
     logUazapiWebhookTokenAuthTelemetry({
       code: primaryTokenAuthEvaluation.code,
       mode: uazapiWebhookTokenAuthMode,
@@ -3492,6 +3498,7 @@ Deno.serve(async (req) => {
         payload,
         isUazapiInstance,
       );
+      finalTokenAuthEvaluation = secondaryTokenAuthEvaluation;
       logUazapiWebhookTokenAuthTelemetry({
         code: secondaryTokenAuthEvaluation.code,
         mode: uazapiWebhookTokenAuthMode,
@@ -3515,6 +3522,29 @@ Deno.serve(async (req) => {
       instance = byMeta?.find(i => i.is_active && i.status === 'connected')
               || byMeta?.find(i => i.is_active)
               || byMeta?.[0];
+    }
+
+    // FASE 18S — menor extensão consultável por SQL da telemetria da
+    // Fase 18N: persiste UMA vez, na mesma linha de `webhook_logs` já
+    // criada no início desta requisição (nunca uma linha/tabela nova),
+    // o objeto sanitizado equivalente ao que já vai para
+    // `logUazapiWebhookTokenAuthTelemetry` — nada além disso, nunca
+    // token/payload/PII (ver `buildUazapiWebhookTokenAuthTelemetryRecord`,
+    // que não recebe nenhum desses campos por assinatura). Melhor
+    // esforço: falha aqui nunca bloqueia o evento nem altera a decisão
+    // de `enforce`/`observe`, já tomada acima por `selectCandidatesForProcessing`.
+    if (logRecordId) {
+      try {
+        await supabase.from("webhook_logs").update({
+          parsed_fields: buildUazapiWebhookTokenAuthTelemetryRecord(
+            uazapiWebhookTokenAuthMode,
+            finalTokenAuthEvaluation,
+            sanitizeUazapiWebhookEventTypeForTelemetry(payload),
+          ),
+        }).eq("id", logRecordId);
+      } catch (e) {
+        console.warn("[uazapi-webhook] failed to persist token-auth telemetry:", e);
+      }
     }
 
     if (!instance || (!instance.is_active && !uuidRegex.test(norm.instance))) {
