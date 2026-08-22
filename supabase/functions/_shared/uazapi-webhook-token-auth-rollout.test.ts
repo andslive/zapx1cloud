@@ -366,3 +366,37 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: code é sempre um dos 9 v
   const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "connection");
   assert(ALLOWED.has(record.token_auth.code));
 });
+
+// ── Fase 18T — cobertura explícita adicional exigida pela revisão ────
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: propriedades extras num objeto de avaliação 'malicioso' nunca vazam — a função constrói um literal, nunca faz spread da entrada", () => {
+  const matchedEvaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, isUazapi);
+  // Simula um chamador que anexou campos extras/inesperados ao objeto de
+  // avaliação (ex.: um bug em outro lugar do código que injetasse
+  // `raw_token`/`payload`/`headers`) — mesmo assim, só as 5 chaves
+  // fechadas devem sobreviver, porque a função nunca faz `...evaluation`
+  // no retorno, só lê `.code` e `.authenticatedInstance.id` de propósito.
+  const maliciousEvaluation = {
+    ...matchedEvaluation,
+    raw_token: "SHOULD-NEVER-APPEAR",
+    payload: { secret: "SHOULD-NEVER-APPEAR-EITHER" },
+    headers: { authorization: "Bearer SHOULD-NOT-LEAK" },
+  } as typeof matchedEvaluation;
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", maliciousEvaluation, "connection");
+  const keys = Object.keys(record.token_auth).sort();
+  assertEquals(keys, ["code", "connection_id", "event_type", "mode", "schema_version"]);
+  const serialized = JSON.stringify(record);
+  assertFalse(serialized.includes("SHOULD-NEVER-APPEAR"));
+  assertFalse(serialized.includes("SHOULD-NOT-LEAK"));
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: authenticatedInstance com propriedades extras (ex. instance_token) nunca vaza — só .id é lido", () => {
+  const candidatesWithExtraFields: FakeInstance[] = [
+    { id: "uazapi-1", provider: "uazapi", instance_token: "REAL-SECRET-TOKEN-VALUE", is_active: true, status: "connected" },
+  ];
+  const evaluation = evaluateUazapiWebhookTokenAuth(candidatesWithExtraFields, { token: "REAL-SECRET-TOKEN-VALUE" }, isUazapi);
+  assertEquals(evaluation.code, "token_auth_match");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluation, "connection");
+  assertEquals(record.token_auth.connection_id, "uazapi-1");
+  assertFalse(JSON.stringify(record).includes("REAL-SECRET-TOKEN-VALUE"));
+});
