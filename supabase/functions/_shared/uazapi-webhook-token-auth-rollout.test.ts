@@ -6,11 +6,13 @@
 
 import { assert, assertEquals, assertFalse, assertThrows } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
+  buildUazapiWebhookTokenAuthTelemetryRecord,
   evaluateUazapiWebhookTokenAuth,
   logUazapiWebhookTokenAuthTelemetry,
   parseUazapiWebhookTokenAuthMode,
   sanitizeUazapiWebhookEventTypeForTelemetry,
   selectCandidatesForProcessing,
+  TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION,
   UnknownUazapiWebhookTokenAuthModeError,
   type UazapiWebhookTokenAuthCandidate,
 } from "./uazapi-webhook-token-auth-rollout.ts";
@@ -294,4 +296,107 @@ Deno.test("logUazapiWebhookTokenAuthTelemetry: a assinatura da função não ace
   assertFalse(serialized.toLowerCase().includes("token_value"));
   const loggedFields = (captured[0] as unknown[])[1] as Record<string, unknown>;
   assertFalse("token" in loggedFields);
+});
+
+// ── Fase 18S — buildUazapiWebhookTokenAuthTelemetryRecord ────────────
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: match persiste code permitido e connection_id da linha autenticada", () => {
+  const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, isUazapi);
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "connection");
+  assertEquals(record.token_auth.code, "token_auth_match");
+  assertEquals(record.token_auth.mode, "observe");
+  assertEquals(record.token_auth.event_type, "connection");
+  assertEquals(record.token_auth.connection_id, "uazapi-1");
+  assertEquals(record.token_auth.schema_version, TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION);
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: missing persiste code permitido, connection_id null", () => {
+  const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, {}, isUazapi);
+  assertEquals(evaluation.code, "token_auth_missing");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "unknown");
+  assertEquals(record.token_auth.code, "token_auth_missing");
+  assertEquals(record.token_auth.connection_id, null);
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: connection_id nunca vem do payload — só de evaluation.authenticatedInstance.id", () => {
+  // Mesmo que um candidato tenha um id "parecido" com algo do payload,
+  // connection_id só é preenchido quando o outcome é match E vem do
+  // objeto authenticatedInstance já resolvido pelo banco — nunca de um
+  // campo arbitrário construído a partir do payload recebido.
+  const evaluationNoMatch = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-nao-existe" }, isUazapi);
+  assertEquals(evaluationNoMatch.code, "token_auth_no_match");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluationNoMatch, "connection");
+  assertEquals(record.token_auth.connection_id, null);
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: ambiguous/non_uazapi/internal_error/no_candidate — connection_id sempre null", () => {
+  const ambiguous: FakeInstance[] = [
+    { id: "c1", provider: "uazapi", instance_token: "tok-X", is_active: true, status: "connected" },
+    { id: "c2", provider: "uazapi", instance_token: "tok-X", is_active: true, status: "connected" },
+  ];
+  const ambiguousEval = evaluateUazapiWebhookTokenAuth(ambiguous, { token: "tok-X" }, isUazapi);
+  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", ambiguousEval, "connection").token_auth.connection_id, null);
+
+  const onlyHookCloud: FakeInstance[] = [{ id: "h1", provider: "meta_cloud", instance_token: null, is_active: true, status: "disconnected" }];
+  const nonUazapiEval = evaluateUazapiWebhookTokenAuth(onlyHookCloud, { token: "x" }, isUazapi);
+  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", nonUazapiEval, "connection").token_auth.connection_id, null);
+
+  const internalErrorEval = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, () => { throw new Error("boom"); });
+  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", internalErrorEval, "connection").token_auth.connection_id, null);
+
+  const noCandidateEval = evaluateUazapiWebhookTokenAuth<FakeInstance>([], { token: "x" }, isUazapi);
+  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", noCandidateEval, "connection").token_auth.connection_id, null);
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: objeto resultante nunca contém token/payload/PII — só as 5 chaves fechadas esperadas", () => {
+  const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "SECRET-VALUE-NEVER-PERSISTED" }, isUazapi);
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluation, "connection");
+  const keys = Object.keys(record.token_auth).sort();
+  assertEquals(keys, ["code", "connection_id", "event_type", "mode", "schema_version"]);
+  assertFalse(JSON.stringify(record).includes("SECRET-VALUE-NEVER-PERSISTED"));
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: code é sempre um dos 9 valores fechados (garantido pelo tipo, verificado em runtime)", () => {
+  const ALLOWED = new Set([
+    "token_auth_match", "token_auth_missing", "token_auth_invalid_type", "token_auth_empty",
+    "token_auth_no_candidate", "token_auth_no_match", "token_auth_ambiguous", "token_auth_non_uazapi",
+    "token_auth_internal_error",
+  ]);
+  const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, isUazapi);
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "connection");
+  assert(ALLOWED.has(record.token_auth.code));
+});
+
+// ── Fase 18T — cobertura explícita adicional exigida pela revisão ────
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: propriedades extras num objeto de avaliação 'malicioso' nunca vazam — a função constrói um literal, nunca faz spread da entrada", () => {
+  const matchedEvaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, isUazapi);
+  // Simula um chamador que anexou campos extras/inesperados ao objeto de
+  // avaliação (ex.: um bug em outro lugar do código que injetasse
+  // `raw_token`/`payload`/`headers`) — mesmo assim, só as 5 chaves
+  // fechadas devem sobreviver, porque a função nunca faz `...evaluation`
+  // no retorno, só lê `.code` e `.authenticatedInstance.id` de propósito.
+  const maliciousEvaluation = {
+    ...matchedEvaluation,
+    raw_token: "SHOULD-NEVER-APPEAR",
+    payload: { secret: "SHOULD-NEVER-APPEAR-EITHER" },
+    headers: { authorization: "Bearer SHOULD-NOT-LEAK" },
+  } as typeof matchedEvaluation;
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", maliciousEvaluation, "connection");
+  const keys = Object.keys(record.token_auth).sort();
+  assertEquals(keys, ["code", "connection_id", "event_type", "mode", "schema_version"]);
+  const serialized = JSON.stringify(record);
+  assertFalse(serialized.includes("SHOULD-NEVER-APPEAR"));
+  assertFalse(serialized.includes("SHOULD-NOT-LEAK"));
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: authenticatedInstance com propriedades extras (ex. instance_token) nunca vaza — só .id é lido", () => {
+  const candidatesWithExtraFields: FakeInstance[] = [
+    { id: "uazapi-1", provider: "uazapi", instance_token: "REAL-SECRET-TOKEN-VALUE", is_active: true, status: "connected" },
+  ];
+  const evaluation = evaluateUazapiWebhookTokenAuth(candidatesWithExtraFields, { token: "REAL-SECRET-TOKEN-VALUE" }, isUazapi);
+  assertEquals(evaluation.code, "token_auth_match");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluation, "connection");
+  assertEquals(record.token_auth.connection_id, "uazapi-1");
+  assertFalse(JSON.stringify(record).includes("REAL-SECRET-TOKEN-VALUE"));
 });
