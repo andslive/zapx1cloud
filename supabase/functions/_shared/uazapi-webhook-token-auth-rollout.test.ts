@@ -7,6 +7,7 @@
 import { assert, assertEquals, assertFalse, assertThrows } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
   evaluateUazapiWebhookTokenAuth,
+  logUazapiWebhookTokenAuthTelemetry,
   parseUazapiWebhookTokenAuthMode,
   sanitizeUazapiWebhookEventTypeForTelemetry,
   selectCandidatesForProcessing,
@@ -249,4 +250,48 @@ Deno.test("selectCandidatesForProcessing (enforce): cross-tenant (token de outra
   assertEquals(evaluation.code, "token_auth_no_match");
   const selected = selectCandidatesForProcessing("enforce", localCandidate, evaluation, isUazapi);
   assertEquals(selected.length, 0);
+});
+
+// ── Fase 18O — cobertura explícita adicional exigida pela revisão ────
+
+Deno.test("selectCandidatesForProcessing (observe): avaliação que resultou em token_auth_internal_error NÃO impede o processamento legado", () => {
+  const evaluationWithInternalError = evaluateUazapiWebhookTokenAuth<FakeInstance>(
+    baseCandidates,
+    { token: "tok-A" },
+    () => { throw new Error("boom"); },
+  );
+  assertEquals(evaluationWithInternalError.code, "token_auth_internal_error");
+  // Reavalia com o filtro real (não o que lança) só para obter o
+  // conjunto esperado de candidatos UazAPI, já que o filtro usado na
+  // avaliação acima não é o mesmo usado na seleção abaixo.
+  const selected = selectCandidatesForProcessing("observe", baseCandidates, evaluationWithInternalError, isUazapi);
+  assertEquals(selected.map((c) => c.id).sort(), ["uazapi-1", "uazapi-2"]);
+});
+
+Deno.test("selectCandidatesForProcessing (enforce): avaliação que resultou em token_auth_internal_error bloqueia (nunca cai para o fluxo legado)", () => {
+  const evaluationWithInternalError: ReturnType<typeof evaluateUazapiWebhookTokenAuth<FakeInstance>> = {
+    code: "token_auth_internal_error",
+    authenticatedInstance: null,
+  };
+  const selected = selectCandidatesForProcessing("enforce", baseCandidates, evaluationWithInternalError, isUazapi);
+  assertEquals(selected.length, 0);
+});
+
+Deno.test("logUazapiWebhookTokenAuthTelemetry: a assinatura da função não aceita nenhum campo que pudesse conter o token — prova estrutural, não apenas por convenção", () => {
+  const captured: unknown[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => { captured.push(args); };
+  try {
+    logUazapiWebhookTokenAuthTelemetry({
+      code: "token_auth_match",
+      mode: "observe",
+      sanitizedEventType: "messages",
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  const serialized = JSON.stringify(captured);
+  assertFalse(serialized.toLowerCase().includes("token_value"));
+  const loggedFields = (captured[0] as unknown[])[1] as Record<string, unknown>;
+  assertFalse("token" in loggedFields);
 });
