@@ -7,6 +7,7 @@
 import { assert, assertEquals, assertFalse, assertThrows } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
   buildUazapiWebhookTokenAuthTelemetryRecord,
+  classifyUazapiWebhookEventAuthPolicy,
   evaluateUazapiWebhookTokenAuth,
   logUazapiWebhookTokenAuthTelemetry,
   parseUazapiWebhookTokenAuthMode,
@@ -399,4 +400,70 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: authenticatedInstance com
   const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluation, "connection");
   assertEquals(record.token_auth.connection_id, "uazapi-1");
   assertFalse(JSON.stringify(record).includes("REAL-SECRET-TOKEN-VALUE"));
+});
+
+// ── Fase 18X — classifyUazapiWebhookEventAuthPolicy ──────────────────
+
+Deno.test("classifyUazapiWebhookEventAuthPolicy: message e message_delete => AUTH_REQUIRED_BUSINESS", () => {
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("message"), "AUTH_REQUIRED_BUSINESS");
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("message_delete"), "AUTH_REQUIRED_BUSINESS");
+});
+
+Deno.test("classifyUazapiWebhookEventAuthPolicy: ack, connection e qrcode => AUTH_REQUIRED_OPERATIONAL", () => {
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("ack"), "AUTH_REQUIRED_OPERATIONAL");
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("connection"), "AUTH_REQUIRED_OPERATIONAL");
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("qrcode"), "AUTH_REQUIRED_OPERATIONAL");
+});
+
+Deno.test("classifyUazapiWebhookEventAuthPolicy: 'unknown' literal => IGNORE_UNKNOWN", () => {
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("unknown"), "IGNORE_UNKNOWN");
+});
+
+Deno.test("classifyUazapiWebhookEventAuthPolicy: null/undefined => REJECT_MALFORMED", () => {
+  assertEquals(classifyUazapiWebhookEventAuthPolicy(null), "REJECT_MALFORMED");
+  assertEquals(classifyUazapiWebhookEventAuthPolicy(undefined), "REJECT_MALFORMED");
+});
+
+Deno.test("classifyUazapiWebhookEventAuthPolicy: kind desconhecido/futuro nunca vira IGNORE_UNKNOWN por omissão — falha fechada para AUTH_REQUIRED_OPERATIONAL", () => {
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("some_future_kind_not_yet_modeled"), "AUTH_REQUIRED_OPERATIONAL");
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("Unknown"), "AUTH_REQUIRED_OPERATIONAL");
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("UNKNOWN"), "AUTH_REQUIRED_OPERATIONAL");
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("unknown_extra"), "AUTH_REQUIRED_OPERATIONAL");
+  assertEquals(classifyUazapiWebhookEventAuthPolicy("xunknown"), "AUTH_REQUIRED_OPERATIONAL");
+});
+
+Deno.test("classifyUazapiWebhookEventAuthPolicy: string vazia nunca vira IGNORE_UNKNOWN", () => {
+  assertEquals(classifyUazapiWebhookEventAuthPolicy(""), "AUTH_REQUIRED_OPERATIONAL");
+});
+
+// ── Fase 18X — telemetria not-applicable para IGNORE_UNKNOWN ─────────
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: token_auth_not_applicable_unknown sempre tem connection_id null", () => {
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord(
+    "observe",
+    { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
+    "unknown",
+  );
+  assertEquals(record.token_auth.code, "token_auth_not_applicable_unknown");
+  assertEquals(record.token_auth.connection_id, null);
+  assertEquals(record.token_auth.event_type, "unknown");
+  const keys = Object.keys(record.token_auth).sort();
+  assertEquals(keys, ["code", "connection_id", "event_type", "mode", "schema_version"]);
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: token_auth_not_applicable_unknown funciona nos dois modos", () => {
+  const observeRecord = buildUazapiWebhookTokenAuthTelemetryRecord(
+    "observe",
+    { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
+    "unknown",
+  );
+  const enforceRecord = buildUazapiWebhookTokenAuthTelemetryRecord(
+    "enforce",
+    { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
+    "unknown",
+  );
+  assertEquals(observeRecord.token_auth.mode, "observe");
+  assertEquals(enforceRecord.token_auth.mode, "enforce");
+  assertEquals(observeRecord.token_auth.connection_id, null);
+  assertEquals(enforceRecord.token_auth.connection_id, null);
 });

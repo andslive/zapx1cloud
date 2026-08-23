@@ -21,6 +21,7 @@ import { isUazapiInstance } from "../whatsapp-proxy/provider-guard.ts";
 import { redactUazapiWebhookPayloadForLog } from "../_shared/uazapi-webhook-token-auth.ts";
 import {
   buildUazapiWebhookTokenAuthTelemetryRecord,
+  classifyUazapiWebhookEventAuthPolicy,
   evaluateUazapiWebhookTokenAuth,
   logUazapiWebhookTokenAuthTelemetry,
   parseUazapiWebhookTokenAuthMode,
@@ -3346,6 +3347,45 @@ Deno.serve(async (req) => {
       });
     }
 
+    // FASE 18X — eventos "unknown" (norm.kind === "unknown") são um
+    // catch-all pré-existente sem nenhum ramo de negócio dedicado (ver
+    // fallback final "---- UNKNOWN ----" perto do fim deste arquivo) —
+    // comprovado por leitura de código (Fase 18W) a nunca escrever
+    // lead/mensagem/conversa/funil/compra/pixel/CAPI, em nenhum modo.
+    // Ignorá-los AQUI, antes de consultar candidatos em
+    // `evolution_instances` e antes de avaliar o token, evita: (a) uma
+    // query evitável para um evento que nunca teria efeito de negócio;
+    // (b) que um futuro `enforce` rejeite esse evento já inerte como se
+    // fosse uma falha de autenticação real — o que causaria retry
+    // desnecessário da UazAPI para algo que nunca precisou de token.
+    //
+    // A classificação usa exclusivamente `norm.kind`, já calculado por
+    // `normalizePayload` (o normalizador canônico) — nunca um campo do
+    // payload lido de novo aqui como autoridade. Um payload não pode "se
+    // declarar" unknown nem "se declarar" um tipo conhecido para escapar
+    // da autenticação: `norm.kind` é decidido antes desta checagem, pela
+    // mesma função que classifica eventos reconhecidos, e este bloco só
+    // executa um `return` imediato — nenhum código deste handler roda
+    // depois disso para esta requisição, então não há como "cair" num
+    // ramo de negócio mesmo que o payload tente parecer com um.
+    if (norm && classifyUazapiWebhookEventAuthPolicy(norm.kind) === "IGNORE_UNKNOWN") {
+      if (logRecordId) {
+        try {
+          await supabase.from("webhook_logs").update({
+            parsed_fields: buildUazapiWebhookTokenAuthTelemetryRecord(
+              uazapiWebhookTokenAuthMode,
+              { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
+              "unknown",
+            ),
+          }).eq("id", logRecordId);
+        } catch (e) {
+          console.warn("[uazapi-webhook] failed to persist not-applicable telemetry:", e);
+        }
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     if (!norm && !(payload as any).__is_resume) {
 

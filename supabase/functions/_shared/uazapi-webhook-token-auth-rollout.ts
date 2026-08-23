@@ -93,7 +93,15 @@ export type UazapiWebhookTokenAuthTelemetryCode =
   | "token_auth_no_match"
   | "token_auth_ambiguous"
   | "token_auth_non_uazapi"
-  | "token_auth_internal_error";
+  | "token_auth_internal_error"
+  // FASE 18X — nunca produzido por `evaluateUazapiWebhookTokenAuth`. Usado
+  // exclusivamente pela integração para eventos classificados
+  // `IGNORE_UNKNOWN` (ver `classifyUazapiWebhookEventAuthPolicy`) — deixa
+  // explícito, na telemetria, que a autenticação nem foi tentada, em vez
+  // de aparecer como `token_auth_missing` (que significa "deveria
+  // autenticar e o token não veio", uma afirmação diferente e mais forte
+  // do que "este evento nunca precisou de token").
+  | "token_auth_not_applicable_unknown";
 
 const SAFE_EVENT_TYPE_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
 
@@ -287,4 +295,65 @@ export function buildUazapiWebhookTokenAuthTelemetryRecord<T extends UazapiWebho
         : null,
     },
   };
+}
+
+// ── Classificação fechada de política de autenticação (Fase 18X) ─────
+
+export type UazapiWebhookEventAuthPolicy =
+  | "AUTH_REQUIRED_BUSINESS"
+  | "AUTH_REQUIRED_OPERATIONAL"
+  | "IGNORE_UNKNOWN"
+  | "REJECT_MALFORMED";
+
+/**
+ * Classifica `norm.kind` (o resultado do normalizador canônico,
+ * `normalizePayload` — NUNCA um campo bruto do payload lido diretamente
+ * aqui) numa das 4 categorias fechadas.
+ *
+ * - `AUTH_REQUIRED_BUSINESS`: pode criar/alterar lead, mensagem,
+ *   conversa, avançar funil, processar comprovante, registrar compra,
+ *   chamar pixel/CAPI — sempre exige autenticação em `enforce`.
+ * - `AUTH_REQUIRED_OPERATIONAL`: altera estado/metadados/configuração
+ *   vinculados à instância (conexão, QR code) — também exige
+ *   autenticação em `enforce`. NOTA: `ack` (confirmação de
+ *   entrega/leitura) é classificado aqui conceitualmente, mas o handler
+ *   já o trata num ramo próprio e anterior a esta classificação (Fase
+ *   28, pré-existente) — este módulo não altera esse comportamento já
+ *   existente, só o documenta.
+ * - `IGNORE_UNKNOWN`: o normalizador não reconheceu o formato do evento
+ *   (`kind === "unknown"`) mas conseguiu extrair um identificador de
+ *   instância válido o bastante para não cair no caminho de payload
+ *   malformado. Comprovado por leitura de código (Fase 18W) que este
+ *   ramo nunca alcança nenhuma ação de negócio ou operacional — só o
+ *   fallback final, que loga e retorna um ACK genérico.
+ * - `REJECT_MALFORMED`: `norm === null` (o normalizador não conseguiu
+ *   nem extrair um identificador de instância) — já tratado pelo
+ *   caminho pré-existente `!norm`, mantido inalterado por esta fase.
+ *   Este valor é retornado aqui só por completude da função pura; a
+ *   integração real nunca chama esta função para o caso `norm === null`
+ *   (o `!norm` já retorna antes).
+ *
+ * Função pura: recebe só o `kind` já normalizado, nunca o payload.
+ */
+export function classifyUazapiWebhookEventAuthPolicy(
+  normKind: string | null | undefined,
+): UazapiWebhookEventAuthPolicy {
+  if (normKind === null || normKind === undefined) return "REJECT_MALFORMED";
+  switch (normKind) {
+    case "message":
+    case "message_delete":
+      return "AUTH_REQUIRED_BUSINESS";
+    case "ack":
+    case "connection":
+    case "qrcode":
+      return "AUTH_REQUIRED_OPERATIONAL";
+    case "unknown":
+      return "IGNORE_UNKNOWN";
+    default:
+      // Falha fechada: qualquer `kind` futuro não listado aqui exige
+      // autenticação por padrão — nunca vira `IGNORE_UNKNOWN` por
+      // omissão. Só `"unknown"` literal (o catch-all comprovadamente
+      // inerte) é ignorado.
+      return "AUTH_REQUIRED_OPERATIONAL";
+  }
 }
