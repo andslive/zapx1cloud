@@ -110,15 +110,134 @@ const SAFE_EVENT_TYPE_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
  * payload inteiro, nunca um valor de tamanho/forma arbitrária. Qualquer
  * coisa fora do padrão seguro (alfanumérico + `._-`, até 64 caracteres)
  * vira `"unknown"`, nunca é passada adiante como está.
+ *
+ * FASE 19C — precedência corrigida para ficar IDÊNTICA à extração de
+ * `event` em `normalizePayload` (`uazapi-webhook/index.ts`, ~linha 851):
+ * mesma ordem de campos (`event, EventType, type, Event`) e mesmo
+ * operador `||` (em vez do `??` usado até a Fase 18N). Comprovado por
+ * execução de código contra fixtures sintéticas (Fase 19C) que a versão
+ * anterior, por usar `??`, "travava" num campo falsy-mas-definido (ex.:
+ * `type: ""`) antes de alcançar um campo posterior com o nome real do
+ * evento — fazendo esta função reportar `"unknown"` para payloads que
+ * `normalizePayload` reconhecia corretamente (ex.: `kind: "message"`).
+ * Este rótulo é usado SÓ para telemetria (nunca para a decisão de
+ * autenticação, que usa exclusivamente `norm.kind` via
+ * `classifyUazapiWebhookEventAuthPolicy`) — corrigir a precedência aqui
+ * não altera nenhuma decisão de negócio ou de autenticação.
  */
 export function sanitizeUazapiWebhookEventTypeForTelemetry(payload: unknown): string {
   if (payload === null || typeof payload !== "object") return "unknown";
-  const raw = (payload as Record<string, unknown>).event ??
-    (payload as Record<string, unknown>).type ??
-    (payload as Record<string, unknown>).Event ??
-    (payload as Record<string, unknown>).EventType;
-  if (typeof raw !== "string") return "unknown";
+  const raw = (payload as Record<string, unknown>).event ||
+    (payload as Record<string, unknown>).EventType ||
+    (payload as Record<string, unknown>).type ||
+    (payload as Record<string, unknown>).Event ||
+    "";
+  if (typeof raw !== "string" || raw.length === 0) return "unknown";
   return SAFE_EVENT_TYPE_PATTERN.test(raw) ? raw : "unknown";
+}
+
+/**
+ * FASE 19C — diagnóstico sanitizado adicional (nunca usado para decisão
+ * de autenticação ou de negócio, só para permitir que uma futura janela
+ * de observação distinga, por SQL, entre os dois conceitos que a Fase
+ * 18W conflacionou: o rótulo de telemetria (`event_type`) e `norm.kind`
+ * (o que de fato controla `classifyUazapiWebhookEventAuthPolicy`).
+ */
+export type UazapiWebhookEventLabelSource = "explicit" | "structural" | "fallback";
+export type UazapiWebhookTokenPresence =
+  | "present"
+  | "missing"
+  | "invalid_type"
+  | "empty"
+  | "not_evaluated";
+export type UazapiWebhookTokenSource = "root" | "none";
+export type UazapiWebhookAuthApplicability = "required" | "not_applicable_unknown";
+
+/**
+ * Verifica, com a MESMA precedência de campos e o MESMO operador `||`
+ * usados por `normalizePayload` para extrair `event`, se o payload trazia
+ * um rótulo de evento explícito e não-vazio — nunca retorna o valor em
+ * si, só um booleano.
+ */
+function hasExplicitUazapiWebhookEventLabel(payload: unknown): boolean {
+  if (payload === null || typeof payload !== "object") return false;
+  const p = payload as Record<string, unknown>;
+  const raw = p.event || p.EventType || p.type || p.Event || "";
+  return typeof raw === "string" && raw.length > 0;
+}
+
+/**
+ * Classifica COMO `norm.kind` foi determinado, em 3 categorias fechadas:
+ * - `explicit`: existia um campo `event`/`EventType`/`type`/`Event` não
+ *   vazio (independente de `norm.kind` ter reconhecido esse valor ou
+ *   não).
+ * - `structural`: não havia rótulo explícito, mas o normalizador ainda
+ *   assim reconheceu um `kind` != "unknown" — só é possível via um dos
+ *   fallbacks estruturais já mapeados por leitura de código na Fase 19C
+ *   (ex.: `!event && data.key && data.message` para mensagens; o bloco
+ *   de recibo por `MessageIDs[]`/`Type` para `ack`, que nem sequer
+ *   depende de `event`).
+ * - `fallback`: nem rótulo explícito nem reconhecimento estrutural —
+ *   caiu no catch-all final (`kind: "unknown"`).
+ *
+ * Não recebe o payload inteiro para gravar — só o usa para computar um
+ * booleano, e o valor de retorno é sempre um dos 3 literais acima.
+ */
+export function deriveUazapiWebhookEventLabelSource(
+  payload: unknown,
+  normalizedKind: string | null | undefined,
+): UazapiWebhookEventLabelSource {
+  if (hasExplicitUazapiWebhookEventLabel(payload)) return "explicit";
+  return normalizedKind && normalizedKind !== "unknown" ? "structural" : "fallback";
+}
+
+/**
+ * Deriva `token_presence` a partir do CÓDIGO de avaliação já computado
+ * por `evaluateUazapiWebhookTokenAuth` — nunca re-lê o payload. Códigos
+ * onde um token válido foi extraído e comparado (`match`/`no_match`/
+ * `ambiguous`) contam como `present` mesmo quando não houve
+ * correspondência, porque a pergunta aqui é só "o campo `token` existia
+ * como string não-vazia?", não "autenticou?". Códigos onde a avaliação
+ * nunca chegou a checar o token (`no_candidate`/`non_uazapi`/
+ * `internal_error`/`not_applicable_unknown`) retornam `not_evaluated` —
+ * um 5º valor fora da lista ilustrativa da tarefa, adicionado
+ * deliberadamente para não forçar uma resposta enganosa quando a
+ * pergunta nem chegou a ser feita.
+ */
+export function deriveUazapiWebhookTokenPresence(
+  evaluationCode: UazapiWebhookTokenAuthTelemetryCode,
+): UazapiWebhookTokenPresence {
+  switch (evaluationCode) {
+    case "token_auth_match":
+    case "token_auth_no_match":
+    case "token_auth_ambiguous":
+      return "present";
+    case "token_auth_missing":
+      return "missing";
+    case "token_auth_invalid_type":
+      return "invalid_type";
+    case "token_auth_empty":
+      return "empty";
+    default:
+      return "not_evaluated";
+  }
+}
+
+/**
+ * Deriva `token_source` a partir de `token_presence` — hoje
+ * `extractUazapiWebhookToken` só aceita `payload.token` na raiz (Fase
+ * 18K, confirmado por leitura de código na Fase 19C: nenhum caminho
+ * aninhado, header ou query é aceito), então "havia algo na raiz"
+ * (`present`/`invalid_type`/`empty`, mesmo que o tipo/conteúdo fosse
+ * inválido) é suficiente para `root`; caso contrário `none`.
+ */
+export function deriveUazapiWebhookTokenSource(
+  tokenPresence: UazapiWebhookTokenPresence,
+): UazapiWebhookTokenSource {
+  return tokenPresence === "present" || tokenPresence === "invalid_type" ||
+      tokenPresence === "empty"
+    ? "root"
+    : "none";
 }
 
 export interface UazapiWebhookTokenAuthTelemetryFields {
@@ -253,7 +372,7 @@ export function selectCandidatesForProcessing<T extends UazapiWebhookTokenAuthCa
  * `webhook_logs.parsed_fields`. Incrementar só se o formato mudar de
  * forma incompatível com consultas já escritas contra a versão 1.
  */
-export const TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION = 1;
+export const TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION = 2;
 
 export interface UazapiWebhookTokenAuthTelemetryRecord {
   token_auth: {
@@ -262,6 +381,11 @@ export interface UazapiWebhookTokenAuthTelemetryRecord {
     code: UazapiWebhookTokenAuthTelemetryCode;
     event_type: string;
     connection_id: string | null;
+    normalized_kind: string | null;
+    event_label_source: UazapiWebhookEventLabelSource;
+    token_presence: UazapiWebhookTokenPresence;
+    token_source: UazapiWebhookTokenSource;
+    auth_applicability: UazapiWebhookAuthApplicability;
   };
 }
 
@@ -279,11 +403,22 @@ export interface UazapiWebhookTokenAuthTelemetryRecord {
  * fornecido pelo payload. Para qualquer outro código, `connection_id` é
  * sempre `null`.
  */
+export interface UazapiWebhookTokenAuthTelemetryDiagnostics {
+  /** `norm.kind` já computado — nunca recomputado aqui, nunca o payload. */
+  normalizedKind: string | null;
+  /** Ver `deriveUazapiWebhookEventLabelSource` — computado pelo chamador. */
+  eventLabelSource: UazapiWebhookEventLabelSource;
+  /** `"not_applicable_unknown"` só no ramo `IGNORE_UNKNOWN`; `"required"` em qualquer outro. */
+  authApplicability: UazapiWebhookAuthApplicability;
+}
+
 export function buildUazapiWebhookTokenAuthTelemetryRecord<T extends UazapiWebhookTokenAuthCandidate>(
   mode: UazapiWebhookTokenAuthMode,
   evaluation: UazapiWebhookTokenAuthEvaluation<T>,
   sanitizedEventType: string,
+  diagnostics: UazapiWebhookTokenAuthTelemetryDiagnostics,
 ): UazapiWebhookTokenAuthTelemetryRecord {
+  const tokenPresence = deriveUazapiWebhookTokenPresence(evaluation.code);
   return {
     token_auth: {
       schema_version: TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION,
@@ -293,6 +428,11 @@ export function buildUazapiWebhookTokenAuthTelemetryRecord<T extends UazapiWebho
       connection_id: evaluation.code === "token_auth_match" && evaluation.authenticatedInstance
         ? evaluation.authenticatedInstance.id
         : null,
+      normalized_kind: diagnostics.normalizedKind,
+      event_label_source: diagnostics.eventLabelSource,
+      token_presence: tokenPresence,
+      token_source: deriveUazapiWebhookTokenSource(tokenPresence),
+      auth_applicability: diagnostics.authApplicability,
     },
   };
 }

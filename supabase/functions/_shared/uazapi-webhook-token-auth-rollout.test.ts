@@ -8,6 +8,9 @@ import { assert, assertEquals, assertFalse, assertThrows } from "https://deno.la
 import {
   buildUazapiWebhookTokenAuthTelemetryRecord,
   classifyUazapiWebhookEventAuthPolicy,
+  deriveUazapiWebhookEventLabelSource,
+  deriveUazapiWebhookTokenPresence,
+  deriveUazapiWebhookTokenSource,
   evaluateUazapiWebhookTokenAuth,
   logUazapiWebhookTokenAuthTelemetry,
   parseUazapiWebhookTokenAuthMode,
@@ -16,6 +19,7 @@ import {
   TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION,
   UnknownUazapiWebhookTokenAuthModeError,
   type UazapiWebhookTokenAuthCandidate,
+  type UazapiWebhookTokenAuthTelemetryDiagnostics,
 } from "./uazapi-webhook-token-auth-rollout.ts";
 
 interface FakeInstance extends UazapiWebhookTokenAuthCandidate {
@@ -29,6 +33,32 @@ interface FakeInstance extends UazapiWebhookTokenAuthCandidate {
 function isUazapi(c: FakeInstance): boolean {
   return c.provider === null || c.provider === undefined || c.provider === "" || c.provider === "uazapi";
 }
+
+// Fase 19C — diagnósticos padrão usados pelos testes pré-existentes de
+// `buildUazapiWebhookTokenAuthTelemetryRecord` que não exercitam
+// especificamente os novos campos (esses ganham testes próprios abaixo).
+const REQUIRED_DIAG: UazapiWebhookTokenAuthTelemetryDiagnostics = {
+  normalizedKind: "connection",
+  eventLabelSource: "explicit",
+  authApplicability: "required",
+};
+const NOT_APPLICABLE_DIAG: UazapiWebhookTokenAuthTelemetryDiagnostics = {
+  normalizedKind: "unknown",
+  eventLabelSource: "fallback",
+  authApplicability: "not_applicable_unknown",
+};
+const ALL_TELEMETRY_KEYS = [
+  "auth_applicability",
+  "code",
+  "connection_id",
+  "event_label_source",
+  "event_type",
+  "mode",
+  "normalized_kind",
+  "schema_version",
+  "token_presence",
+  "token_source",
+].sort();
 
 // ── Parser de modo ───────────────────────────────────────────────────
 
@@ -303,7 +333,7 @@ Deno.test("logUazapiWebhookTokenAuthTelemetry: a assinatura da função não ace
 
 Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: match persiste code permitido e connection_id da linha autenticada", () => {
   const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, isUazapi);
-  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "connection");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "connection", REQUIRED_DIAG);
   assertEquals(record.token_auth.code, "token_auth_match");
   assertEquals(record.token_auth.mode, "observe");
   assertEquals(record.token_auth.event_type, "connection");
@@ -314,7 +344,7 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: match persiste code permi
 Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: missing persiste code permitido, connection_id null", () => {
   const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, {}, isUazapi);
   assertEquals(evaluation.code, "token_auth_missing");
-  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "unknown");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "unknown", REQUIRED_DIAG);
   assertEquals(record.token_auth.code, "token_auth_missing");
   assertEquals(record.token_auth.connection_id, null);
 });
@@ -326,7 +356,7 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: connection_id nunca vem d
   // campo arbitrário construído a partir do payload recebido.
   const evaluationNoMatch = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-nao-existe" }, isUazapi);
   assertEquals(evaluationNoMatch.code, "token_auth_no_match");
-  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluationNoMatch, "connection");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluationNoMatch, "connection", REQUIRED_DIAG);
   assertEquals(record.token_auth.connection_id, null);
 });
 
@@ -336,24 +366,24 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: ambiguous/non_uazapi/inte
     { id: "c2", provider: "uazapi", instance_token: "tok-X", is_active: true, status: "connected" },
   ];
   const ambiguousEval = evaluateUazapiWebhookTokenAuth(ambiguous, { token: "tok-X" }, isUazapi);
-  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", ambiguousEval, "connection").token_auth.connection_id, null);
+  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", ambiguousEval, "connection", REQUIRED_DIAG).token_auth.connection_id, null);
 
   const onlyHookCloud: FakeInstance[] = [{ id: "h1", provider: "meta_cloud", instance_token: null, is_active: true, status: "disconnected" }];
   const nonUazapiEval = evaluateUazapiWebhookTokenAuth(onlyHookCloud, { token: "x" }, isUazapi);
-  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", nonUazapiEval, "connection").token_auth.connection_id, null);
+  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", nonUazapiEval, "connection", REQUIRED_DIAG).token_auth.connection_id, null);
 
   const internalErrorEval = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, () => { throw new Error("boom"); });
-  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", internalErrorEval, "connection").token_auth.connection_id, null);
+  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", internalErrorEval, "connection", REQUIRED_DIAG).token_auth.connection_id, null);
 
   const noCandidateEval = evaluateUazapiWebhookTokenAuth<FakeInstance>([], { token: "x" }, isUazapi);
-  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", noCandidateEval, "connection").token_auth.connection_id, null);
+  assertEquals(buildUazapiWebhookTokenAuthTelemetryRecord("observe", noCandidateEval, "connection", REQUIRED_DIAG).token_auth.connection_id, null);
 });
 
-Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: objeto resultante nunca contém token/payload/PII — só as 5 chaves fechadas esperadas", () => {
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: objeto resultante nunca contém token/payload/PII — só as chaves fechadas esperadas", () => {
   const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "SECRET-VALUE-NEVER-PERSISTED" }, isUazapi);
-  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluation, "connection");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluation, "connection", REQUIRED_DIAG);
   const keys = Object.keys(record.token_auth).sort();
-  assertEquals(keys, ["code", "connection_id", "event_type", "mode", "schema_version"]);
+  assertEquals(keys, ALL_TELEMETRY_KEYS);
   assertFalse(JSON.stringify(record).includes("SECRET-VALUE-NEVER-PERSISTED"));
 });
 
@@ -364,7 +394,7 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: code é sempre um dos 9 v
     "token_auth_internal_error",
   ]);
   const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, isUazapi);
-  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "connection");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "connection", REQUIRED_DIAG);
   assert(ALLOWED.has(record.token_auth.code));
 });
 
@@ -374,7 +404,7 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: propriedades extras num o
   const matchedEvaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, isUazapi);
   // Simula um chamador que anexou campos extras/inesperados ao objeto de
   // avaliação (ex.: um bug em outro lugar do código que injetasse
-  // `raw_token`/`payload`/`headers`) — mesmo assim, só as 5 chaves
+  // `raw_token`/`payload`/`headers`) — mesmo assim, só as chaves
   // fechadas devem sobreviver, porque a função nunca faz `...evaluation`
   // no retorno, só lê `.code` e `.authenticatedInstance.id` de propósito.
   const maliciousEvaluation = {
@@ -383,9 +413,9 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: propriedades extras num o
     payload: { secret: "SHOULD-NEVER-APPEAR-EITHER" },
     headers: { authorization: "Bearer SHOULD-NOT-LEAK" },
   } as typeof matchedEvaluation;
-  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", maliciousEvaluation, "connection");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", maliciousEvaluation, "connection", REQUIRED_DIAG);
   const keys = Object.keys(record.token_auth).sort();
-  assertEquals(keys, ["code", "connection_id", "event_type", "mode", "schema_version"]);
+  assertEquals(keys, ALL_TELEMETRY_KEYS);
   const serialized = JSON.stringify(record);
   assertFalse(serialized.includes("SHOULD-NEVER-APPEAR"));
   assertFalse(serialized.includes("SHOULD-NOT-LEAK"));
@@ -397,7 +427,7 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: authenticatedInstance com
   ];
   const evaluation = evaluateUazapiWebhookTokenAuth(candidatesWithExtraFields, { token: "REAL-SECRET-TOKEN-VALUE" }, isUazapi);
   assertEquals(evaluation.code, "token_auth_match");
-  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluation, "connection");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("enforce", evaluation, "connection", REQUIRED_DIAG);
   assertEquals(record.token_auth.connection_id, "uazapi-1");
   assertFalse(JSON.stringify(record).includes("REAL-SECRET-TOKEN-VALUE"));
 });
@@ -443,12 +473,13 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: token_auth_not_applicable
     "observe",
     { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
     "unknown",
+    NOT_APPLICABLE_DIAG,
   );
   assertEquals(record.token_auth.code, "token_auth_not_applicable_unknown");
   assertEquals(record.token_auth.connection_id, null);
   assertEquals(record.token_auth.event_type, "unknown");
   const keys = Object.keys(record.token_auth).sort();
-  assertEquals(keys, ["code", "connection_id", "event_type", "mode", "schema_version"]);
+  assertEquals(keys, ALL_TELEMETRY_KEYS);
 });
 
 Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: token_auth_not_applicable_unknown funciona nos dois modos", () => {
@@ -456,14 +487,145 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: token_auth_not_applicable
     "observe",
     { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
     "unknown",
+    NOT_APPLICABLE_DIAG,
   );
   const enforceRecord = buildUazapiWebhookTokenAuthTelemetryRecord(
     "enforce",
     { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
     "unknown",
+    NOT_APPLICABLE_DIAG,
   );
   assertEquals(observeRecord.token_auth.mode, "observe");
   assertEquals(enforceRecord.token_auth.mode, "enforce");
   assertEquals(observeRecord.token_auth.connection_id, null);
   assertEquals(enforceRecord.token_auth.connection_id, null);
+});
+
+// ── Fase 19C — sanitizeUazapiWebhookEventTypeForTelemetry: correção de
+// precedência (era `??`+ordem diferente de normalizePayload; agora `||`
+// + mesma ordem `event, EventType, type, Event`) ─────────────────────
+
+Deno.test("sanitizeUazapiWebhookEventTypeForTelemetry: campo falsy-mas-definido antes de um campo real não bloqueia mais o rótulo real (bug corrigido na Fase 19C)", () => {
+  // Antes da correção, `??` só pulava null/undefined — uma string vazia
+  // num campo checado ANTES do campo real (na ordem antiga, diferente da
+  // de normalizePayload) fazia esta função reportar "unknown" mesmo
+  // quando normalizePayload reconhecia corretamente o evento.
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ type: "", EventType: "messages" }), "messages");
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ type: 0, EventType: "messages" }), "messages");
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ event: "", type: "", Event: "connection" }), "connection");
+});
+
+Deno.test("sanitizeUazapiWebhookEventTypeForTelemetry: precedência agora idêntica à de normalizePayload (event, EventType, type, Event)", () => {
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ event: "a", EventType: "b", type: "c", Event: "d" }), "a");
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ EventType: "b", type: "c", Event: "d" }), "b");
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ type: "c", Event: "d" }), "c");
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ Event: "d" }), "d");
+});
+
+Deno.test("sanitizeUazapiWebhookEventTypeForTelemetry: todos os campos falsy => unknown (nunca undefined/erro)", () => {
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ event: "", EventType: "", type: "", Event: "" }), "unknown");
+  assertEquals(sanitizeUazapiWebhookEventTypeForTelemetry({ event: 0, EventType: null }), "unknown");
+});
+
+// ── Fase 19C — deriveUazapiWebhookEventLabelSource ───────────────────
+
+Deno.test("deriveUazapiWebhookEventLabelSource: campo explícito não-vazio => explicit, independente de normalizedKind", () => {
+  assertEquals(deriveUazapiWebhookEventLabelSource({ event: "messages.upsert" }, "message"), "explicit");
+  // Mesmo se normalizePayload não reconheceu o valor (kind ainda unknown),
+  // o rótulo explícito existia — a fonte é "explicit", não "fallback".
+  assertEquals(deriveUazapiWebhookEventLabelSource({ event: "algum-evento-nao-mapeado" }, "unknown"), "explicit");
+});
+
+Deno.test("deriveUazapiWebhookEventLabelSource: sem campo explícito mas kind reconhecido => structural", () => {
+  assertEquals(deriveUazapiWebhookEventLabelSource({ data: { key: {}, message: {} } }, "message"), "structural");
+  assertEquals(deriveUazapiWebhookEventLabelSource({ MessageIDs: ["1"], Type: "Read" }, "ack"), "structural");
+});
+
+Deno.test("deriveUazapiWebhookEventLabelSource: sem campo explícito e kind unknown => fallback", () => {
+  assertEquals(deriveUazapiWebhookEventLabelSource({}, "unknown"), "fallback");
+  assertEquals(deriveUazapiWebhookEventLabelSource({ foo: "bar" }, null), "fallback");
+  assertEquals(deriveUazapiWebhookEventLabelSource(null, undefined), "fallback");
+});
+
+Deno.test("deriveUazapiWebhookEventLabelSource: campo falsy-mas-definido (string vazia) não conta como explícito", () => {
+  assertEquals(deriveUazapiWebhookEventLabelSource({ event: "", type: "" }, "unknown"), "fallback");
+});
+
+// ── Fase 19C — deriveUazapiWebhookTokenPresence / deriveUazapiWebhookTokenSource ──
+
+Deno.test("deriveUazapiWebhookTokenPresence: match/no_match/ambiguous => present (token existia e era string não-vazia)", () => {
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_match"), "present");
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_no_match"), "present");
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_ambiguous"), "present");
+});
+
+Deno.test("deriveUazapiWebhookTokenPresence: missing/invalid_type/empty mapeiam 1:1", () => {
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_missing"), "missing");
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_invalid_type"), "invalid_type");
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_empty"), "empty");
+});
+
+Deno.test("deriveUazapiWebhookTokenPresence: no_candidate/non_uazapi/internal_error/not_applicable_unknown => not_evaluated (nunca chegou a checar o token)", () => {
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_no_candidate"), "not_evaluated");
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_non_uazapi"), "not_evaluated");
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_internal_error"), "not_evaluated");
+  assertEquals(deriveUazapiWebhookTokenPresence("token_auth_not_applicable_unknown"), "not_evaluated");
+});
+
+Deno.test("deriveUazapiWebhookTokenSource: present/invalid_type/empty => root; missing/not_evaluated => none", () => {
+  assertEquals(deriveUazapiWebhookTokenSource("present"), "root");
+  assertEquals(deriveUazapiWebhookTokenSource("invalid_type"), "root");
+  assertEquals(deriveUazapiWebhookTokenSource("empty"), "root");
+  assertEquals(deriveUazapiWebhookTokenSource("missing"), "none");
+  assertEquals(deriveUazapiWebhookTokenSource("not_evaluated"), "none");
+});
+
+// ── Fase 19C — buildUazapiWebhookTokenAuthTelemetryRecord: novos campos ──
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: campos diagnósticos novos refletem exatamente o que foi passado, sem transformação extra", () => {
+  const evaluation = evaluateUazapiWebhookTokenAuth(
+    [{ id: "c1", provider: "uazapi", instance_token: "tok-A", is_active: true, status: "connected" }],
+    {},
+    isUazapi,
+  );
+  assertEquals(evaluation.code, "token_auth_missing");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "unknown", {
+    normalizedKind: "message",
+    eventLabelSource: "structural",
+    authApplicability: "required",
+  });
+  assertEquals(record.token_auth.normalized_kind, "message");
+  assertEquals(record.token_auth.event_label_source, "structural");
+  assertEquals(record.token_auth.auth_applicability, "required");
+  assertEquals(record.token_auth.token_presence, "missing");
+  assertEquals(record.token_auth.token_source, "none");
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: prova direta do achado da Fase 19C — normalized_kind pode ser 'message' mesmo quando event_type sanitizado é 'unknown'", () => {
+  // Reproduz exatamente o payload que expôs o bug de precedência: rótulo
+  // explícito ausente/vazio no campo checado primeiro, mas o normalizador
+  // canônico (fora do escopo deste arquivo) teria chegado a kind="message"
+  // via outro campo ou via fallback estrutural. Este teste prova que,
+  // com a correção da Fase 19C, o par (event_type, normalized_kind) pode
+  // ser corretamente distinguido na telemetria persistida.
+  const payload = { type: "", EventType: "messages" };
+  const sanitizedLabel = sanitizeUazapiWebhookEventTypeForTelemetry(payload);
+  // Pós-correção da Fase 19C, este caso específico já não produz mais
+  // "unknown" — mas o objeto de telemetria abaixo simula o caso genérico
+  // em que normalizedKind diverge de sanitizedEventType (ex.: qualquer
+  // fallback estrutural remanescente), provando que o schema consegue
+  // representar essa divergência quando ela ocorrer.
+  const evaluation = evaluateUazapiWebhookTokenAuth(
+    [{ id: "c1", provider: "uazapi", instance_token: "tok-A", is_active: true, status: "connected" }],
+    {},
+    isUazapi,
+  );
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "unknown", {
+    normalizedKind: "message",
+    eventLabelSource: "structural",
+    authApplicability: "required",
+  });
+  assertEquals(record.token_auth.event_type, "unknown");
+  assertEquals(record.token_auth.normalized_kind, "message");
+  assertEquals(sanitizedLabel, "messages"); // corrigido: já não é mais "unknown"
 });
