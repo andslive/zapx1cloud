@@ -22,6 +22,7 @@ import { redactUazapiWebhookPayloadForLog } from "../_shared/uazapi-webhook-toke
 import {
   buildUazapiWebhookTokenAuthTelemetryRecord,
   classifyUazapiWebhookEventAuthPolicy,
+  deriveUazapiWebhookEventLabelSource,
   evaluateUazapiWebhookTokenAuth,
   logUazapiWebhookTokenAuthTelemetry,
   parseUazapiWebhookTokenAuthMode,
@@ -3376,6 +3377,11 @@ Deno.serve(async (req) => {
               uazapiWebhookTokenAuthMode,
               { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
               "unknown",
+              {
+                normalizedKind: norm?.kind ?? null,
+                eventLabelSource: deriveUazapiWebhookEventLabelSource(payload, norm?.kind ?? null),
+                authApplicability: "not_applicable_unknown",
+              },
             ),
           }).eq("id", logRecordId);
         } catch (e) {
@@ -3580,6 +3586,11 @@ Deno.serve(async (req) => {
             uazapiWebhookTokenAuthMode,
             finalTokenAuthEvaluation,
             sanitizeUazapiWebhookEventTypeForTelemetry(payload),
+            {
+              normalizedKind: norm?.kind ?? null,
+              eventLabelSource: deriveUazapiWebhookEventLabelSource(payload, norm?.kind ?? null),
+              authApplicability: "required",
+            },
           ),
         }).eq("id", logRecordId);
       } catch (e) {
