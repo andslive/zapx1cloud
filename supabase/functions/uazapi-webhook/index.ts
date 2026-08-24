@@ -88,28 +88,20 @@ function normalizeResponseHash(text: any): string {
     .trim();
 }
 
-/** Debug insert for testing attribution propagation. */
-async function debugInsertTracking(supabase: any, payload: any) {
-  const { lead_id, phone, source, raw_payload } = payload;
-  const tracking = {
-    lead_id,
-    phone,
-    source,
-    raw_payload,
-    created_at: new Date().toISOString()
-  };
-  
-  const { data, error } = await supabase.from("lead_tracking").insert(tracking).select().single();
-  
-  if (error) {
-    console.error("[uazapi-webhook] debug insert error:", error);
-    return { success: false, error };
-  }
-  
-  const { count } = await supabase.from("lead_tracking").select("*", { count: 'exact', head: true });
-  
-  return { success: true, lead_tracking_id: data.id, count_after: count };
-}
+// FASE 19O — a ação `debug-insert-tracking` (e o helper `debugInsertTracking`
+// que a implementava) foi removida fisicamente. Histórico: ferramenta de
+// teste manual de propagação de atribuição, sem nenhum chamador legítimo
+// atual ou histórico (Fase 19I.1/19M, arqueologia exaustiva de todo o
+// histórico Git, frontend, cron, triggers e VPS — zero ocorrência fora
+// deste arquivo). Na v21 (antes da Fase 19J), o ramo era alcançável sem
+// nenhuma autenticação e podia gravar em `lead_tracking` com `lead_id` de
+// qualquer organização; o trigger `tr_propagate_lead_attribution`
+// propagava o campo `source` do payload do cliente para `leads.source`
+// cross-tenant (Fase 19M). Desde a Fase 19J/19L (deploy na Fase 19N, v22),
+// o interceptor de domínio interno/externo já rejeitava incondicionalmente
+// esta ação antes de qualquer processamento — o código ficou morto, porém
+// fisicamente presente. Esta remoção (Fase 19O) elimina o ramo do código-
+// fonte; a proteção em produção (v22) já estava ativa antes desta remoção.
 
 /** Log for Webhook Health and Audit - Optimized with UPSERT and 60s throttle */
 async function logWebhookHealth(supabase: any, data: {
@@ -2736,13 +2728,8 @@ Deno.serve(async (req) => {
     }
 
 
-    // DEBUG ACTION: Controlled insert test
-    if (action === "debug-insert-tracking") {
-      const result = await debugInsertTracking(supabase, payload);
-      return new Response(JSON.stringify(result), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    // FASE 19O — ramo `debug-insert-tracking` removido fisicamente. Ver o
+    // comentário histórico acima de `logWebhookHealth` para o motivo.
 
     const rawEvent = payload.event || payload.type || payload.Event ||
       payload.EventType;
@@ -11096,16 +11083,10 @@ FORMATO JSON:
         }
       }
 
-      // DEBUG ACTION: Controlled insert test
-      const url = new URL(req.url);
-      const action = url.searchParams.get("action");
-      if (action === "debug-insert-tracking") {
-        const payload = await req.json();
-        const result = await debugInsertTracking(supabase, payload);
-        return new Response(JSON.stringify(result), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+      // FASE 19O — ramo `debug-insert-tracking` removido fisicamente (era
+      // código morto: `req.json()` já havia sido consumido no topo do
+      // handler, uma segunda leitura sempre lançava `Body already
+      // consumed`). Ver o comentário histórico acima de `logWebhookHealth`.
 
       return new Response(JSON.stringify({ ok: true }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
