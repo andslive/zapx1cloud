@@ -117,3 +117,21 @@ export function redactUazapiWebhookPayloadForLog(payload: unknown): unknown {
   if ("token" in clone) clone.token = "[REDACTED]";
   return clone;
 }
+
+/**
+ * FASE 19J — extrai o token de um cabeçalho `Authorization: Bearer <token>`
+ * com formato estrito: exige exatamente o literal `Bearer ` (maiúscula,
+ * um único espaço) seguido de um token sem espaços internos, sem nada
+ * mais no valor do cabeçalho. Qualquer desvio (capitalização diferente,
+ * espaço duplo, prefixo/sufixo extra, ausência do token, múltiplos
+ * valores concatenados pelo runtime em caso de cabeçalho duplicado)
+ * retorna `null` — nunca tenta "consertar" ou tolerar o formato.
+ * Função pura: nunca loga, nunca lança exceção.
+ */
+export function extractBearerToken(authorizationHeader: string | null | undefined): string | null {
+  if (typeof authorizationHeader !== "string") return null;
+  const match = /^Bearer ([^\s]+)$/.exec(authorizationHeader);
+  if (!match) return null;
+  const token = match[1];
+  return token.length > 0 ? token : null;
+}

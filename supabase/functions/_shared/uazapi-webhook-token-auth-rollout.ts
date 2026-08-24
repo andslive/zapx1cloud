@@ -33,8 +33,10 @@
 // Funções puras, sem I/O de rede — testáveis isoladamente via `deno test`.
 
 import {
+  extractBearerToken,
   extractUazapiWebhookToken,
   resolveUazapiInstanceByToken,
+  timingSafeEqualString,
   type UazapiTokenCandidate,
 } from "./uazapi-webhook-token-auth.ts";
 
@@ -101,7 +103,15 @@ export type UazapiWebhookTokenAuthTelemetryCode =
   // de aparecer como `token_auth_missing` (que significa "deveria
   // autenticar e o token não veio", uma afirmação diferente e mais forte
   // do que "este evento nunca precisou de token").
-  | "token_auth_not_applicable_unknown";
+  | "token_auth_not_applicable_unknown"
+  // FASE 19J — nunca produzido por `evaluateUazapiWebhookTokenAuth` nem
+  // por nenhuma avaliação de token de instância UazAPI. Usado
+  // exclusivamente pelo domínio interno (`action === "resume_funnel"`,
+  // ver `evaluateUazapiWebhookInternalServiceAuth`) — garante,
+  // estruturalmente, que uma chamada interna nunca pode ser contada como
+  // `token_auth_match`/`token_auth_missing` de um evento UazAPI real,
+  // mesmo que a autenticação de serviço tenha falhado.
+  | "token_auth_internal_service";
 
 const SAFE_EVENT_TYPE_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
 
@@ -240,6 +250,54 @@ export function deriveUazapiWebhookTokenSource(
     : "none";
 }
 
+// ── FASE 19J — domínio interno × externo ──────────────────────────────
+//
+// A Fase 19I.1 provou, por arqueologia exaustiva de código (todo o Git,
+// `pg_cron`, `pg_proc`, triggers), que `execute_recovery`/
+// `execute_silent_recovery` não têm nenhum chamador atual — eram só do
+// incidente histórico de crédito OpenAI (2026-07-26/27), com a fila que
+// os alimentava vazia e 100% terminal há semanas. Removidas da
+// superfície aceita pelo handler (ver `uazapi-webhook/index.ts`). Só
+// `resume_funnel` permanece como ação interna reconhecida, com os 3
+// chamadores reais (`funnel-resume-cron`, `funnel-job-runner`,
+// `webchat-inbox`) já enviando `Authorization: Bearer
+// ${SUPABASE_SERVICE_ROLE_KEY}` — sem nenhuma mudança necessária nesses
+// chamadores.
+
+export type UazapiWebhookAuthDomain = "internal_service" | "external_uazapi" | "not_applicable_unknown";
+export type UazapiWebhookInternalAction = "resume_funnel" | "none";
+export type UazapiWebhookInternalAuthResult = "match" | "missing" | "invalid" | "not_applicable";
+
+/**
+ * Avalia se um cabeçalho `Authorization` prova, em tempo constante, que
+ * o chamador possui exatamente o `SUPABASE_SERVICE_ROLE_KEY` — a única
+ * credencial aceita para o domínio interno. NUNCA aceita anon key, JWT
+ * de usuário/admin, ou qualquer JWT só por ser sintaticamente válido:
+ * a única prova aceita é posse do valor exato do secret, comparado byte
+ * a byte em tempo constante (reaproveita `timingSafeEqualString`, o
+ * mesmo helper canônico já usado para comparar `instance_token` — nunca
+ * um novo mecanismo). Ambiente sem o secret configurado falha fechada
+ * (`"invalid"`, nunca autentica por omissão). Função pura: nunca loga,
+ * nunca lança exceção, nunca retorna o valor comparado.
+ */
+export function evaluateUazapiWebhookInternalServiceAuth(
+  authorizationHeader: string | null | undefined,
+  expectedServiceRoleKey: string | null | undefined,
+): UazapiWebhookInternalAuthResult {
+  try {
+    if (typeof expectedServiceRoleKey !== "string" || expectedServiceRoleKey.length === 0) {
+      return "invalid";
+    }
+    const bearer = extractBearerToken(authorizationHeader);
+    if (bearer === null) return "missing";
+    return timingSafeEqualString(expectedServiceRoleKey, bearer) ? "match" : "invalid";
+  } catch {
+    // Nunca deixa um erro inesperado (ex.: header exótico) autenticar por
+    // omissão nem derrubar o handler — falha fechada.
+    return "invalid";
+  }
+}
+
 export interface UazapiWebhookTokenAuthTelemetryFields {
   code: UazapiWebhookTokenAuthTelemetryCode;
   mode: UazapiWebhookTokenAuthMode;
@@ -372,7 +430,7 @@ export function selectCandidatesForProcessing<T extends UazapiWebhookTokenAuthCa
  * `webhook_logs.parsed_fields`. Incrementar só se o formato mudar de
  * forma incompatível com consultas já escritas contra a versão 1.
  */
-export const TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION = 2;
+export const TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION = 3;
 
 export interface UazapiWebhookTokenAuthTelemetryRecord {
   token_auth: {
@@ -386,6 +444,14 @@ export interface UazapiWebhookTokenAuthTelemetryRecord {
     token_presence: UazapiWebhookTokenPresence;
     token_source: UazapiWebhookTokenSource;
     auth_applicability: UazapiWebhookAuthApplicability;
+    // FASE 19J — dimensão adicional, aditiva. Nunca escrita por
+    // `buildUazapiWebhookTokenAuthTelemetryRecord` (caminho externo, ver
+    // abaixo) com outro valor além de `external_uazapi`/
+    // `not_applicable_unknown`/`internal_action:"none"` — o caminho
+    // interno usa exclusivamente `buildUazapiWebhookInternalServiceTelemetryRecord`.
+    auth_domain: UazapiWebhookAuthDomain;
+    internal_action: UazapiWebhookInternalAction;
+    internal_auth_result: UazapiWebhookInternalAuthResult;
   };
 }
 
@@ -433,6 +499,87 @@ export function buildUazapiWebhookTokenAuthTelemetryRecord<T extends UazapiWebho
       token_presence: tokenPresence,
       token_source: deriveUazapiWebhookTokenSource(tokenPresence),
       auth_applicability: diagnostics.authApplicability,
+      // FASE 19J — este builder é usado exclusivamente pelo caminho
+      // externo/UazAPI; `auth_domain` é sempre derivado de
+      // `authApplicability` (nunca um parâmetro extra que um chamador
+      // pudesse desalinhar): `not_applicable_unknown` espelha
+      // exatamente o mesmo ramo `IGNORE_UNKNOWN` já existente,
+      // `external_uazapi` cobre todo o resto. `internal_action`/
+      // `internal_auth_result` são sempre `"none"`/`"not_applicable"`
+      // aqui — o domínio interno usa exclusivamente
+      // `buildUazapiWebhookInternalServiceTelemetryRecord`, nunca este.
+      auth_domain: diagnostics.authApplicability === "not_applicable_unknown"
+        ? "not_applicable_unknown"
+        : "external_uazapi",
+      internal_action: "none",
+      internal_auth_result: "not_applicable",
+    },
+  };
+}
+
+/**
+ * FASE 19J — constrói o objeto sanitizado para uma chamada do domínio
+ * interno (`action === "resume_funnel"`, a única reconhecida). Função
+ * pura, separada de `buildUazapiWebhookTokenAuthTelemetryRecord` de
+ * propósito: nunca recebe payload/candidatos/token de instância — só o
+ * `mode` e o resultado já computado de `evaluateUazapiWebhookInternalServiceAuth`.
+ * `code` é sempre o literal dedicado `token_auth_internal_service`
+ * (nunca um dos códigos de avaliação de token UazAPI), `connection_id`
+ * é sempre `null` (a resolução de conexão do domínio interno nunca passa
+ * por aqui), `normalized_kind` é sempre `null` (não é um evento
+ * normalizado). `event_type` é sempre o literal fixo `"resume_funnel"`
+ * — nunca derivado do payload.
+ */
+export function buildUazapiWebhookInternalServiceTelemetryRecord(
+  mode: UazapiWebhookTokenAuthMode,
+  internalAuthResult: UazapiWebhookInternalAuthResult,
+): UazapiWebhookTokenAuthTelemetryRecord {
+  return {
+    token_auth: {
+      schema_version: TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION,
+      mode,
+      code: "token_auth_internal_service",
+      event_type: "resume_funnel",
+      connection_id: null,
+      normalized_kind: null,
+      event_label_source: "explicit",
+      token_presence: "not_evaluated",
+      token_source: "none",
+      auth_applicability: "not_applicable_unknown",
+      auth_domain: "internal_service",
+      internal_action: "resume_funnel",
+      internal_auth_result: internalAuthResult,
+    },
+  };
+}
+
+/**
+ * FASE 19J — constrói o objeto sanitizado para uma tentativa de ação
+ * interna NÃO reconhecida (qualquer `action` presente e diferente de
+ * `"resume_funnel"` — inclui as ações históricas removidas
+ * `execute_recovery`/`execute_silent_recovery`, ver Fase 19I.1, e
+ * qualquer valor futuro não previsto). Nunca executa nada: só documenta,
+ * de forma fechada, que uma tentativa do domínio interno foi rejeitada
+ * sem nunca cair no fluxo externo.
+ */
+export function buildUazapiWebhookUnknownInternalActionTelemetryRecord(
+  mode: UazapiWebhookTokenAuthMode,
+): UazapiWebhookTokenAuthTelemetryRecord {
+  return {
+    token_auth: {
+      schema_version: TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION,
+      mode,
+      code: "token_auth_internal_service",
+      event_type: "unknown",
+      connection_id: null,
+      normalized_kind: null,
+      event_label_source: "explicit",
+      token_presence: "not_evaluated",
+      token_source: "none",
+      auth_applicability: "not_applicable_unknown",
+      auth_domain: "internal_service",
+      internal_action: "none",
+      internal_auth_result: "not_applicable",
     },
   };
 }
