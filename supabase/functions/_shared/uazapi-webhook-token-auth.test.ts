@@ -8,6 +8,7 @@
 
 import { assert, assertEquals, assertFalse } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
+  extractBearerToken,
   extractUazapiWebhookToken,
   redactUazapiWebhookPayloadForLog,
   resolveUazapiInstanceByToken,
@@ -173,4 +174,47 @@ Deno.test("redactUazapiWebhookPayloadForLog: não muta o objeto original", () =>
   const payload = { token: "secret-abc" };
   redactUazapiWebhookPayloadForLog(payload);
   assertEquals(payload.token, "secret-abc");
+});
+
+// ── FASE 19J — extractBearerToken ─────────────────────────────────────
+
+Deno.test("extractBearerToken: formato correto extrai o token", () => {
+  assertEquals(extractBearerToken("Bearer abc123"), "abc123");
+  assertEquals(extractBearerToken("Bearer a.b-c_d"), "a.b-c_d");
+});
+
+Deno.test("extractBearerToken: header ausente/null/undefined => null", () => {
+  assertEquals(extractBearerToken(null), null);
+  assertEquals(extractBearerToken(undefined), null);
+});
+
+Deno.test("extractBearerToken: header vazio => null", () => {
+  assertEquals(extractBearerToken(""), null);
+});
+
+Deno.test("extractBearerToken: 'Bearer' sem token => null", () => {
+  assertEquals(extractBearerToken("Bearer"), null);
+  assertEquals(extractBearerToken("Bearer "), null);
+});
+
+Deno.test("extractBearerToken: capitalização incorreta do prefixo => null", () => {
+  assertEquals(extractBearerToken("bearer abc123"), null);
+  assertEquals(extractBearerToken("BEARER abc123"), null);
+  assertEquals(extractBearerToken("BeArEr abc123"), null);
+});
+
+Deno.test("extractBearerToken: espaço duplo ou espaço interno no token => null", () => {
+  assertEquals(extractBearerToken("Bearer  abc123"), null);
+  assertEquals(extractBearerToken("Bearer abc 123"), null);
+});
+
+Deno.test("extractBearerToken: sem o prefixo 'Bearer ' => null (ex.: token cru, outro esquema)", () => {
+  assertEquals(extractBearerToken("abc123"), null);
+  assertEquals(extractBearerToken("Basic abc123"), null);
+  assertEquals(extractBearerToken("token abc123"), null);
+});
+
+Deno.test("extractBearerToken: prefixo/sufixo extra no valor inteiro do header => null", () => {
+  assertEquals(extractBearerToken("XBearer abc123"), null);
+  assertEquals(extractBearerToken("Bearer abc123X extra"), null);
 });
