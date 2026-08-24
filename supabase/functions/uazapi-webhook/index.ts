@@ -9,11 +9,18 @@ import { normalizePhoneBR, phoneVariantsBR } from "../_shared/phone.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { resolveAIProvider } from "../_shared/ai-credentials.ts";
 import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
+// FASE 19K — classifyReceiptMediaReadOnly/conversationUnchanged/
+// outboundCountUnchanged eram usados exclusivamente pelo bloco
+// execute_silent_recovery, removido na Fase 19J (ver Fase 19I.1 para a
+// prova de que não tinha chamador) — import morto removido nesta
+// revisão. deterministicRecoveryEventId/resolveOriginalEventTime
+// continuam importados: ainda são referenciados dentro de um ramo
+// `if (recoveryCtx)` no processamento de pixel (permanentemente
+// inalcançável, já que nada mais escreve `payload.__recovery_context`
+// — preservado como documentado, não removido nesta revisão por tocar
+// lógica de Pixel/CAPI fora do escopo mínimo desta PR).
 import {
-  classifyReceiptMediaReadOnly,
-  conversationUnchanged,
   deterministicRecoveryEventId,
-  outboundCountUnchanged,
   resolveOriginalEventTime,
 } from "../_shared/receipt-recovery.ts";
 import { resolveEvolutionProviderConfig } from "../_shared/evolution-provider-config.ts";
