@@ -6,11 +6,14 @@
 
 import { assert, assertEquals, assertFalse, assertThrows } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
+  buildUazapiWebhookInternalServiceTelemetryRecord,
   buildUazapiWebhookTokenAuthTelemetryRecord,
+  buildUazapiWebhookUnknownInternalActionTelemetryRecord,
   classifyUazapiWebhookEventAuthPolicy,
   deriveUazapiWebhookEventLabelSource,
   deriveUazapiWebhookTokenPresence,
   deriveUazapiWebhookTokenSource,
+  evaluateUazapiWebhookInternalServiceAuth,
   evaluateUazapiWebhookTokenAuth,
   logUazapiWebhookTokenAuthTelemetry,
   parseUazapiWebhookTokenAuthMode,
@@ -49,10 +52,13 @@ const NOT_APPLICABLE_DIAG: UazapiWebhookTokenAuthTelemetryDiagnostics = {
 };
 const ALL_TELEMETRY_KEYS = [
   "auth_applicability",
+  "auth_domain",
   "code",
   "connection_id",
   "event_label_source",
   "event_type",
+  "internal_action",
+  "internal_auth_result",
   "mode",
   "normalized_kind",
   "schema_version",
@@ -628,4 +634,170 @@ Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: prova direta do achado da
   assertEquals(record.token_auth.event_type, "unknown");
   assertEquals(record.token_auth.normalized_kind, "message");
   assertEquals(sanitizedLabel, "messages"); // corrigido: já não é mais "unknown"
+});
+
+// ── FASE 19J — evaluateUazapiWebhookInternalServiceAuth ───────────────
+
+const REAL_SERVICE_KEY = "sb-service-role-eyJhbGciOiJIUzI1NiJ9.fake-jwt-body.fake-signature";
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: Bearer exatamente igual ao service-role => match", () => {
+  assertEquals(
+    evaluateUazapiWebhookInternalServiceAuth(`Bearer ${REAL_SERVICE_KEY}`, REAL_SERVICE_KEY),
+    "match",
+  );
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: sem Authorization => missing", () => {
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth(null, REAL_SERVICE_KEY), "missing");
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth(undefined, REAL_SERVICE_KEY), "missing");
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: Bearer vazio => missing", () => {
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth("Bearer ", REAL_SERVICE_KEY), "missing");
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth("Bearer", REAL_SERVICE_KEY), "missing");
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: anon key (valor sintaticamente plausível mas errado) => invalid", () => {
+  const anonKeyLookalike = "sb-anon-eyJhbGciOiJIUzI1NiJ9.fake-jwt-body.fake-signature";
+  assertEquals(
+    evaluateUazapiWebhookInternalServiceAuth(`Bearer ${anonKeyLookalike}`, REAL_SERVICE_KEY),
+    "invalid",
+  );
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: JWT de usuário (formato válido, valor errado) => invalid", () => {
+  const userJwtLookalike = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEyMyJ9.signature-abc";
+  assertEquals(
+    evaluateUazapiWebhookInternalServiceAuth(`Bearer ${userJwtLookalike}`, REAL_SERVICE_KEY),
+    "invalid",
+  );
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: service-role com prefixo extra => invalid", () => {
+  assertEquals(
+    evaluateUazapiWebhookInternalServiceAuth(`Bearer X${REAL_SERVICE_KEY}`, REAL_SERVICE_KEY),
+    "invalid",
+  );
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: service-role com sufixo extra => invalid", () => {
+  assertEquals(
+    evaluateUazapiWebhookInternalServiceAuth(`Bearer ${REAL_SERVICE_KEY}X`, REAL_SERVICE_KEY),
+    "invalid",
+  );
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: capitalização incorreta do prefixo Bearer => missing (extractBearerToken já rejeita)", () => {
+  assertEquals(
+    evaluateUazapiWebhookInternalServiceAuth(`bearer ${REAL_SERVICE_KEY}`, REAL_SERVICE_KEY),
+    "missing",
+  );
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: segredo correto em outro formato de header (sem 'Bearer ') => missing", () => {
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth(REAL_SERVICE_KEY, REAL_SERVICE_KEY), "missing");
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: variável de ambiente ausente/vazia => invalid, nunca autentica por omissão", () => {
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth(`Bearer ${REAL_SERVICE_KEY}`, undefined), "invalid");
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth(`Bearer ${REAL_SERVICE_KEY}`, null), "invalid");
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth(`Bearer ${REAL_SERVICE_KEY}`, ""), "invalid");
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: mesmo com o secret ausente, Authorization ausente ainda resulta em falha fechada (nunca undefined/exceção)", () => {
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth(null, undefined), "invalid");
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: token quase igual (1 caractere diferente, mesmo tamanho) => invalid", () => {
+  const almostSame = REAL_SERVICE_KEY.slice(0, -1) + "X";
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth(`Bearer ${almostSame}`, REAL_SERVICE_KEY), "invalid");
+});
+
+Deno.test("evaluateUazapiWebhookInternalServiceAuth: nunca lança exceção mesmo com entradas exóticas", () => {
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth("Bearer " + "x".repeat(10000), REAL_SERVICE_KEY), "invalid");
+  // Whitespace no valor do token falha o formato estrito de extractBearerToken
+  // (nunca extrai um token com espaço) — resultado correto é "missing", não "invalid".
+  assertEquals(evaluateUazapiWebhookInternalServiceAuth("Bearer \n\t", REAL_SERVICE_KEY), "missing");
+});
+
+// ── FASE 19J — buildUazapiWebhookInternalServiceTelemetryRecord ──────
+
+Deno.test("buildUazapiWebhookInternalServiceTelemetryRecord: match => auth_domain/internal_action/internal_auth_result corretos, code dedicado, nunca token_auth_match/missing", () => {
+  const record = buildUazapiWebhookInternalServiceTelemetryRecord("observe", "match");
+  assertEquals(record.token_auth.auth_domain, "internal_service");
+  assertEquals(record.token_auth.internal_action, "resume_funnel");
+  assertEquals(record.token_auth.internal_auth_result, "match");
+  assertEquals(record.token_auth.code, "token_auth_internal_service");
+  assert(record.token_auth.code !== "token_auth_match");
+  assert(record.token_auth.code !== "token_auth_missing");
+  assertEquals(record.token_auth.connection_id, null);
+  assertEquals(record.token_auth.schema_version, TOKEN_AUTH_TELEMETRY_SCHEMA_VERSION);
+});
+
+Deno.test("buildUazapiWebhookInternalServiceTelemetryRecord: missing/invalid mapeiam para internal_auth_result correspondente, nunca para o schema de erro de token UazAPI", () => {
+  assertEquals(buildUazapiWebhookInternalServiceTelemetryRecord("observe", "missing").token_auth.internal_auth_result, "missing");
+  assertEquals(buildUazapiWebhookInternalServiceTelemetryRecord("observe", "invalid").token_auth.internal_auth_result, "invalid");
+  assertEquals(buildUazapiWebhookInternalServiceTelemetryRecord("observe", "missing").token_auth.code, "token_auth_internal_service");
+  assertEquals(buildUazapiWebhookInternalServiceTelemetryRecord("observe", "invalid").token_auth.code, "token_auth_internal_service");
+});
+
+Deno.test("buildUazapiWebhookInternalServiceTelemetryRecord: nunca contém token/Bearer/payload — só as chaves fechadas esperadas", () => {
+  const record = buildUazapiWebhookInternalServiceTelemetryRecord("enforce", "match");
+  const keys = Object.keys(record.token_auth).sort();
+  assertEquals(keys, ALL_TELEMETRY_KEYS);
+  const serialized = JSON.stringify(record);
+  assertFalse(serialized.toLowerCase().includes("bearer"));
+  assertFalse(serialized.toLowerCase().includes(REAL_SERVICE_KEY.toLowerCase()));
+});
+
+Deno.test("buildUazapiWebhookInternalServiceTelemetryRecord: funciona nos dois modos", () => {
+  assertEquals(buildUazapiWebhookInternalServiceTelemetryRecord("observe", "match").token_auth.mode, "observe");
+  assertEquals(buildUazapiWebhookInternalServiceTelemetryRecord("enforce", "match").token_auth.mode, "enforce");
+});
+
+// ── FASE 19J — buildUazapiWebhookUnknownInternalActionTelemetryRecord ──
+
+Deno.test("buildUazapiWebhookUnknownInternalActionTelemetryRecord: internal_action=none, internal_auth_result=not_applicable, domain=internal_service", () => {
+  const record = buildUazapiWebhookUnknownInternalActionTelemetryRecord("observe");
+  assertEquals(record.token_auth.auth_domain, "internal_service");
+  assertEquals(record.token_auth.internal_action, "none");
+  assertEquals(record.token_auth.internal_auth_result, "not_applicable");
+  assertEquals(record.token_auth.code, "token_auth_internal_service");
+  assertEquals(record.token_auth.connection_id, null);
+});
+
+Deno.test("buildUazapiWebhookUnknownInternalActionTelemetryRecord: nunca contém token/payload — só as chaves fechadas esperadas", () => {
+  const record = buildUazapiWebhookUnknownInternalActionTelemetryRecord("enforce");
+  const keys = Object.keys(record.token_auth).sort();
+  assertEquals(keys, ALL_TELEMETRY_KEYS);
+});
+
+// ── FASE 19J — buildUazapiWebhookTokenAuthTelemetryRecord (caminho externo): auth_domain derivado ──
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: caminho externo normal => auth_domain=external_uazapi, internal_action=none, internal_auth_result=not_applicable", () => {
+  const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, { token: "tok-A" }, isUazapi);
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "connection", REQUIRED_DIAG);
+  assertEquals(record.token_auth.auth_domain, "external_uazapi");
+  assertEquals(record.token_auth.internal_action, "none");
+  assertEquals(record.token_auth.internal_auth_result, "not_applicable");
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: ramo IGNORE_UNKNOWN => auth_domain=not_applicable_unknown, espelhando auth_applicability", () => {
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord(
+    "observe",
+    { code: "token_auth_not_applicable_unknown", authenticatedInstance: null },
+    "unknown",
+    NOT_APPLICABLE_DIAG,
+  );
+  assertEquals(record.token_auth.auth_domain, "not_applicable_unknown");
+  assertEquals(record.token_auth.internal_action, "none");
+  assertEquals(record.token_auth.internal_auth_result, "not_applicable");
+});
+
+Deno.test("buildUazapiWebhookTokenAuthTelemetryRecord: evento externo NUNCA pode ser confundido com chamada interna — auth_domain nunca é internal_service", () => {
+  const evaluation = evaluateUazapiWebhookTokenAuth(baseCandidates, {}, isUazapi);
+  assertEquals(evaluation.code, "token_auth_missing");
+  const record = buildUazapiWebhookTokenAuthTelemetryRecord("observe", evaluation, "unknown", REQUIRED_DIAG);
+  assert(record.token_auth.auth_domain !== "internal_service");
+  assert(record.token_auth.code !== "token_auth_internal_service");
 });
