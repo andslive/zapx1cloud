@@ -277,7 +277,7 @@ export function classifyWebSessionChannel(
   return { status: "Offline", reason: "Sessão Web (Chromium) desconectada." };
 }
 
-export type OfficialApiStatus = "Não configurada" | "Pendente" | "Online" | "Offline" | "Erro";
+export type OfficialApiStatus = "Não configurada" | "Pendente" | "Online" | "Offline" | "Erro" | "Dados indisponíveis";
 /** `unknown` = `onboarding_source` presente mas com valor não reconhecido (ex.: `evohub`) — falha fechada, nunca vira `hookcloud`/`direct_meta` por adivinhação. */
 export type OfficialApiSource = "hookcloud" | "direct_meta" | "unknown" | null;
 
@@ -336,6 +336,39 @@ export function classifyOfficialApi(
   };
 }
 
+/**
+ * FASE 20D — resultado de TENTAR buscar o DTO administrativo de API Oficial
+ * (`instances-api?action=officialApi`), antes de saber se existe alguma
+ * linha. Discriminado por `ok` para nunca deixar uma falha de rede/permissão
+ * ser silenciosamente convertida num array vazio (que classifyOfficialApi
+ * trataria como "Não configurada" — mascarando a falha).
+ */
+export type OfficialApiFetchResult =
+  | { ok: true; rows: readonly OfficialApiRaw[] }
+  | { ok: false };
+
+/**
+ * Núcleo do defeito de segurança corrigido nesta fase: uma falha ao
+ * CONSULTAR a API Oficial (permission denied, rede, timeout, resposta
+ * malformada) precisa aparecer como "Dados indisponíveis" — nunca como
+ * "Não configurada" (que afirma, incorretamente, que não existe nenhuma
+ * conexão configurada). Só quando a consulta teve SUCESSO e não encontrou
+ * nenhuma linha é que "Não configurada" é uma afirmação verdadeira.
+ */
+export function classifyOfficialApiFromFetch(
+  fetchResult: OfficialApiFetchResult | null | undefined,
+  metaCloud: OfficialApiRaw | null | undefined,
+): { status: OfficialApiStatus; reason: string; source: OfficialApiSource } {
+  if (!fetchResult || fetchResult.ok !== true) {
+    return {
+      status: "Dados indisponíveis",
+      reason: "Não foi possível consultar a API Oficial (erro de permissão, rede ou backend) — estado real desconhecido, não é o mesmo que \"Não configurada\".",
+      source: null,
+    };
+  }
+  return classifyOfficialApi(metaCloud);
+}
+
 export type OverallStatus =
   | "Online"
   | "Parcial"
@@ -363,7 +396,16 @@ function officialApiBucket(status: OfficialApiStatus): ChannelBucket {
   // "Pendente" nunca reduz o Status Geral (não é uma falha, é onboarding em
   // andamento) — tratada como neutra para fins de agregação, igual a "Não
   // configurada"; a nota "API Oficial pendente" é adicionada separadamente.
-  if (status === "Não configurada" || status === "Pendente") return "neutral";
+  //
+  // FASE 20D — "Dados indisponíveis" (falha ao CONSULTAR o backend: erro de
+  // rede, timeout, permissão) também é neutra aqui, pelo MESMO motivo que
+  // levou à criação deste estado: uma falha de observabilidade nunca pode
+  // rebaixar o Status Geral de uma conexão que continua operacional nos
+  // outros canais (UazAPI/Sessão Web). Se tratada como "down", uma simples
+  // falha temporária de rede ao buscar a API Oficial degradaria
+  // silenciosamente uma conexão saudável para "Parcial"/"Offline" — o MESMO
+  // tipo de falso negativo que a Fase 20B corrigiu para o heartbeat UNKNOWN.
+  if (status === "Não configurada" || status === "Pendente" || status === "Dados indisponíveis") return "neutral";
   if (status === "Online") return "online";
   return "down"; // Offline, Erro
 }
@@ -462,6 +504,16 @@ export interface ThreeChannelRawInput {
   webSessionId?: string | null;
   officialApi: OfficialApiRaw | null | undefined;
   officialApiConnectionId?: string | null;
+  /**
+   * FASE 20D — `true` quando a busca do DTO administrativo de API Oficial
+   * (`instances-api?action=officialApi`) falhou para ESTA requisição
+   * (permissão/rede/backend) — nunca setado por ausência de linha, que é um
+   * resultado de sucesso (`officialApi: null` com fetch OK). Quando `true`,
+   * `officialApi` é ignorado e o canal vira "Dados indisponíveis" — nunca
+   * "Não configurada". Omitido/`false` preserva o comportamento anterior
+   * (fetch OK).
+   */
+  officialApiUnavailable?: boolean;
   activeFunnel?: string | null;
 }
 
@@ -509,12 +561,20 @@ export function classifyThreeChannelConnection(input: ThreeChannelRawInput): Thr
     supportsDelete: webSessionClassified.status !== "Não configurada",
   };
 
-  const officialApiClassified = classifyOfficialApi(input.officialApi ?? null);
+  const officialApiClassified = input.officialApiUnavailable
+    ? classifyOfficialApiFromFetch({ ok: false }, null)
+    : classifyOfficialApi(input.officialApi ?? null);
   const officialApiConnectionId = input.officialApiConnectionId ?? null;
+  // FASE 20D — "Dados indisponíveis" nunca habilita ações: o estado real é
+  // desconhecido (pode ou não existir uma conexão configurada), então
+  // oferecer "Reconectar"/"Excluir" seria uma ação às cegas. Só estados
+  // conhecidos e configurados (Pendente/Online/Offline/Erro) habilitam.
+  const officialApiKnownAndConfigured =
+    officialApiClassified.status !== "Não configurada" && officialApiClassified.status !== "Dados indisponíveis";
   const officialApiCaps: ThreeChannelCapabilities = {
     supportsQr: false, // API Oficial nunca usa QR Code
-    supportsReconnect: officialApiClassified.status !== "Não configurada",
-    supportsDelete: officialApiClassified.status !== "Não configurada",
+    supportsReconnect: officialApiKnownAndConfigured,
+    supportsDelete: officialApiKnownAndConfigured,
   };
 
   const overall = computeOverallStatus(uazapiStatus, webSessionClassified.status, officialApiClassified.status);
