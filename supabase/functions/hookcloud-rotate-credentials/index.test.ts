@@ -82,7 +82,7 @@ function adminClient(config: AdminMockConfig): AdminSupabaseLike {
 function baseDeps(overrides: Partial<RotateHookCloudCredentialsDeps> = {}): RotateHookCloudCredentialsDeps {
   return {
     authClient: authClient(CALLER_ID),
-    adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }),
+    adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"] }),
     callbackBaseUrl: CALLBACK_BASE_URL,
     ...overrides,
   };
@@ -118,12 +118,30 @@ Deno.test("papel insuficiente (seller) => 403", async () => {
   assertEquals(res.status, 403);
 });
 
-Deno.test("admin é suficiente => 200", async () => {
-  const res = await handleRotateCredentialsRequest(req(validPayload()), baseDeps());
-  assertEquals(res.status, 200);
+// FASE 21B — contrato do piloto restringe a rotação EXCLUSIVAMENTE a
+// super_admin, mesma mudança de hookcloud-provision-connection. 'admin'
+// de organização, que antes era suficiente, agora é rejeitado (403,
+// mesma resposta genérica "insufficient_role" de qualquer outro papel
+// insuficiente — nunca revela que "quase" tinha permissão).
+Deno.test("admin de organização (sem super_admin) NÃO é mais suficiente => 403", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }) }),
+  );
+  assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "insufficient_role");
 });
 
-Deno.test("super_admin também é suficiente => 200", async () => {
+Deno.test("admin junto com manager, sem super_admin, ainda é rejeitado => 403", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin", "manager"] }) }),
+  );
+  assertEquals(res.status, 403);
+});
+
+Deno.test("super_admin é suficiente (único papel autorizado no contrato do piloto) => 200", async () => {
   const res = await handleRotateCredentialsRequest(
     req(validPayload()),
     baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"] }) }),
@@ -131,10 +149,28 @@ Deno.test("super_admin também é suficiente => 200", async () => {
   assertEquals(res.status, 200);
 });
 
+Deno.test("super_admin junto com admin também é suficiente => 200", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin", "super_admin"] }) }),
+  );
+  assertEquals(res.status, 200);
+});
+
+Deno.test("usuário sem NENHUM papel em user_roles => 403, mesma resposta genérica de papel insuficiente", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: [] }) }),
+  );
+  assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "insufficient_role");
+});
+
 Deno.test("usuário desativado (profiles.disabled=true) => 403", async () => {
   const res = await handleRotateCredentialsRequest(
     req(validPayload()),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileDisabled: true }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileDisabled: true }) }),
   );
   assertEquals(res.status, 403);
 });
@@ -143,7 +179,7 @@ Deno.test("organization_id enviado divergente do real => 403, cross-tenant rejei
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   const res = await handleRotateCredentialsRequest(
     req({ ...validPayload(), organizationId: "org-de-outra-organizacao" }),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assertEquals(res.status, 403);
   assertEquals(rpcCalls.length, 0, "cross-tenant nunca deve chegar a chamar a RPC de rotação");
@@ -155,7 +191,7 @@ Deno.test("RPC devolve hookcloud_rotation_not_found (conexão de outra organiza�
     baseDeps({
       adminClient: adminClient({
         profileOrgId: ORG_ID,
-        roles: ["admin"],
+        roles: ["super_admin"],
         rpcResult: { data: null, error: { message: "hookcloud_rotation_not_found" } },
       }),
     }),
@@ -169,7 +205,7 @@ Deno.test("nem rotateCallbackSecret nem rotateVerifyToken solicitados => 400, RP
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   const res = await handleRotateCredentialsRequest(
     req({ connectionId: CONNECTION_ID }),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assertEquals(res.status, 400);
   assertEquals(rpcCalls.length, 0);
@@ -179,7 +215,7 @@ Deno.test("rotação CONJUNTA: ambos os segredos são gerados e devolvidos, e o 
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   const res = await handleRotateCredentialsRequest(
     req(validPayload({ rotateCallbackSecret: true, rotateVerifyToken: true })),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   const body = await res.json();
   assertEquals(res.status, 200);
@@ -195,7 +231,7 @@ Deno.test("rotação SEPARADA (só callback secret): verify_token nunca aparece 
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   const res = await handleRotateCredentialsRequest(
     req(validPayload({ rotateCallbackSecret: true, rotateVerifyToken: false })),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   const body = await res.json();
   assertEquals(res.status, 200);
@@ -209,7 +245,7 @@ Deno.test("rotação SEPARADA (só verify token): callback_url nunca aparece na 
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   const res = await handleRotateCredentialsRequest(
     req(validPayload({ rotateCallbackSecret: false, rotateVerifyToken: true })),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   const body = await res.json();
   assertEquals(res.status, 200);
@@ -229,7 +265,7 @@ Deno.test("timestamps de rotação: a RPC é chamada com os hashes novos (prova 
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   await handleRotateCredentialsRequest(
     req(validPayload()),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assertEquals(rpcCalls[0].fn, "rotate_hookcloud_webhook_credentials");
   assert(!("rotated_at" in rpcCalls[0].args), "o timestamp de rotação nunca é parâmetro do cliente — é sempre now() dentro da RPC");
@@ -275,7 +311,7 @@ Deno.test("nenhum token Meta/Vault é tocado — a RPC de rotação nunca recebe
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   await handleRotateCredentialsRequest(
     req(validPayload()),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assert(!("p_access_token" in rpcCalls[0].args));
 });
@@ -313,7 +349,7 @@ Deno.test("16.direct_meta) rotação nunca aceita uma conexão direct_meta — R
     baseDeps({
       adminClient: adminClient({
         profileOrgId: ORG_ID,
-        roles: ["admin"],
+        roles: ["super_admin"],
         rpcResult: { data: null, error: { message: "hookcloud_rotation_not_found" } },
       }),
     }),
@@ -370,7 +406,7 @@ Deno.test("16B.3) OPTIONS com origem permitida => 204, sem autenticar/consultar 
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   const res = await routeRotateCredentialsRequest(
     rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN } }),
-    routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assertEquals(res.status, 204);
   assertEquals(rpcCalls.length, 0);
@@ -391,7 +427,7 @@ Deno.test("16B.5) OPTIONS não chama banco/RPC (reforço)", async () => {
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   const res = await routeRotateCredentialsRequest(
     rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN }, body: JSON.stringify({ ignored: true }) }),
-    routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assertEquals(res.status, 204);
   assertEquals(rpcCalls.length, 0);
@@ -436,7 +472,7 @@ Deno.test("16B.12) origem semelhante/maliciosa é rejeitada (403), antes de qual
   const spyAuth: AuthClientLike = { auth: { getUser: async () => { authCalled = true; return { data: { user: { id: CALLER_ID } } }; } } };
   const res = await routeRotateCredentialsRequest(
     validJsonReq({}, { origin: "https://admin.x1zap.com.attacker.com" }),
-    routeDeps({ authClient: spyAuth, adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    routeDeps({ authClient: spyAuth, adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assertEquals(res.status, 403);
   assertEquals(authCalled, false);
@@ -742,7 +778,7 @@ Deno.test("16B.35) direct_meta continua inalcançável através do roteador (mes
     routeDeps({
       adminClient: adminClient({
         profileOrgId: ORG_ID,
-        roles: ["admin"],
+        roles: ["super_admin"],
         rpcResult: { data: null, error: { message: "hookcloud_rotation_not_found" } },
       }),
     }),

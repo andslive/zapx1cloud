@@ -1,21 +1,53 @@
-// FASE 18A — modal de exibição única do callback URL e verify token
-// gerados pelo provisionamento HookCloud.
+// FASE 18A/21B — modal de exibição única de segredos HookCloud
+// (callback URL, verify token — nunca o Meta Access Token, que nunca
+// chega a esta tela). Reutilizado tanto pelo provisionamento
+// (`HookCloudOnboardingConfig`) quanto pela rotação de credenciais
+// (`HookCloudRotateCredentialsModal`) — ver Parte 5 da Fase 21B ("se o
+// caminho já existir, reaproveite-o; não crie segundo mecanismo
+// concorrente"): antes desta fase, o modal de rotação duplicava esta
+// mesma UI inline, com uma proteção mais fraca (confirmação por
+// AlertDialog Sim/Não, sem checkbox obrigatório).
+//
+// Máquina de estados explícita (Fase 21B, Parte 2) — nunca um booleano
+// solto decidindo se o fechamento é permitido. Cinco estados nomeados,
+// divididos entre este componente e seu dono (`onSensitiveLifecycleChange`
+// do pai cobre os dois primeiros; os três últimos vivem aqui):
+//   1) `idle`                       — dono do modal, `result === null`, nenhuma submissão em andamento.
+//   2) `provisioning`               — dono do modal, requisição de rede em voo (`isSubmitting`/equivalente).
+//   3) `secret_visible_unconfirmed` — ESTE componente, `result !== null` e a caixa de confirmação ainda não foi marcada.
+//   4) `secret_confirmed`           — ESTE componente, caixa marcada — só agora o botão final habilita.
+//   5) `closed`                     — `onClose()` foi chamado; o pai zera `result`, voltando a `idle`.
 //
 // Segurança do ciclo de vida do segredo, ponto a ponto:
-//   - os valores só existem no estado local do componente PAI
-//     (`HookCloudOnboardingConfig`), recebidos como prop — nunca em
-//     React Query cache, nunca em estado global, nunca em
-//     localStorage/sessionStorage/IndexedDB, nunca em URL;
-//   - fechar o modal (X, Escape, clique fora, ou confirmação) sempre
-//     chama `onClose`, que no componente pai faz `setSuccessResult(null)`
-//     — o valor deixa de existir em QUALQUER lugar da árvore React,
-//     tornando reabertura com os mesmos valores estruturalmente
-//     impossível (não há de onde reler);
-//   - nenhum `console.*`, nenhum evento de analytics, nenhum toast
-//     inclui o valor do segredo — só confirmações genéricas ("Copiado!");
-//   - nenhum `beforeunload` é registrado.
+//   - os valores só existem no estado local do componente PAI, recebidos
+//     como prop — nunca em React Query cache, nunca em estado global,
+//     nunca em localStorage/sessionStorage/IndexedDB, nunca em URL, nunca
+//     em cache persistente, nunca enviados a analytics;
+//   - fechar o modal (X, Escape, clique fora, ou o botão final) SÓ
+//     funciona no estado `secret_confirmed` — em `secret_visible_unconfirmed`
+//     as três formas de fechar são bloqueadas e mostram um aviso, nunca
+//     fecham silenciosamente;
+//   - a confirmação é SEMPRE explícita: marcar a caixa "Confirmo que
+//     salvei..." — copiar um campo NUNCA marca a caixa automaticamente
+//     (Fase 21C, achado da revisão independente do PR #29: a caixa em si
+//     agora só fica HABILITADA depois que todos os campos copiáveis
+//     foram copiados pelo menos uma vez — clicar em "Copiar" não confirma
+//     sozinho, mas confirmar sem nunca ter copiado deixou de ser
+//     possível);
+//   - reabrir com um novo resultado (nova chamada de sucesso) sempre
+//     volta a `secret_visible_unconfirmed`, mesmo que o componente já
+//     estivesse montado — nunca herda a confirmação de uma exibição
+//     anterior;
+//   - nenhum `console.*`, nenhum evento de analytics, nenhum toast inclui
+//     o valor de nenhum campo — só confirmações genéricas ("Copiado!");
+//   - `beforeunload`/bloqueio de navegação SPA/voltar-avançar do
+//     navegador são responsabilidade do componente PAI (que sabe se está
+//     em `provisioning` ou `secret_visible_unconfirmed`/equivalente) via
+//     `useBlockPageUnloadWhileSensitive`/`useBlockInternalNavigationWhileSensitive`/
+//     `useBlockBrowserHistoryWhileSensitive` — este componente não
+//     duplica esses hooks, só garante que NUNCA se fecha sozinho.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -24,182 +56,197 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
-import {
-  AlertDialog,
-  AlertDialogContent,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogCancel,
-  AlertDialogAction,
-} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Copy, ShieldAlert, CheckCircle2 } from 'lucide-react';
 import { toast } from 'sonner';
-import type { HookCloudProvisionSuccess } from '@/lib/hookcloud/hookcloudProvisioning';
+import {
+  areAllRequiredFieldsCopied,
+  canCloseHookCloudSecretRevealModal,
+  hookCloudSecretRevealPhaseOnCheckboxChange,
+  initialHookCloudSecretRevealPhase,
+} from '@/lib/hookcloud/hookCloudSecretRevealState';
+
+export interface HookCloudSecretRevealField {
+  id: string;
+  label: string;
+  value: string;
+  /** `false` para campos informativos (ex.: ID da conexão) que não precisam de botão de copiar — nunca editável de qualquer forma. */
+  copyable?: boolean;
+}
+
+export interface HookCloudSecretRevealModalContent {
+  title: string;
+  description: string;
+  /** Aviso principal (ícone de alerta) — específico do fluxo (provisionamento vs. rotação). */
+  warning: string;
+  fields: HookCloudSecretRevealField[];
+  /** Lista opcional de próximos passos — só o provisionamento usa; a rotação omite. */
+  nextSteps?: string[];
+}
 
 interface HookCloudSecretRevealModalProps {
-  result: HookCloudProvisionSuccess | null;
+  /** `null` = modal fechado (estado `idle`, dono do modal). */
+  result: HookCloudSecretRevealModalContent | null;
   onClose: () => void;
 }
 
-async function copyToClipboard(value: string, label: string) {
+async function copyToClipboard(value: string, label: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(value);
     // Nunca inclui o valor copiado na mensagem — só a confirmação.
     toast.success(`${label} copiado!`);
+    return true;
   } catch {
-    toast.error(`Não foi possível copiar. Copie manualmente.`);
+    toast.error('Não foi possível copiar. Copie manualmente.');
+    return false;
   }
 }
 
-export function HookCloudSecretRevealModal({ result, onClose }: HookCloudSecretRevealModalProps) {
-  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false);
+const BLOCKED_CLOSE_WARNING = 'Marque a confirmação de que salvou os valores antes de fechar.';
 
-  const requestClose = () => setConfirmCloseOpen(true);
-  const confirmClose = () => {
-    setConfirmCloseOpen(false);
+export function HookCloudSecretRevealModal({ result, onClose }: HookCloudSecretRevealModalProps) {
+  const [phase, setPhase] = useState(initialHookCloudSecretRevealPhase());
+  // FASE 21C — quais campos copiáveis já foram copiados com sucesso PELO
+  // MENOS uma vez nesta exibição. A caixa de confirmação só habilita
+  // depois que todos foram copiados — clicar "Copiar" não confirma
+  // automaticamente (a checkbox continua exigindo um clique à parte),
+  // mas confirmar sem nunca ter copiado deixa de ser possível.
+  const [copiedFieldIds, setCopiedFieldIds] = useState<ReadonlySet<string>>(new Set());
+
+  // Cada NOVO resultado (identidade de objeto muda a cada chamada de
+  // sucesso — provisionamento e rotação sempre criam um objeto novo,
+  // nunca reaproveitam o anterior) reabre em `secret_visible_unconfirmed`,
+  // com nenhum campo marcado como copiado, mesmo que o componente já
+  // estivesse montado de uma exibição anterior.
+  useEffect(() => {
+    if (result) {
+      setPhase(initialHookCloudSecretRevealPhase());
+      setCopiedFieldIds(new Set());
+    }
+  }, [result]);
+
+  const requiredFieldIds = (result?.fields ?? [])
+    .filter((field) => field.copyable !== false)
+    .map((field) => field.id);
+  const allCopied = areAllRequiredFieldsCopied(requiredFieldIds, copiedFieldIds);
+
+  const handleCopy = async (field: HookCloudSecretRevealField) => {
+    const copied = await copyToClipboard(field.value, field.label);
+    if (copied) {
+      setCopiedFieldIds((prev) => new Set(prev).add(field.id));
+    }
+  };
+
+  const attemptClose = () => {
+    if (!canCloseHookCloudSecretRevealModal(phase)) {
+      toast.warning(BLOCKED_CLOSE_WARNING);
+      return;
+    }
     onClose();
   };
-  const cancelClose = () => setConfirmCloseOpen(false);
 
   return (
-    <>
-      <Dialog
-        open={!!result}
-        onOpenChange={(open) => {
-          if (!open) requestClose();
+    <Dialog
+      open={!!result}
+      onOpenChange={(open) => {
+        if (!open) attemptClose();
+      }}
+    >
+      <DialogContent
+        className="sm:max-w-lg"
+        onEscapeKeyDown={(e) => {
+          e.preventDefault();
+          attemptClose();
+        }}
+        onPointerDownOutside={(e) => {
+          e.preventDefault();
+          attemptClose();
+        }}
+        onInteractOutside={(e) => {
+          e.preventDefault();
         }}
       >
-        <DialogContent
-          className="sm:max-w-lg"
-          onEscapeKeyDown={(e) => {
-            e.preventDefault();
-            requestClose();
-          }}
-          onPointerDownOutside={(e) => {
-            e.preventDefault();
-            requestClose();
-          }}
-        >
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <CheckCircle2 className="h-5 w-5 text-green-600" />
-              Conexão criada como pendente
-            </DialogTitle>
-            <DialogDescription>
-              Copie agora. O verify token não será exibido novamente pelo CRM.
-            </DialogDescription>
-          </DialogHeader>
+        {result && (
+          <>
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <CheckCircle2 className="h-5 w-5 text-green-600" />
+                {result.title}
+              </DialogTitle>
+              <DialogDescription>{result.description}</DialogDescription>
+            </DialogHeader>
 
-          {result && (
             <div className="space-y-4">
               <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm flex gap-2">
                 <ShieldAlert className="h-4 w-4 shrink-0 text-amber-600 mt-0.5" />
-                <p>
-                  Estes valores só aparecem <strong>uma única vez</strong>. Se você fechar esta janela sem
-                  copiá-los, será necessário rotacionar as credenciais numa fase futura.
-                </p>
+                <p>{result.warning}</p>
               </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="hc-connection-id">ID da conexão</Label>
-                <div className="flex gap-2">
-                  <input
-                    id="hc-connection-id"
-                    readOnly
-                    value={result.connectionId}
-                    className="flex-1 rounded-md border bg-muted px-3 py-2 text-sm font-mono"
-                  />
+              {result.fields.map((field) => (
+                <div className="space-y-1.5" key={field.id}>
+                  <Label htmlFor={field.id}>{field.label}</Label>
+                  <div className="flex gap-2">
+                    <input
+                      id={field.id}
+                      readOnly
+                      value={field.value}
+                      className="flex-1 rounded-md border bg-muted px-3 py-2 text-sm font-mono truncate"
+                    />
+                    {field.copyable !== false && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        aria-label={`Copiar ${field.label}`}
+                        onClick={() => handleCopy(field)}
+                      >
+                        {copiedFieldIds.has(field.id) ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
+                      </Button>
+                    )}
+                  </div>
                 </div>
-                <p className="text-xs text-muted-foreground">Estado: Pendente de configuração</p>
-              </div>
+              ))}
 
-              <div className="space-y-1.5">
-                <Label htmlFor="hc-callback-url">Callback URL</Label>
-                <div className="flex gap-2">
-                  <input
-                    id="hc-callback-url"
-                    readOnly
-                    value={result.callbackUrl}
-                    className="flex-1 rounded-md border bg-muted px-3 py-2 text-sm font-mono truncate"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    aria-label="Copiar Callback URL"
-                    onClick={() => copyToClipboard(result.callbackUrl, 'Callback URL')}
-                  >
-                    <Copy className="h-4 w-4" />
-                  </Button>
+              {result.nextSteps && result.nextSteps.length > 0 && (
+                <div className="rounded-md border p-3 text-sm space-y-2">
+                  <p className="font-medium">Próximos passos no painel HookCloud:</p>
+                  <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
+                    {result.nextSteps.map((step, i) => (
+                      <li key={i}>{step}</li>
+                    ))}
+                  </ol>
                 </div>
-              </div>
+              )}
 
-              <div className="space-y-1.5">
-                <Label htmlFor="hc-verify-token">Verify token</Label>
-                <div className="flex gap-2">
-                  <input
-                    id="hc-verify-token"
-                    readOnly
-                    value={result.verifyToken}
-                    className="flex-1 rounded-md border bg-muted px-3 py-2 text-sm font-mono truncate"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    aria-label="Copiar Verify Token"
-                    onClick={() => copyToClipboard(result.verifyToken, 'Verify token')}
-                  >
-                    <Copy className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
-
-              <div className="rounded-md border p-3 text-sm space-y-2">
-                <p className="font-medium">Próximos passos no painel HookCloud:</p>
-                <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
-                  <li>Abra a conexão correspondente no painel HookCloud.</li>
-                  <li>Configure a Callback URL exatamente como fornecida acima.</li>
-                  <li>Informe o Verify Token exatamente como fornecido acima.</li>
-                  <li>Assine os eventos necessários de mensagens.</li>
-                  <li>Não altere o parâmetro <code>hcs</code> da URL.</li>
-                  <li>Não compartilhe estes dados por chat ou e-mail.</li>
-                  <li>Retorne ao CRM para validação posterior.</li>
-                </ol>
-                <p className="text-xs text-muted-foreground">
-                  A conexão continuará <strong>pendente</strong> até a validação posterior — o CRM não configura a
-                  HookCloud automaticamente.
-                </p>
+              <div className="flex items-start gap-2 rounded-md border p-3">
+                <Checkbox
+                  id="hc-secret-confirm-saved"
+                  checked={phase === 'secret_confirmed'}
+                  disabled={!allCopied}
+                  onCheckedChange={(checked) => setPhase(hookCloudSecretRevealPhaseOnCheckboxChange(checked === true))}
+                />
+                <Label
+                  htmlFor="hc-secret-confirm-saved"
+                  className={`text-sm font-normal leading-snug ${!allCopied ? 'text-muted-foreground' : ''}`}
+                >
+                  Confirmo que salvei a URL de callback e o verify token em local seguro. Sei que estes valores não
+                  serão exibidos novamente pelo CRM — se eu perdê-los, precisarei usar a rotação segura de
+                  credenciais.
+                  {!allCopied && ' (copie todos os valores acima para habilitar esta confirmação)'}
+                </Label>
               </div>
             </div>
-          )}
 
-          <DialogFooter>
-            <Button type="button" onClick={requestClose}>
-              Já copiei, fechar
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <AlertDialog open={confirmCloseOpen} onOpenChange={(open) => !open && cancelClose()}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Você já salvou o callback e o verify token?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Eles não poderão ser recuperados pelo CRM depois que esta janela for fechada.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel onClick={cancelClose}>Ainda não</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmClose}>Sim, já salvei</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </>
+            <DialogFooter>
+              <Button type="button" onClick={attemptClose} disabled={!canCloseHookCloudSecretRevealModal(phase)}>
+                Fechar
+              </Button>
+            </DialogFooter>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }

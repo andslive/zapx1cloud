@@ -101,7 +101,7 @@ function validPayload(overrides: Record<string, unknown> = {}) {
 function baseDeps(overrides: Partial<ProvisionHookCloudConnectionDeps> = {}): ProvisionHookCloudConnectionDeps {
   return {
     authClient: authClient(CALLER_ID),
-    adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }),
+    adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"] }),
     tokenValidator: createNoopMetaAccessTokenValidator(),
     callbackBaseUrl: CALLBACK_BASE_URL,
     isMetaCloudApiEnabledForOrg: async () => true,
@@ -144,7 +144,7 @@ Deno.test("2) usuário sem organização => 403", async () => {
   await withHookCloudPilotEnv(async () => {
     const res = await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: null, roles: ["admin"] }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: null, roles: ["super_admin"] }) }),
     );
     assertEquals(res.status, 403);
   });
@@ -157,7 +157,7 @@ Deno.test("3) organization_id enviado pelo cliente diferente do real => 403, rej
     const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     const res = await handleProvisionRequest(
       req({ ...validPayload(), organizationId: "org-de-outra-organizacao" }),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
     );
     assertEquals(res.status, 403);
     assertEquals(rpcCalls.length, 0, "cross-tenant nunca deve chegar a chamar a RPC de provisionamento");
@@ -183,7 +183,7 @@ Deno.test("4) papel insuficiente (seller) => 403", async () => {
   });
 });
 
-Deno.test("4b) manager sozinho NÃO é suficiente (mais restrito que create-team-member) => 403", async () => {
+Deno.test("4b) manager sozinho NÃO é suficiente => 403", async () => {
   await withHookCloudPilotEnv(async () => {
     const res = await handleProvisionRequest(
       req(validPayload()),
@@ -193,10 +193,56 @@ Deno.test("4b) manager sozinho NÃO é suficiente (mais restrito que create-team
   });
 });
 
-Deno.test("4c) admin é suficiente => 201", async () => {
+// FASE 21B — contrato do piloto restringe o provisionamento
+// EXCLUSIVAMENTE a super_admin. `admin` de organização (que antes era
+// suficiente, achado da Fase 21A) agora é explicitamente rejeitado —
+// mesmo padrão de resposta genérica que qualquer outro papel insuficiente
+// (403 "insufficient_role"), nunca revela que "quase" tinha permissão.
+Deno.test("4c) admin de organização (sem super_admin) NÃO é mais suficiente => 403", async () => {
   await withHookCloudPilotEnv(async () => {
-    const res = await handleProvisionRequest(req(validPayload()), baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }) }));
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }) }),
+    );
+    assertEquals(res.status, 403);
+    const body = await res.json();
+    assertEquals(body.error, "insufficient_role");
+  });
+});
+
+Deno.test("4d) usuário com admin E manager, mas sem super_admin, ainda é rejeitado (múltiplos papéis insuficientes não se somam) => 403", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin", "manager"] }) }),
+    );
+    assertEquals(res.status, 403);
+  });
+});
+
+Deno.test("4e) super_admin é suficiente (único papel autorizado no contrato do piloto) => 201", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"] }) }));
     assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("4f) super_admin junto com admin também é suficiente (um papel autorizado entre vários basta) => 201", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin", "super_admin"] }) }));
+    assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("4g) usuário sem NENHUM papel em user_roles => 403, mesma resposta genérica de papel insuficiente", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: [] }) }),
+    );
+    assertEquals(res.status, 403);
+    const body = await res.json();
+    assertEquals(body.error, "insufficient_role");
   });
 });
 
@@ -227,7 +273,7 @@ Deno.test("6) esta função sempre cria uma conexão NOVA com provider=meta_clou
     const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
     );
     assertEquals(rpcCalls.length, 1);
     assert(!("connection_id" in rpcCalls[0].args), "a RPC nunca recebe um connection_id de entrada");
@@ -243,7 +289,7 @@ Deno.test("7) Phone Number ID duplicado (RPC retorna conflito, simulando a const
       baseDeps({
         adminClient: adminClient({
           profileOrgId: ORG_ID,
-          roles: ["admin"],
+          roles: ["super_admin"],
           rpcResult: { data: null, error: { message: "hookcloud_provisioning_conflict" } },
         }),
       }),
@@ -260,7 +306,7 @@ Deno.test("7) Phone Number ID duplicado (RPC retorna conflito, simulando a const
 Deno.test("8) duas conexões com a MESMA WABA mas Phone Number ID diferente: nenhuma validação artificial de WABA-única é imposta por este endpoint (delegado à constraint real, já auditada)", async () => {
   await withHookCloudPilotEnv(async () => {
     const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
-    const client = adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls });
+    const client = adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls });
     const res1 = await handleProvisionRequest(req(validPayload({ phoneNumberId: "111", wabaId: "SAME-WABA" })), baseDeps({ adminClient: client }));
     const res2 = await handleProvisionRequest(req(validPayload({ phoneNumberId: "222", wabaId: "SAME-WABA" })), baseDeps({ adminClient: client }));
     assertEquals(res1.status, 201);
@@ -295,7 +341,7 @@ Deno.test("9c) IDs nunca são convertidos para number — string puramente numé
     const longNumericId = "123456789012345678901234567890";
     await handleProvisionRequest(
       req(validPayload({ phoneNumberId: longNumericId })),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
     );
     assertEquals(rpcCalls[0].args.p_phone_number_id, longNumericId);
     assertEquals(typeof rpcCalls[0].args.p_phone_number_id, "string");
@@ -309,7 +355,7 @@ Deno.test("10) token de acesso vazio => 400, RPC nunca chamada", async () => {
     const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     const res = await handleProvisionRequest(
       req(validPayload({ accessToken: "" })),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
     );
     assertEquals(res.status, 400);
     assertEquals(rpcCalls.length, 0);
@@ -325,7 +371,7 @@ Deno.test("11/12) falha na RPC (Vault indisponível, simulado) => 500, resposta 
       baseDeps({
         adminClient: adminClient({
           profileOrgId: ORG_ID,
-          roles: ["admin"],
+          roles: ["super_admin"],
           rpcResult: { data: null, error: { message: "hookcloud_provisioning_failed" } },
         }),
       }),
@@ -361,7 +407,7 @@ Deno.test("15) a RPC recebe SOMENTE o hash do segredo de callback, nunca o valor
     const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     const res = await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
     );
     const body = await res.json();
     const rawSecret = new URL(body.callback_url).searchParams.get("hcs")!;
@@ -392,7 +438,7 @@ Deno.test("17) este endpoint é EXCLUSIVO de criação — uma segunda tentativa
       baseDeps({
         adminClient: adminClient({
           profileOrgId: ORG_ID,
-          roles: ["admin"],
+          roles: ["super_admin"],
           rpcResult: { data: null, error: { message: "hookcloud_provisioning_conflict" } },
         }),
       }),
@@ -447,7 +493,7 @@ Deno.test("19) nenhuma chamada a console.* durante todo o fluxo (sucesso ou erro
         baseDeps({
           adminClient: adminClient({
             profileOrgId: ORG_ID,
-            roles: ["admin"],
+            roles: ["super_admin"],
             rpcResult: { data: null, error: { message: "hookcloud_provisioning_failed" } },
           }),
         }),
@@ -479,7 +525,7 @@ Deno.test("21) a RPC não recebe onboarding_source como parâmetro do cliente �
     const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
     );
     assert(!("p_onboarding_source" in rpcCalls[0].args), "onboarding_source nunca é parâmetro de entrada — é fixo na RPC");
     assert(!("p_provider" in rpcCalls[0].args), "provider nunca é parâmetro de entrada — é fixo 'meta_cloud' na RPC");
@@ -491,7 +537,7 @@ Deno.test("22) função de provisionamento é a única chamada — nome exato da
     const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
     );
     assertEquals(rpcCalls.length, 1);
     assertEquals(rpcCalls[0].fn, "provision_hookcloud_meta_connection");
@@ -596,7 +642,7 @@ Deno.test("usuário com profiles.disabled=true => 403, mesmo com JWT válido e p
   await withHookCloudPilotEnv(async () => {
     const res = await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileDisabled: true }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileDisabled: true }) }),
     );
     assertEquals(res.status, 403);
   });
@@ -606,7 +652,7 @@ Deno.test("usuário com profiles.is_active=false => 403", async () => {
   await withHookCloudPilotEnv(async () => {
     const res = await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileIsActive: false }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileIsActive: false }) }),
     );
     assertEquals(res.status, 403);
   });
@@ -670,7 +716,7 @@ Deno.test("16B.2) entrypoint de roteamento delega ao handler correto (POST váli
 
 Deno.test("16B.3) OPTIONS com origem permitida => 204, sem autenticar/consultar banco/RPC", async () => {
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
-  const deps = routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) });
+  const deps = routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) });
   const res = await routeProvisionConnectionRequest(
     rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN } }),
     deps,
@@ -694,7 +740,7 @@ Deno.test("16B.5) OPTIONS não chama banco/RPC (reforço — nenhuma chamada a a
   const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   const res = await routeProvisionConnectionRequest(
     rawReq({ method: "OPTIONS", headers: { origin: ALLOWED_ORIGIN }, body: JSON.stringify({ ignored: true }) }),
-    routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    routeDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assertEquals(res.status, 204);
   assertEquals(rpcCalls.length, 0);
@@ -743,7 +789,7 @@ Deno.test("16B.12) origem semelhante/maliciosa é rejeitada (403), antes de qual
   const spyAuth: AuthClientLike = { auth: { getUser: async () => { authCalled = true; return { data: { user: { id: CALLER_ID } } }; } } };
   const res = await routeProvisionConnectionRequest(
     validJsonReq({}, { origin: "https://admin.x1zap.com.attacker.com" }),
-    routeDeps({ authClient: spyAuth, adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    routeDeps({ authClient: spyAuth, adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
   );
   assertEquals(res.status, 403);
   assertEquals(authCalled, false, "origem rejeitada nunca deve chegar a autenticar");
@@ -1081,7 +1127,7 @@ Deno.test("usuário ativo (disabled=false, is_active=true) continua permitido", 
   await withHookCloudPilotEnv(async () => {
     const res = await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileDisabled: false, profileIsActive: true }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileDisabled: false, profileIsActive: true }) }),
     );
     assertEquals(res.status, 201);
   });
@@ -1116,7 +1162,7 @@ Deno.test("14A.3) a RPC recebe SOMENTE o hash do verify token, nunca o valor bru
     const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     const res = await handleProvisionRequest(
       req(validPayload()),
-      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], rpcCalls }) }),
     );
     const body = await res.json();
     const sentVerifyTokenHash = rpcCalls[0].args.p_hookcloud_verify_token_hash as string;
@@ -1153,7 +1199,7 @@ Deno.test("14A.6) resposta de erro NUNCA contém verify_token nem seu hash", asy
       baseDeps({
         adminClient: adminClient({
           profileOrgId: ORG_ID,
-          roles: ["admin"],
+          roles: ["super_admin"],
           rpcResult: { data: null, error: { message: "hookcloud_provisioning_failed" } },
         }),
       }),

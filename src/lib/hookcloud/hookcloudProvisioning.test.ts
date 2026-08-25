@@ -332,7 +332,7 @@ Deno.test("classifyProvisionInvokeResult: erro sem name reconhecido (defensivo) 
 Deno.test("publicErrorMessageForCode: códigos conhecidos retornam mensagem curta e específica", () => {
   assertEquals(
     publicErrorMessageForCode(403, "insufficient_role"),
-    "Apenas administradores podem provisionar conexões HookCloud.",
+    "Apenas Super Admin pode provisionar conexões HookCloud.",
   );
   assertEquals(
     publicErrorMessageForCode(409, "phone_number_id_or_waba_conflict"),

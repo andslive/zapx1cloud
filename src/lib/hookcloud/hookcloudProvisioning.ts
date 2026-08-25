@@ -298,7 +298,7 @@ export function publicErrorMessageForCode(status: number, code: string): string 
     case 'user_disabled':
       return 'Sua conta não tem permissão para provisionar conexões HookCloud.';
     case 'insufficient_role':
-      return 'Apenas administradores podem provisionar conexões HookCloud.';
+      return 'Apenas Super Admin pode provisionar conexões HookCloud.';
     case 'organization_mismatch':
       return 'Não foi possível confirmar sua organização. Atualize a página e tente novamente.';
     case 'hookcloud_disabled':

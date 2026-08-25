@@ -1,4 +1,4 @@
-// FASE 18G — Alternativa B (recuperação segura), explicitamente
+// FASE 18G/21B — Alternativa B (recuperação segura), explicitamente
 // preferida no relatório: o bloqueio de navegação SPA para `navigate()`
 // programático não é alcançável sem migrar o roteador
 // (`createBrowserRouter`/`RouterProvider`, indisponível hoje —
@@ -11,19 +11,28 @@
 // gerar um par novo — o anterior é invalidado atomicamente pela RPC do
 // backend, a conexão volta para `pending`.
 //
-// Mesmo rigor de segurança de `HookCloudOnboardingConfig.tsx`/
-// `HookCloudSecretRevealModal.tsx`:
+// FASE 21B — a exibição do segredo rotacionado agora reutiliza o MESMO
+// componente protegido do provisionamento (`HookCloudSecretRevealModal`),
+// em vez de duplicar a UI inline com uma proteção mais fraca (era um
+// AlertDialog Sim/Não; o componente compartilhado exige uma caixa de
+// confirmação explícita antes de habilitar o fechamento — ver Parte 5 do
+// gate de prontidão: "se o caminho já existir, reaproveite-o; não crie
+// segundo mecanismo concorrente").
+//
+// Mesmo rigor de segurança de `HookCloudOnboardingConfig.tsx`:
 //   - nunca usa `useMutation` (token/segredo nunca em cache do React
 //     Query) — chamada `async` local simples;
 //   - nunca envia `organizationId` (backend deriva do perfil);
 //   - segredo só existe no estado efêmero deste componente, apagado
-//     depois da confirmação explícita ou fechamento autorizado;
-//   - fechar o modal de segredo exige confirmação explícita
-//     (AlertDialog), igual ao fluxo de provisionamento;
+//     depois da confirmação explícita;
 //   - bloqueia navegação interna (`<Link>`/`<a>`) e back/forward do
 //     navegador enquanto o segredo não foi confirmado como salvo, e
 //     `beforeunload` cobre reload/fechamento de aba — mesmos hooks já
-//     testados usados por `IntegrationsManager.tsx`.
+//     testados usados por `IntegrationsManager.tsx`;
+//   - visível e utilizável SOMENTE por super_admin (mesmo contrato
+//     exclusivo do backend, `REQUIRED_ROLES` em
+//     `hookcloud-rotate-credentials/index.ts`) — esconder o botão aqui
+//     não substitui a checagem do backend, é defesa complementar.
 
 import { useState } from 'react';
 import {
@@ -34,21 +43,11 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
-import {
-  AlertDialog,
-  AlertDialogContent,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogCancel,
-  AlertDialogAction,
-} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Copy, RefreshCw, ShieldAlert, AlertTriangle, Loader2, CheckCircle2 } from 'lucide-react';
+import { RefreshCw, ShieldAlert, AlertTriangle, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { supabase } from '@/integrations/supabase/client';
 import { useQueryClient } from '@tanstack/react-query';
@@ -65,30 +64,38 @@ import {
 import { getHookCloudCallbackExpectedOrigin } from '@/lib/hookcloud/hookcloudRuntimeConfig';
 import type { HookCloudSensitiveLifecycle } from '@/lib/hookcloud/hookcloudProvisioning';
 import { hookCloudLifecycleBlockMessage } from '@/lib/hookcloud/hookcloudProvisioning';
-
-async function copyToClipboard(value: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(value);
-    toast.success(`${label} copiado!`);
-  } catch {
-    toast.error('Não foi possível copiar. Copie manualmente.');
-  }
-}
+import { HookCloudSecretRevealModal, type HookCloudSecretRevealModalContent } from './HookCloudSecretRevealModal';
 
 interface HookCloudRotateCredentialsModalProps {
   connectionId: string;
 }
 
+// Função pura de módulo — monta o conteúdo do modal compartilhado a
+// partir do resultado de sucesso da rotação. Só inclui os campos que
+// foram de fato rotacionados nesta chamada (o outro fica `null` no
+// resultado, e nunca aparece aqui).
+function buildRotateRevealContent(result: HookCloudRotateSuccess): HookCloudSecretRevealModalContent {
+  const fields: HookCloudSecretRevealModalContent['fields'] = [];
+  if (result.callbackUrl) fields.push({ id: 'hc-rotate-callback-url', label: 'Callback URL', value: result.callbackUrl });
+  if (result.verifyToken) fields.push({ id: 'hc-rotate-verify-token', label: 'Verify token', value: result.verifyToken });
+  return {
+    title: 'Credenciais rotacionadas',
+    description: 'Copie agora. Estes valores não serão exibidos novamente pelo CRM.',
+    warning:
+      'O(s) valor(es) anterior(es) já foi(foram) invalidado(s). A conexão está pendente até você configurar estes novos valores no painel HookCloud.',
+    fields,
+  };
+}
+
 export function HookCloudRotateCredentialsModal({ connectionId }: HookCloudRotateCredentialsModalProps) {
   const queryClient = useQueryClient();
-  const { profile } = useAuth();
+  const { profile, isSuperAdmin } = useAuth();
   const [formOpen, setFormOpen] = useState(false);
   const [rotateCallback, setRotateCallback] = useState(true);
   const [rotateVerify, setRotateVerify] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [result, setResult] = useState<HookCloudRotateSuccess | null>(null);
-  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false);
 
   const lifecycle: HookCloudSensitiveLifecycle = isSubmitting ? 'submitting' : result ? 'secret_unacknowledged' : 'idle';
   const isSensitive = lifecycle !== 'idle';
@@ -150,12 +157,16 @@ export function HookCloudRotateCredentialsModal({ connectionId }: HookCloudRotat
     }
   };
 
-  const requestCloseResult = () => setConfirmCloseOpen(true);
-  const confirmCloseResult = () => {
-    setConfirmCloseOpen(false);
-    setResult(null);
-  };
-  const cancelCloseResult = () => setConfirmCloseOpen(false);
+  // FASE 21B — mesma restrição do backend (`hookcloud-rotate-credentials`,
+  // REQUIRED_ROLES exclusivo de super_admin): esconder este botão para
+  // quem não é super_admin NÃO é a proteção real (o backend já rejeita
+  // de forma independente), mas evita oferecer uma ação que sempre
+  // resultaria em 403 e evita expor a existência do fluxo de rotação a
+  // um papel que nunca deveria vê-lo. Hooks acima continuam sendo
+  // chamados incondicionalmente (regra de hooks do React) — para
+  // qualquer usuário sem acesso, `formOpen`/`result` nunca saem de seus
+  // valores iniciais, então esses hooks permanecem inertes.
+  if (!isSuperAdmin()) return null;
 
   return (
     <>
@@ -214,78 +225,10 @@ export function HookCloudRotateCredentialsModal({ connectionId }: HookCloudRotat
         </DialogContent>
       </Dialog>
 
-      <Dialog open={!!result} onOpenChange={(open) => { if (!open) requestCloseResult(); }}>
-        <DialogContent
-          className="sm:max-w-lg"
-          onEscapeKeyDown={(e) => { e.preventDefault(); requestCloseResult(); }}
-          onPointerDownOutside={(e) => { e.preventDefault(); requestCloseResult(); }}
-        >
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <CheckCircle2 className="h-5 w-5 text-green-600" />
-              Credenciais rotacionadas
-            </DialogTitle>
-            <DialogDescription>
-              Copie agora. Estes valores não serão exibidos novamente pelo CRM.
-            </DialogDescription>
-          </DialogHeader>
-
-          {result && (
-            <div className="space-y-4">
-              <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm flex gap-2">
-                <ShieldAlert className="h-4 w-4 shrink-0 text-amber-600 mt-0.5" />
-                <p>
-                  O(s) valor(es) anterior(es) já foi(foram) invalidado(s). A conexão está pendente até você
-                  configurar estes novos valores no painel HookCloud.
-                </p>
-              </div>
-
-              {result.callbackUrl && (
-                <div className="space-y-1.5">
-                  <Label htmlFor="hc-rotate-callback-url">Callback URL</Label>
-                  <div className="flex gap-2">
-                    <input id="hc-rotate-callback-url" readOnly value={result.callbackUrl} className="flex-1 rounded-md border bg-muted px-3 py-2 text-sm font-mono truncate" />
-                    <Button type="button" variant="outline" size="icon" aria-label="Copiar Callback URL" onClick={() => copyToClipboard(result.callbackUrl!, 'Callback URL')}>
-                      <Copy className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-              )}
-
-              {result.verifyToken && (
-                <div className="space-y-1.5">
-                  <Label htmlFor="hc-rotate-verify-token">Verify token</Label>
-                  <div className="flex gap-2">
-                    <input id="hc-rotate-verify-token" readOnly value={result.verifyToken} className="flex-1 rounded-md border bg-muted px-3 py-2 text-sm font-mono truncate" />
-                    <Button type="button" variant="outline" size="icon" aria-label="Copiar Verify Token" onClick={() => copyToClipboard(result.verifyToken!, 'Verify token')}>
-                      <Copy className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          <DialogFooter>
-            <Button type="button" onClick={requestCloseResult}>Já copiei, fechar</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <AlertDialog open={confirmCloseOpen} onOpenChange={(open) => !open && cancelCloseResult()}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Você já salvou os novos valores?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Eles não poderão ser recuperados pelo CRM depois que esta janela for fechada.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel onClick={cancelCloseResult}>Ainda não</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmCloseResult}>Sim, já salvei</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <HookCloudSecretRevealModal
+        result={result ? buildRotateRevealContent(result) : null}
+        onClose={() => setResult(null)}
+      />
     </>
   );
 }

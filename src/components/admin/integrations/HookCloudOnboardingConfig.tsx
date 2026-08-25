@@ -57,7 +57,35 @@ import {
 } from '@/lib/hookcloud/hookcloudProvisioning';
 import { getHookCloudCallbackExpectedOrigin } from '@/lib/hookcloud/hookcloudRuntimeConfig';
 import { useBlockPageUnloadWhileSensitive } from '@/hooks/useBlockPageUnloadWhileSensitive';
-import { HookCloudSecretRevealModal } from './HookCloudSecretRevealModal';
+import { HookCloudSecretRevealModal, type HookCloudSecretRevealModalContent } from './HookCloudSecretRevealModal';
+
+// FASE 21B — monta o conteúdo do modal compartilhado
+// (`HookCloudSecretRevealModal`) a partir do resultado de sucesso do
+// provisionamento. Função pura de módulo, fora do componente — nenhuma
+// dependência de estado do React, só transforma dados já validados em
+// forma de exibição.
+function buildProvisionRevealContent(result: HookCloudProvisionSuccess): HookCloudSecretRevealModalContent {
+  return {
+    title: 'Conexão criada como pendente',
+    description: 'Copie agora. O verify token não será exibido novamente pelo CRM.',
+    warning:
+      'Estes valores só aparecem uma única vez. Se você fechar esta janela sem copiá-los, será necessário rotacionar as credenciais numa fase futura.',
+    fields: [
+      { id: 'hc-connection-id', label: 'ID da conexão', value: result.connectionId, copyable: false },
+      { id: 'hc-callback-url', label: 'Callback URL', value: result.callbackUrl },
+      { id: 'hc-verify-token', label: 'Verify token', value: result.verifyToken },
+    ],
+    nextSteps: [
+      'Abra a conexão correspondente no painel HookCloud.',
+      'Configure a Callback URL exatamente como fornecida acima.',
+      'Informe o Verify Token exatamente como fornecido acima.',
+      'Assine os eventos necessários de mensagens.',
+      'Não altere o parâmetro hcs da URL.',
+      'Não compartilhe estes dados por chat ou e-mail.',
+      'Retorne ao CRM para validação posterior.',
+    ],
+  };
+}
 
 const EMPTY_VALUES: HookCloudOnboardingFormValues = {
   connectionName: '',
@@ -429,7 +457,7 @@ export function HookCloudOnboardingConfig({ onSensitiveLifecycleChange }: HookCl
       </Card>
 
       <HookCloudSecretRevealModal
-        result={successResult}
+        result={successResult ? buildProvisionRevealContent(successResult) : null}
         onClose={() => setSuccessResult(null)}
       />
     </div>
