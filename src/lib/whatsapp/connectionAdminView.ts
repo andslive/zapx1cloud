@@ -26,7 +26,12 @@
 import { isUazapiProvider, type ConnectionProviderFields } from "./connectionProviderView.ts";
 
 export type TechnicalStatus = "online" | "connecting" | "offline" | "unknown";
-export type DisplayStatus = "Online" | "Conectando" | "Offline" | "Desconhecido";
+export type DisplayStatus =
+  | "Online"
+  | "Conectando"
+  | "Offline"
+  | "Offline — sem resposta atual"
+  | "Desconhecido";
 
 export interface AdminConnectionRaw extends ConnectionProviderFields {
   id?: string | null;
@@ -53,10 +58,22 @@ export interface AdminConnectionViewModel {
   supportsReconnect: boolean;
   supportsDelete: boolean;
   chromiumAuxStatus: TechnicalStatus;
+  /**
+   * true SOMENTE quando o heartbeat persistido da UazAPI é literalmente
+   * "UNKNOWN" (ping não confirmou conexão nem desconexão). Contada como
+   * "offline" no agregado operacional (`technicalStatus`/`countAdminConnections`)
+   * porque a conexão não está confirmadamente ativa, mas o badge/detalhe
+   * individual NUNCA deve afirmar que o ping confirmou desconexão — só que
+   * não há confirmação atual. Vem sempre de `last_real_whatsapp_state`
+   * persistido, nunca de nome/ID/posição de linha.
+   */
+  isUnconfirmedOffline: boolean;
 }
 
 const CONNECTING_UAZ_STATUSES = new Set(["qr_pending"]);
 const CONNECTING_WA_STATES = new Set(["PAIRING", "OPENING"]);
+/** Heartbeat persistido que NÃO confirma nem conexão nem desconexão. */
+const UNCONFIRMED_WA_STATES = new Set(["UNKNOWN"]);
 
 /** Estado do canal Chromium/VPS auxiliar — nunca usado para decidir o status geral de uma conexão UazAPI. */
 export function classifyChromiumAuxStatus(chrom: ChromiumAuxRaw | null | undefined): TechnicalStatus {
@@ -98,6 +115,7 @@ export function classifyAdminConnection(
       supportsReconnect: false,
       supportsDelete: false,
       chromiumAuxStatus,
+      isUnconfirmedOffline: false,
     };
   }
 
@@ -105,6 +123,7 @@ export function classifyAdminConnection(
   let technicalStatus: TechnicalStatus;
   let displayStatus: DisplayStatus;
   let statusReason: string;
+  let isUnconfirmedOffline = false;
 
   if (waState === "CONNECTED") {
     technicalStatus = "online";
@@ -114,6 +133,16 @@ export function classifyAdminConnection(
     technicalStatus = "connecting";
     displayStatus = "Conectando";
     statusReason = "UazAPI em processo de conexão/pareamento.";
+  } else if (waState && UNCONFIRMED_WA_STATES.has(waState)) {
+    // Heartbeat persistido é "UNKNOWN": o ping não confirmou conexão nem
+    // desconexão. Tratada como não-ativa no agregado (nunca "Online"), mas
+    // o texto não pode afirmar que houve confirmação de desconexão — só
+    // que não há confirmação atual, o que é tecnicamente diferente de um
+    // "DISCONNECTED" confirmado.
+    technicalStatus = "offline";
+    displayStatus = "Offline — sem resposta atual";
+    statusReason = 'Heartbeat UazAPI não confirmou conexão nem desconexão (estado "UNKNOWN"). Não é um reparo pendente conhecido — apenas sem confirmação recente.';
+    isUnconfirmedOffline = true;
   } else if (waState) {
     technicalStatus = "offline";
     displayStatus = "Offline";
@@ -136,6 +165,7 @@ export function classifyAdminConnection(
     supportsReconnect: true,
     supportsDelete: true,
     chromiumAuxStatus,
+    isUnconfirmedOffline,
   };
 }
 
