@@ -28,7 +28,12 @@
 //     as três formas de fechar são bloqueadas e mostram um aviso, nunca
 //     fecham silenciosamente;
 //   - a confirmação é SEMPRE explícita: marcar a caixa "Confirmo que
-//     salvei..." — copiar um campo NUNCA marca a caixa automaticamente;
+//     salvei..." — copiar um campo NUNCA marca a caixa automaticamente
+//     (Fase 21C, achado da revisão independente do PR #29: a caixa em si
+//     agora só fica HABILITADA depois que todos os campos copiáveis
+//     foram copiados pelo menos uma vez — clicar em "Copiar" não confirma
+//     sozinho, mas confirmar sem nunca ter copiado deixou de ser
+//     possível);
 //   - reabrir com um novo resultado (nova chamada de sucesso) sempre
 //     volta a `secret_visible_unconfirmed`, mesmo que o componente já
 //     estivesse montado — nunca herda a confirmação de uma exibição
@@ -57,6 +62,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Copy, ShieldAlert, CheckCircle2 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
+  areAllRequiredFieldsCopied,
   canCloseHookCloudSecretRevealModal,
   hookCloudSecretRevealPhaseOnCheckboxChange,
   initialHookCloudSecretRevealPhase,
@@ -86,13 +92,15 @@ interface HookCloudSecretRevealModalProps {
   onClose: () => void;
 }
 
-async function copyToClipboard(value: string, label: string) {
+async function copyToClipboard(value: string, label: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(value);
     // Nunca inclui o valor copiado na mensagem — só a confirmação.
     toast.success(`${label} copiado!`);
+    return true;
   } catch {
     toast.error('Não foi possível copiar. Copie manualmente.');
+    return false;
   }
 }
 
@@ -100,14 +108,36 @@ const BLOCKED_CLOSE_WARNING = 'Marque a confirmação de que salvou os valores a
 
 export function HookCloudSecretRevealModal({ result, onClose }: HookCloudSecretRevealModalProps) {
   const [phase, setPhase] = useState(initialHookCloudSecretRevealPhase());
+  // FASE 21C — quais campos copiáveis já foram copiados com sucesso PELO
+  // MENOS uma vez nesta exibição. A caixa de confirmação só habilita
+  // depois que todos foram copiados — clicar "Copiar" não confirma
+  // automaticamente (a checkbox continua exigindo um clique à parte),
+  // mas confirmar sem nunca ter copiado deixa de ser possível.
+  const [copiedFieldIds, setCopiedFieldIds] = useState<ReadonlySet<string>>(new Set());
 
   // Cada NOVO resultado (identidade de objeto muda a cada chamada de
   // sucesso — provisionamento e rotação sempre criam um objeto novo,
   // nunca reaproveitam o anterior) reabre em `secret_visible_unconfirmed`,
-  // mesmo que o componente já estivesse montado de uma exibição anterior.
+  // com nenhum campo marcado como copiado, mesmo que o componente já
+  // estivesse montado de uma exibição anterior.
   useEffect(() => {
-    if (result) setPhase(initialHookCloudSecretRevealPhase());
+    if (result) {
+      setPhase(initialHookCloudSecretRevealPhase());
+      setCopiedFieldIds(new Set());
+    }
   }, [result]);
+
+  const requiredFieldIds = (result?.fields ?? [])
+    .filter((field) => field.copyable !== false)
+    .map((field) => field.id);
+  const allCopied = areAllRequiredFieldsCopied(requiredFieldIds, copiedFieldIds);
+
+  const handleCopy = async (field: HookCloudSecretRevealField) => {
+    const copied = await copyToClipboard(field.value, field.label);
+    if (copied) {
+      setCopiedFieldIds((prev) => new Set(prev).add(field.id));
+    }
+  };
 
   const attemptClose = () => {
     if (!canCloseHookCloudSecretRevealModal(phase)) {
@@ -170,9 +200,9 @@ export function HookCloudSecretRevealModal({ result, onClose }: HookCloudSecretR
                         variant="outline"
                         size="icon"
                         aria-label={`Copiar ${field.label}`}
-                        onClick={() => copyToClipboard(field.value, field.label)}
+                        onClick={() => handleCopy(field)}
                       >
-                        <Copy className="h-4 w-4" />
+                        {copiedFieldIds.has(field.id) ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4" />}
                       </Button>
                     )}
                   </div>
@@ -194,12 +224,17 @@ export function HookCloudSecretRevealModal({ result, onClose }: HookCloudSecretR
                 <Checkbox
                   id="hc-secret-confirm-saved"
                   checked={phase === 'secret_confirmed'}
+                  disabled={!allCopied}
                   onCheckedChange={(checked) => setPhase(hookCloudSecretRevealPhaseOnCheckboxChange(checked === true))}
                 />
-                <Label htmlFor="hc-secret-confirm-saved" className="text-sm font-normal leading-snug">
+                <Label
+                  htmlFor="hc-secret-confirm-saved"
+                  className={`text-sm font-normal leading-snug ${!allCopied ? 'text-muted-foreground' : ''}`}
+                >
                   Confirmo que salvei a URL de callback e o verify token em local seguro. Sei que estes valores não
                   serão exibidos novamente pelo CRM — se eu perdê-los, precisarei usar a rotação segura de
                   credenciais.
+                  {!allCopied && ' (copie todos os valores acima para habilitar esta confirmação)'}
                 </Label>
               </div>
             </div>

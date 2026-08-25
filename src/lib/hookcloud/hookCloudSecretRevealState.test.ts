@@ -8,6 +8,7 @@
 
 import { assertEquals } from "https://deno.land/std@0.208.0/assert/mod.ts";
 import {
+  areAllRequiredFieldsCopied,
   canCloseHookCloudSecretRevealModal,
   hookCloudSecretRevealPhaseOnCheckboxChange,
   initialHookCloudSecretRevealPhase,
@@ -38,4 +39,32 @@ Deno.test("desmarcar depois de confirmar bloqueia o fechamento de novo (não é 
   assertEquals(canCloseHookCloudSecretRevealModal(afterCheck), true);
   const afterUncheck = hookCloudSecretRevealPhaseOnCheckboxChange(false);
   assertEquals(canCloseHookCloudSecretRevealModal(afterUncheck), false);
+});
+
+// FASE 21C (achado da revisão independente do PR #29) — a checkbox de
+// confirmação não exigia ter copiado nada antes de ficar disponível.
+
+Deno.test("nenhum campo copiado => checkbox não pode ser habilitada", () => {
+  assertEquals(areAllRequiredFieldsCopied(["callback", "verify"], new Set()), false);
+});
+
+Deno.test("só um dos dois campos copiado => ainda não habilita", () => {
+  assertEquals(areAllRequiredFieldsCopied(["callback", "verify"], new Set(["callback"])), false);
+});
+
+Deno.test("ambos os campos copiados => habilita", () => {
+  assertEquals(areAllRequiredFieldsCopied(["callback", "verify"], new Set(["callback", "verify"])), true);
+});
+
+Deno.test("copiar um campo extra que não é exigido não afeta o resultado", () => {
+  assertEquals(areAllRequiredFieldsCopied(["callback", "verify"], new Set(["callback", "verify", "algo-nao-exigido"])), true);
+});
+
+Deno.test("lista de campos exigidos vazia (ex.: só campo informativo não-copiável) => vacuamente satisfeita", () => {
+  assertEquals(areAllRequiredFieldsCopied([], new Set()), true);
+});
+
+Deno.test("um único campo exigido (ex.: rotação de só um dos dois segredos) segue a mesma regra", () => {
+  assertEquals(areAllRequiredFieldsCopied(["verify"], new Set()), false);
+  assertEquals(areAllRequiredFieldsCopied(["verify"], new Set(["verify"])), true);
 });

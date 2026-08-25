@@ -30,3 +30,17 @@ export function hookCloudSecretRevealPhaseOnCheckboxChange(checked: boolean): Ho
 export function canCloseHookCloudSecretRevealModal(phase: HookCloudSecretRevealPhase): boolean {
   return phase === 'secret_confirmed';
 }
+
+// FASE 21C (achado da revisão independente do PR #29) — a caixa de
+// confirmação era clicável mesmo que o usuário nunca tivesse clicado em
+// nenhum botão "Copiar": nada impedia marcar "Confirmo que salvei" sem
+// ter salvo nada de fato. `requiredFieldIds` são os campos copiáveis
+// exibidos (`field.copyable !== false`); a caixa só fica habilitada
+// depois que TODOS eles foram copiados com sucesso pelo menos uma vez —
+// nunca antes.
+export function areAllRequiredFieldsCopied(
+  requiredFieldIds: readonly string[],
+  copiedFieldIds: ReadonlySet<string>,
+): boolean {
+  return requiredFieldIds.every((id) => copiedFieldIds.has(id));
+}
