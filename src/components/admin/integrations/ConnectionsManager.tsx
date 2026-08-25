@@ -10,15 +10,15 @@ import {
   fetchInstanceQr,
 } from '@/hooks/useConnections';
 import { Checkbox } from '@/components/ui/checkbox';
-import { 
-  useWhatsAppInstances, 
+import {
+  useWhatsAppInstances,
   useSyncWhatsAppInstances,
   useCreateWhatsAppInstanceSelf,
   useConnectWhatsAppInstance,
-  useRenameWhatsAppInstanceSelf,
   useDeleteWhatsAppInstanceSelf,
   useUpdateWhatsAppInstanceOffer,
   useSetConnectionDefaultFunnel,
+  useOfficialApiConnections,
   WhatsAppInstance
 } from '@/hooks/useWhatsAppInstances';
 import { useFunnels } from '@/hooks/useFunnels';
@@ -41,7 +41,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Plus, RefreshCw, MoreVertical, QrCode, Trash2, Info, Loader2, Sparkles, Square, Play, AlertTriangle, User, Search, ArrowUp, ArrowDown, Filter, Pencil, Beaker, Ghost } from 'lucide-react';
+import { Plus, RefreshCw, MoreVertical, QrCode, Trash2, Info, Loader2, Square, Play, AlertTriangle, User, Search, ArrowUp, ArrowDown, Filter, Pencil, Ghost } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useAuth } from '@/hooks/useAuth';
 import { useOrganizationEffectivePlan } from '@/hooks/useOrganizationPlan';
@@ -50,10 +50,15 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { QRCodeCanvas } from 'qrcode.react';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { AdminStatusNotificationConfig } from './AdminStatusNotificationConfig';
-import { SimulateOutageModal } from './SimulateOutageModal';
 import { supabase } from '@/integrations/supabase/client';
 import type { Funnel } from '@/types/funnel';
 import { classifyConnectionForDisplay } from '@/lib/whatsapp/connectionProviderView';
+import { classifyAdminConnection } from '@/lib/whatsapp/connectionAdminView';
+import {
+  classifyThreeChannelConnection,
+  countThreeChannelConnections,
+  type ThreeChannelConnectionViewModel,
+} from '@/lib/whatsapp/connectionAdminView';
 
 
 
@@ -329,9 +334,15 @@ export default function ConnectionsManager() {
 
   // UazAPI hooks
   const { data: uazInstances, isLoading: isLoadingUaz, refetch: refetchUaz } = useWhatsAppInstances();
+  // FASE 20D — API Oficial buscada separadamente via `instances-api`
+  // (nunca embutida na query direta de `evolution_instances` — ver
+  // comentário em `useWhatsAppInstances.ts`). `officialApiUnavailable` só é
+  // `true` quando a busca falhou de verdade E os retries automáticos do
+  // React Query se esgotaram (nunca numa falha transitória isolada) —
+  // usado abaixo para nunca converter uma falha em "Não configurada".
+  const { byInstanceId: officialApiByInstanceIdRaw, unavailable: officialApiUnavailableGlobal, isLoading: isLoadingOfficialApi } = useOfficialApiConnections();
   const syncUazMut = useSyncWhatsAppInstances();
   const createUazMut = useCreateWhatsAppInstanceSelf();
-  const renameUazMut = useRenameWhatsAppInstanceSelf();
   const deleteUazMut = useDeleteWhatsAppInstanceSelf();
   const updateOfferMut = useUpdateWhatsAppInstanceOffer();
   const { data: allFunnels, isLoading: isLoadingFunnels } = useFunnels();
@@ -348,11 +359,8 @@ export default function ConnectionsManager() {
 
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isQrModalOpen, setIsQrModalOpen] = useState(false);
-  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isOfferModalOpen, setIsOfferModalOpen] = useState(false);
-  const [isSimulateModalOpen, setIsSimulateModalOpen] = useState(false);
   const [connectingUaz, setConnectingUaz] = useState<WhatsAppInstance | null>(null);
-  const [editingUaz, setEditingUaz] = useState<WhatsAppInstance | null>(null);
   const [editingOfferUaz, setEditingOfferUaz] = useState<WhatsAppInstance | null>(null);
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [selectedChromiumId, setSelectedChromiumId] = useState<string | null>(null);
@@ -362,7 +370,6 @@ export default function ConnectionsManager() {
   const [newOffer, setNewOffer] = useState('');
   const [newCreateUaz, setNewCreateUaz] = useState(true);
   const [newCreateChromium, setNewCreateChromium] = useState(true);
-  const [editName, setEditName] = useState('');
   const [editOffer, setEditOffer] = useState('');
 
   // Filtering & Sorting states
@@ -371,6 +378,10 @@ export default function ConnectionsManager() {
   const [filterStatus, setFilterStatus] = useState('all');
   const [filterApi, setFilterApi] = useState('all');
   const [filterSession, setFilterSession] = useState('all');
+  // FASE 20C — filtro independente do terceiro canal (API Oficial). Nunca
+  // combinado com os outros dois num único eixo: uma linha pode passar no
+  // filtro UazAPI e falhar no filtro API Oficial e vice-versa.
+  const [filterOfficial, setFilterOfficial] = useState('all');
   
   const [sortConfig, setSortConfig] = useState<{ key: string; direction: 'asc' | 'desc' | null }>({
     key: '',
@@ -387,8 +398,8 @@ export default function ConnectionsManager() {
   }, [searchParams, isCreateModalOpen, setSearchParams]);
 
   useEffect(() => {
-    console.log('Modals state:', { isCreateModalOpen, isEditModalOpen, isQrModalOpen });
-  }, [isCreateModalOpen, isEditModalOpen, isQrModalOpen]);
+    console.log('Modals state:', { isCreateModalOpen, isQrModalOpen });
+  }, [isCreateModalOpen, isQrModalOpen]);
 
   // Polling da Sessão Web enquanto o modal de QR está aberto
   useEffect(() => {
@@ -424,22 +435,67 @@ export default function ConnectionsManager() {
     return phone.replace(/\D/g, '');
   };
 
-  const mergedConnections = useMemo(() => {
+  // Movido para antes de `mergedConnections`/filtros (FASE 20A): o filtro
+  // de "Sessão Web" agora reutiliza esta mesma função em vez de duplicar a
+  // regra inline — precisa estar declarada antes do useMemo que a usa.
+  const isChromiumConnected = (chrom: any) => {
+    if (!chrom) return false;
+    if (chrom.connected === true) return true;
+    const s = String(chrom.chromium_status || chrom.chromiumStatus || chrom.status || '').toLowerCase();
+    return s === 'online' || s === 'authenticated' || s === 'ready';
+  };
+
+  // FASE 20C — array CANÔNICO e NÃO FILTRADO (sem busca/filtros de UI
+  // aplicados). Contadores do topo e view models de 3 canais SEMPRE derivam
+  // deste array, nunca do array já filtrado para exibição — caso contrário
+  // os contadores mudariam conforme o usuário digitasse na busca ou
+  // trocasse um filtro (bug apontado na revisão desta fase). O array
+  // filtrado para a TABELA (`mergedConnections`, abaixo) é sempre um
+  // subconjunto deste.
+  const allMergedConnections = useMemo(() => {
     // FASE 18C — esta tela mescla sessões Chromium (VPS) com conexões
-    // UazAPI; não foi projetada para conexões Meta/HookCloud (que não têm
-    // QR Code Chromium, não têm `instance_token` UazAPI, e as ações desta
-    // tabela chamam `whatsapp-proxy` por `id` sem checar provider). Uma
-    // conexão HookCloud pendente é excluída aqui na origem, antes de
-    // qualquer merge/ação — nunca aparece nesta tela, em vez de aparecer
-    // e receber uma ação UazAPI. Continua visível/gerenciável só no
-    // painel de Integrações → HookCloud (`WhatsAppInstancesPanel.tsx`).
-    const uaz = (uazInstances || []).filter((u) => classifyConnectionForDisplay(u, u.meta_cloud_config) === 'uazapi');
+    // UazAPI; não foi projetada para conexões Meta/HookCloud standalone (sem
+    // UazAPI correspondente — não têm QR Code Chromium, não têm
+    // `instance_token` UazAPI, e as ações desta tabela chamam
+    // `whatsapp-proxy` por `id` sem checar provider). Uma linha Meta/HookCloud
+    // SEM UazAPI continua excluída aqui na origem — decisão de escopo
+    // preservada da Fase 18C (nenhuma ação UazAPI pode vazar para uma linha
+    // que não tem canal UazAPI); hoje isso não esconde nenhum dado real (0
+    // linhas `provider='meta_cloud'` em produção). O que MUDA nesta fase:
+    // uma linha UazAPI que TEM uma API Oficial em coexistência
+    // (`meta_cloud_config` embutido na própria linha via FK
+    // `evolution_instances_meta_cloud.evolution_instance_id`) agora carrega
+    // esse dado adiante em vez de descartá-lo — é isso que alimenta a nova
+    // coluna "API Oficial".
+    //
+    // LIMITAÇÃO DE ESCOPO DOCUMENTADA (revisão desta fase, Codex): o
+    // compositor `classifyThreeChannelConnection` (`connectionAdminView.ts`)
+    // já sabe classificar uma linha `provider='meta_cloud'` standalone (sem
+    // UazAPI) como "Somente API Oficial" — testado isoladamente — mas essa
+    // linha nunca chega até aqui, porque o menu de Ações desta tabela
+    // (`QR UazAPI`, `Conectar/Reiniciar/Excluir Sessão Web`, `Excluir`) não
+    // foi auditado/reforçado nesta fase para lidar com `conn.uaz === null &&
+    // conn.chromium === null` sem risco de erro em runtime (ex.:
+    // `setConnectingUaz(null)` abrindo o modal de QR sem instância). Como
+    // hoje existem 0 linhas `provider='meta_cloud'` reais em produção, isso
+    // não esconde nenhum dado real agora — é uma decisão deliberada de não
+    // arriscar uma regressão de UI por um caminho ainda não exercitado, não
+    // um esquecimento. Reforçar o menu de Ações para esse caso é o trabalho
+    // recomendado para destravar isso numa fase futura dedicada.
+    // FASE 20D — `meta_cloud_config` não vem mais embutido em `u` (removido
+    // de `useWhatsAppInstances` por falta de GRANT SELECT na tabela
+    // satélite); `classifyConnectionForDisplay` só usa `provider` para essa
+    // decisão (nunca `meta_cloud_config`), então passar `undefined` aqui é
+    // seguro e não muda esse comportamento.
+    const uaz = (uazInstances || []).filter((u) => classifyConnectionForDisplay(u, undefined) === 'uazapi');
     const chrom = chromiumInstances || [];
+    const officialApiByInstanceId = officialApiByInstanceIdRaw;
+    const officialApiFetchOk = !officialApiUnavailableGlobal;
 
     console.log('[AUDIT] UAZAPI CONNECTIONS', { count: uaz.length, items: uaz });
     console.log('[AUDIT] MANAGER CONNECTIONS', { count: chrom.length, items: chrom });
 
-    let results: any[] = [];
+    const results: any[] = [];
     const processedChromiumIds = new Set<string>();
 
 
@@ -465,6 +521,14 @@ export default function ConnectionsManager() {
         name: u.custom_name || u.name,
         uaz: u,
         chromium: matchingChrom || null,
+        // FASE 20D — registro satélite da API Oficial buscado via
+        // `instances-api?action=officialApi` (nunca embutido diretamente na
+        // query de `evolution_instances` — ver `useWhatsAppInstances.ts`),
+        // mesclado aqui por `evolution_instance_id` (chave da FK composta
+        // `evolution_instances_meta_cloud.evolution_instance_id ->
+        // evolution_instances.id`, que também inclui `organization_id`).
+        officialApi: officialApiByInstanceId.get(u.id) || null,
+        officialApiUnavailable: !officialApiFetchOk,
         type: 'uaz-first',
         isOrphan: false,
         offer_name: u.offer_name || '---',
@@ -482,6 +546,8 @@ export default function ConnectionsManager() {
           name: c.name,
           uaz: null,
           chromium: c,
+          officialApi: null,
+          officialApiUnavailable: !officialApiFetchOk,
           type: 'chromium-only',
           isOrphan: true,
           offer_name: '---',
@@ -493,10 +559,46 @@ export default function ConnectionsManager() {
       }
     });
 
+    console.log('[AUDIT] FINAL TABLE (unfiltered)', { count: results.length, items: results });
+    return results;
+  }, [uazInstances, chromiumInstances, officialApiByInstanceIdRaw, officialApiUnavailableGlobal]);
+
+  // FASE 20C — view models de 3 canais, SEMPRE derivados do array canônico
+  // não filtrado (`allMergedConnections`). Contadores do topo e o filtro de
+  // "Status Geral"/UazAPI/Sessão Web/API Oficial usam este MESMO array —
+  // nunca uma contagem separada que possa divergir da tabela.
+  const threeChannelViewModels: ThreeChannelConnectionViewModel[] = useMemo(
+    () =>
+      allMergedConnections.map((conn: any) =>
+        classifyThreeChannelConnection({
+          rowId: conn.id,
+          organizationId: conn.uaz?.organization_id ?? profile?.organization_id ?? null,
+          offerLabel: conn.offer_name && conn.offer_name !== '---' ? conn.offer_name : null,
+          whatsappIdentity: conn.push_name && conn.push_name !== '---' ? conn.push_name : null,
+          uazapi: conn.uaz,
+          webSession: conn.chromium,
+          webSessionId: conn.chromium?.id ?? null,
+          officialApi: conn.officialApi,
+          officialApiConnectionId: conn.officialApi ? conn.id : null,
+          officialApiUnavailable: conn.officialApiUnavailable,
+          activeFunnel: conn.uaz?.default_funnel_id ?? null,
+        }),
+      ),
+    [allMergedConnections, profile?.organization_id],
+  );
+  const threeChannelByRowId = useMemo(() => {
+    const map = new Map<string, ThreeChannelConnectionViewModel>();
+    threeChannelViewModels.forEach((vm) => map.set(vm.rowId, vm));
+    return map;
+  }, [threeChannelViewModels]);
+
+  const mergedConnections = useMemo(() => {
+    let results: any[] = allMergedConnections;
+
     // Apply Search Filter
     if (searchTerm) {
       const search = searchTerm.toLowerCase();
-      results = results.filter(c => 
+      results = results.filter(c =>
         c.name.toLowerCase().includes(search) ||
         (c.offer_name && c.offer_name.toLowerCase().includes(search)) ||
         (c.push_name && c.push_name.toLowerCase().includes(search)) ||
@@ -509,72 +611,100 @@ export default function ConnectionsManager() {
       results = results.filter(c => c.offer_name === filterOffer);
     }
 
-    // Apply Status Filter
+    // FASE 20C — filtro de "Status Geral" agora usa o MESMO `overallStatus`
+    // de 3 canais exibido na coluna/badge (antes comparava só
+    // `technicalStatus` da UazAPI, divergindo do que a coluna "Status
+    // Geral" realmente mostrava — ex.: uma linha "Parcial" ou "Somente
+    // Sessão Web" caía sempre no filtro "Offline").
     if (filterStatus !== 'all') {
       results = results.filter(c => {
-        const isUazOnline = c.uaz?.last_real_whatsapp_state === 'CONNECTED';
-        const isChromOnline = c.chrom_status === 'online';
-        const realWaState = c.uaz?.last_real_whatsapp_state;
-        const isRealWebConnected = isChromOnline && realWaState === 'CONNECTED';
-        
-        if (filterStatus === 'online') return isUazOnline && isRealWebConnected;
-        if (filterStatus === 'offline') return !isUazOnline && !isRealWebConnected;
-        if (filterStatus === 'partial') return (isUazOnline && !isRealWebConnected) || (!isUazOnline && isRealWebConnected);
-        return true;
+        const vm = threeChannelByRowId.get(c.id);
+        if (!vm) return false;
+        switch (filterStatus) {
+          case 'online': return vm.overallStatus === 'Online';
+          case 'partial': return vm.overallStatus === 'Parcial';
+          case 'offline': return vm.overallStatus === 'Offline' || vm.overallStatus === 'Sem canais configurados';
+          case 'uazapi_only': return vm.overallStatus === 'Somente UazAPI';
+          case 'websession_only': return vm.overallStatus === 'Somente Sessão Web';
+          case 'official_only': return vm.overallStatus === 'Somente API Oficial';
+          default: return true;
+        }
       });
     }
 
-    // Apply API Filter
+    // Apply API Filter (status técnico da UazAPI — mesma regra do classificador canônico)
     if (filterApi !== 'all') {
       results = results.filter(c => {
-        const realWaState = c.uaz?.last_real_whatsapp_state;
-        const isUazOnline = realWaState === 'CONNECTED';
-        return filterApi === 'online' ? isUazOnline : !isUazOnline;
+        const vm = classifyAdminConnection(c.uaz, c.chromium);
+        return filterApi === 'online' ? vm.technicalStatus === 'online' : vm.technicalStatus !== 'online';
       });
     }
 
-    // Apply Session Filter
+    // Apply Session Filter — Chromium é um canal auxiliar independente;
+    // este filtro olha SÓ o estado do Chromium (mesma regra da coluna
+    // "Sessão Web"), sem exigir que a UazAPI também esteja conectada.
     if (filterSession !== 'all') {
       results = results.filter(c => {
-        const isChromOnline = c.chrom_status === 'online';
-        const realWaState = c.uaz?.last_real_whatsapp_state;
-        const isRealWebConnected = isChromOnline && realWaState === 'CONNECTED';
-        return filterSession === 'online' ? isRealWebConnected : !isRealWebConnected;
+        const isChromOnline = isChromiumConnected(c.chromium);
+        return filterSession === 'online' ? isChromOnline : !isChromOnline;
+      });
+    }
+
+    // FASE 20C — filtro independente do terceiro canal (API Oficial), usando
+    // o MESMO view model de 3 canais da coluna/contadores.
+    if (filterOfficial !== 'all') {
+      results = results.filter(c => {
+        const vm = threeChannelByRowId.get(c.id);
+        if (!vm) return false;
+        if (filterOfficial === 'hookcloud') return vm.officialApiSource === 'hookcloud';
+        if (filterOfficial === 'meta_direct') return vm.officialApiSource === 'direct_meta';
+        if (filterOfficial === 'online') return vm.officialApiStatus === 'Online';
+        if (filterOfficial === 'pending') return vm.officialApiStatus === 'Pendente';
+        if (filterOfficial === 'offline') return vm.officialApiStatus === 'Offline' || vm.officialApiStatus === 'Erro';
+        if (filterOfficial === 'not_configured') return vm.officialApiStatus === 'Não configurada';
+        return true;
       });
     }
 
     // Apply Sorting
     if (sortConfig.key && sortConfig.direction) {
-      results.sort((a, b) => {
+      results = [...results].sort((a, b) => {
         let valA, valB;
         switch (sortConfig.key) {
           case 'name': valA = a.name; valB = b.name; break;
           case 'offer': valA = a.offer_name; valB = b.offer_name; break;
           case 'whatsapp': valA = a.push_name; valB = b.push_name; break;
           case 'number': valA = a.phone; valB = b.phone; break;
-          case 'status': 
-            const getStatusRank = (c: any) => {
-              const u = c.uaz_status === 'connected' || c.uaz_status === 'paired';
-              const ch = c.chrom_status === 'online';
-              if (u && ch) return 3;
-              if (u || ch) return 2;
-              return 1;
+          case 'status': {
+            // FASE 20C — ordena pelo Status Geral de 3 canais (mesmo
+            // overallStatus exibido na coluna), não mais pela heurística XOR
+            // UazAPI/Chromium antiga.
+            const OVERALL_RANK: Record<string, number> = {
+              'Online': 5,
+              'Somente UazAPI': 4,
+              'Somente Sessão Web': 4,
+              'Somente API Oficial': 4,
+              'Parcial': 3,
+              'Offline': 2,
+              'Sem canais configurados': 1,
             };
-            valA = getStatusRank(a);
-            valB = getStatusRank(b);
+            const rankOf = (c: any) => OVERALL_RANK[threeChannelByRowId.get(c.id)?.overallStatus ?? ''] ?? 0;
+            valA = rankOf(a);
+            valB = rankOf(b);
             break;
+          }
           default: valA = a[sortConfig.key] || ''; valB = b[sortConfig.key] || '';
         }
-        
+
         if (valA < valB) return sortConfig.direction === 'asc' ? -1 : 1;
         if (valA > valB) return sortConfig.direction === 'asc' ? 1 : -1;
         return 0;
       });
     }
 
-    console.log('[AUDIT] FINAL TABLE', { count: results.length, items: results });
+    console.log('[AUDIT] FINAL TABLE (filtrada para exibição)', { count: results.length, items: results });
     return results;
-  }, [uazInstances, chromiumInstances, searchTerm, filterOffer, filterStatus, filterApi, filterSession, sortConfig]);
+  }, [allMergedConnections, searchTerm, filterOffer, filterStatus, filterApi, filterSession, filterOfficial, sortConfig, threeChannelByRowId]);
 
 
   const handleSyncAll = async () => {
@@ -698,27 +828,54 @@ export default function ConnectionsManager() {
     return value;
   };
 
-  const isChromiumConnected = (chrom: any) => {
-    if (!chrom) return false;
-    if (chrom.connected === true) return true;
-    const s = String(chrom.chromium_status || chrom.chromiumStatus || chrom.status || '').toLowerCase();
-    return s === 'online' || s === 'authenticated' || s === 'ready';
-  };
-
+  // FASE 20A — corrige o bug em que "Status Geral" era um XOR entre UazAPI
+  // e Chromium: uma UazAPI saudável sem Sessão Web virava "Parcial", e uma
+  // UazAPI offline com Sessão Web viva também virava "Parcial", escondendo
+  // que a conexão real (UazAPI) estava fora do ar. Chromium é um canal
+  // auxiliar (VPS `api.x1zap.cloud`) e nunca determina o status geral de
+  // uma conexão UazAPI — ver `src/lib/whatsapp/connectionAdminView.ts`.
+  // FASE 20C — Status Geral agora vem do compositor de 3 canais
+  // (`overallStatus`), que nunca deixa a ausência de um canal opcional
+  // (Sessão Web/API Oficial) reduzir o status de outro canal configurado e
+  // operacional — ver matriz completa em `computeOverallStatus`.
   const getGeneralStatus = (conn: any) => {
-    const realWaState = conn.uaz?.last_real_whatsapp_state;
-    const isUazOnline = realWaState === 'CONNECTED';
-    const isWebOnline = isChromiumConnected(conn.chromium);
-
-    if (isUazOnline && isWebOnline) return <Badge className="bg-green-500">Online</Badge>;
-    if (isUazOnline || isWebOnline) return <Badge className="bg-yellow-500 text-black">Parcial</Badge>;
-    return <Badge variant="destructive">Offline</Badge>;
+    const vm = threeChannelByRowId.get(conn.id);
+    if (!vm) {
+      return (
+        <Badge variant="outline" className="text-muted-foreground" title="Sem view model resolvido para esta linha">
+          Desconhecido
+        </Badge>
+      );
+    }
+    switch (vm.overallStatus) {
+      case 'Online':
+        return <Badge className="bg-green-500" title={vm.overallStatusReason}>Online</Badge>;
+      case 'Parcial':
+        return <Badge className="bg-yellow-500 text-black" title={vm.overallStatusReason}>Parcial</Badge>;
+      case 'Somente UazAPI':
+        return <Badge className="bg-green-500" title={vm.overallStatusReason}>Somente UazAPI</Badge>;
+      case 'Somente Sessão Web':
+        return <Badge className="bg-green-500" title={vm.overallStatusReason}>Somente Sessão Web</Badge>;
+      case 'Somente API Oficial':
+        return <Badge className="bg-green-500" title={vm.overallStatusReason}>Somente API Oficial</Badge>;
+      case 'Sem canais configurados':
+        return (
+          <Badge variant="outline" className="text-muted-foreground" title={vm.overallStatusReason}>
+            Sem canais configurados
+          </Badge>
+        );
+      case 'Offline':
+      default:
+        return <Badge variant="destructive" title={vm.overallStatusReason}>Offline</Badge>;
+    }
   };
 
-  // Detecta duplicidades por número (visível — não oculta nada)
+  // Detecta duplicidades por número (visível — não oculta nada). Usa o
+  // array CANÔNICO não filtrado — duplicidade é uma propriedade dos dados,
+  // não deveria sumir/aparecer conforme o usuário filtra a tabela.
   const duplicatePhoneGroups = useMemo(() => {
     const byPhone = new Map<string, any[]>();
-    mergedConnections.forEach((c: any) => {
+    allMergedConnections.forEach((c: any) => {
       const phone = String(c.phone || '').replace(/\D/g, '');
       if (!phone) return;
       if (!byPhone.has(phone)) byPhone.set(phone, []);
@@ -727,12 +884,45 @@ export default function ConnectionsManager() {
     const groups: { phone: string; rows: any[] }[] = [];
     byPhone.forEach((rows, phone) => { if (rows.length > 1) groups.push({ phone, rows }); });
     return groups;
-  }, [mergedConnections]);
+  }, [allMergedConnections]);
 
-  const isLoading = isLoadingUaz || isLoadingChromium;
-  const used = uazInstances?.length ?? 0;
+  // FASE 20D — inclui o carregamento inicial de API Oficial no gate geral
+  // de loading da tela: sem isso, `officialApiResult` fica `undefined`
+  // durante o primeiro fetch e cada linha marcaria `officialApiUnavailable:
+  // true` (correto para nunca mentir "Não configurada"), mas a tabela
+  // renderizaria momentaneamente um "flash" de "Dados indisponíveis" antes
+  // da resposta real chegar. Esperar o loading inicial evita esse flash
+  // sem reintroduzir o problema original (a distinção erro-real vs.
+  // "Não configurada" continua intacta para qualquer falha PÓS-loading).
+  const isLoading = isLoadingUaz || isLoadingChromium || isLoadingOfficialApi;
+
+  // FASE 20C — "Total"/"Limite"/contadores do topo contam só conexões
+  // REGISTRADAS (linhas com `conn.uaz` real — mesmo escopo que "Ativas"
+  // usava antes da Fase 20C: `evolution_instances` cadastradas), nunca
+  // órfãs de Chromium sem UazAPI correspondente (que não ocupam vaga no
+  // plano). Derivado do array completo NÃO FILTRADO
+  // (`allMergedConnections`/`threeChannelViewModels`), nunca do array já
+  // filtrado para exibição — para que os contadores do cabeçalho nunca
+  // divirjam da tabela nem mudem silenciosamente conforme o usuário digita
+  // na busca/filtra colunas. "Operacionais" = linha com PELO MENOS UM canal
+  // esperado online (mesma regra usada para decidir "Somente X"/"Online"/
+  // "Parcial" no `overallStatus`) — nunca conta ausência de API Oficial
+  // como "offline".
+  const registeredRowIds = useMemo(
+    () => new Set(allMergedConnections.filter((c: any) => !!c.uaz).map((c: any) => c.id)),
+    [allMergedConnections],
+  );
+  const registeredThreeChannelViewModels = useMemo(
+    () => threeChannelViewModels.filter((vm) => registeredRowIds.has(vm.rowId)),
+    [threeChannelViewModels, registeredRowIds],
+  );
+  const threeChannelCounts = useMemo(
+    () => countThreeChannelConnections(registeredThreeChannelViewModels),
+    [registeredThreeChannelViewModels],
+  );
+  const used = threeChannelCounts.operational;
   const limit = effectivePlan?.limits?.max_connections ?? 1;
-  const limitReached = used >= limit;
+  const limitReached = threeChannelCounts.total >= limit;
 
   const uniqueOffers = useMemo(() => {
     const offers = new Set<string>();
@@ -765,44 +955,48 @@ export default function ConnectionsManager() {
           <p className="text-muted-foreground">Gerencie suas instâncias de WhatsApp (UazAPI) e sessões Web (Chromium).</p>
         </div>
         <div className="flex items-center gap-3">
-          <Badge variant={limitReached ? 'destructive' : 'secondary'} className="text-sm py-1 px-3">
-            Ativas: {used} / {limit}
-          </Badge>
-          
+          {/* FASE 20C — "Operacionais" conta linhas com PELO MENOS UM canal
+              esperado online (mesma regra de `overallStatus` !== "Offline"/
+              "Sem canais configurados"). Ausência de API Oficial NUNCA conta
+              como "offline" no agregado — hoje "API Oficial online" é
+              sempre 0 (nenhuma conexão real), o que é o estado esperado, não
+              um erro. Offline/Total/Limite ficam separados e explícitos
+              (produção real: ~10 operacionais, ~6 offline intencionalmente,
+              16 cadastradas, limite do plano à parte). */}
+          <div className="flex flex-wrap items-center gap-1.5 text-sm">
+            <Badge className="bg-green-500 py-1 px-2.5">Operacionais: {used}</Badge>
+            <Badge variant="destructive" className="py-1 px-2.5">Offline: {threeChannelCounts.offline}</Badge>
+            <Badge variant="outline" className="py-1 px-2.5" title="Conexões UazAPI com heartbeat CONNECTED">
+              UazAPI online: {threeChannelCounts.uazapiOnline}
+            </Badge>
+            <Badge variant="outline" className="py-1 px-2.5" title="Sessões Web (Chromium) conectadas">
+              Sessões Web online: {threeChannelCounts.webSessionOnline}
+            </Badge>
+            <Badge variant="outline" className="py-1 px-2.5" title="Conexões API Oficial (HookCloud/Meta Cloud) ativas — hoje sempre 0, nenhuma conexão real configurada">
+              API Oficial online: {threeChannelCounts.officialApiOnline}
+            </Badge>
+            <Badge variant="secondary" className="py-1 px-2.5">Total: {threeChannelCounts.total}</Badge>
+            <Badge variant={limitReached ? 'destructive' : 'outline'} className="py-1 px-2.5" title="Limite de conexões do plano/organização">
+              Limite: {limit}
+            </Badge>
+          </div>
+
           <AdminStatusNotificationConfig organizationId={profile?.organization_id} />
 
-          <Button 
-            variant="outline" 
-            size="sm" 
-            onClick={() => setIsSimulateModalOpen(true)}
-            className="gap-2 border-amber-500/50 hover:bg-amber-500/10 text-amber-600"
-          >
-            <Beaker className="h-4 w-4" />
-            Simular Queda
-          </Button>
+          {/* FASE 20B — botão "Simular Queda" (SimulateOutageModal) removido
+              da UI de produção: toda a ação chamava
+              `simulate_connection_status_change` via `whatsapp-proxy`, ação
+              sem handler correspondente (404 "Action not found").
+              Reimplementar exigiria deploy de Edge Function, fora do escopo
+              desta fase. */}
 
-
-          
-          {mergedConnections.some(c => c.isOrphan) && (
-            <Button 
-              variant="destructive" 
-              size="sm" 
-              onClick={async () => {
-                const orphanIds = mergedConnections.filter(c => c.isOrphan).map(c => c.chromium?.id).filter(Boolean);
-                if (confirm(`Remover ${orphanIds.length} conexões órfãs detectadas?`)) {
-                  for (const id of orphanIds) {
-                    await deleteChromiumMut.mutateAsync(id);
-                  }
-                  toast.success('Limpeza de órfãos concluída');
-                  handleSyncAll();
-                }
-              }}
-              disabled={deleteChromiumMut.isPending}
-            >
-              <AlertTriangle className="h-4 w-4 mr-2" />
-              Limpar Órfãos
-            </Button>
-          )}
+          {/* FASE 20C — botão "Limpar Órfãos" removido da UI de produção:
+              ação destrutiva (DELETE permanente na VPS Chromium por linha),
+              sem dry-run, sem preview individual, só um `confirm()` agregado
+              — e o modelo de associação UazAPI↔Chromium usado para detectar
+              "órfã" está sendo corrigido/documentado nesta mesma fase (ver
+              risco residual em `connectionAdminView.ts`). Backend não foi
+              alterado. */}
 
           <Button variant="outline" size="sm" onClick={handleSyncAll} disabled={syncUazMut.isPending || syncChromiumMut.isPending}>
             <RefreshCw className={`h-4 w-4 mr-2 ${(syncUazMut.isPending || syncChromiumMut.isPending) ? 'animate-spin' : ''}`} />
@@ -846,7 +1040,7 @@ export default function ConnectionsManager() {
             onChange={(e) => setSearchTerm(e.target.value)}
           />
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
           <Select value={filterOffer} onValueChange={setFilterOffer}>
             <SelectTrigger className="w-full md:w-[150px]">
               <Filter className="h-3 w-3 mr-2" />
@@ -861,36 +1055,56 @@ export default function ConnectionsManager() {
           </Select>
 
           <Select value={filterStatus} onValueChange={setFilterStatus}>
-            <SelectTrigger className="w-full md:w-[150px]">
-              <SelectValue placeholder="Status" />
+            <SelectTrigger className="w-full md:w-[170px]">
+              <SelectValue placeholder="Status Geral" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">Todos Status</SelectItem>
+              <SelectItem value="all">Todos Status Geral</SelectItem>
               <SelectItem value="online">Online</SelectItem>
               <SelectItem value="partial">Parcial</SelectItem>
               <SelectItem value="offline">Offline</SelectItem>
+              <SelectItem value="uazapi_only">Somente UazAPI</SelectItem>
+              <SelectItem value="websession_only">Somente Sessão Web</SelectItem>
+              <SelectItem value="official_only">Somente API Oficial</SelectItem>
             </SelectContent>
           </Select>
 
           <Select value={filterApi} onValueChange={setFilterApi}>
             <SelectTrigger className="w-full md:w-[150px]">
-              <SelectValue placeholder="API Principal" />
+              <SelectValue placeholder="Status UazAPI" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">Todas APIs</SelectItem>
+              <SelectItem value="all">Todos Status UazAPI</SelectItem>
               <SelectItem value="online">UazAPI Online</SelectItem>
-              <SelectItem value="offline">UazAPI Offline</SelectItem>
+              <SelectItem value="offline">UazAPI Offline/Conectando</SelectItem>
             </SelectContent>
           </Select>
 
           <Select value={filterSession} onValueChange={setFilterSession}>
             <SelectTrigger className="w-full md:w-[150px]">
-              <SelectValue placeholder="Sessão Web" />
+              <SelectValue placeholder="Sessão Web (auxiliar)" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">Todas Sessões</SelectItem>
-              <SelectItem value="online">Chromium Online</SelectItem>
-              <SelectItem value="offline">Não conectada</SelectItem>
+              <SelectItem value="all">Todas Sessões Web</SelectItem>
+              <SelectItem value="online">Sessão Web Online</SelectItem>
+              <SelectItem value="offline">Sessão Web Offline</SelectItem>
+            </SelectContent>
+          </Select>
+
+          {/* FASE 20C — filtro independente do terceiro canal. Nunca
+              combinado com UazAPI/Sessão Web num único eixo. */}
+          <Select value={filterOfficial} onValueChange={setFilterOfficial}>
+            <SelectTrigger className="w-full md:w-[170px]">
+              <SelectValue placeholder="API Oficial" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Todas API Oficial</SelectItem>
+              <SelectItem value="online">API Oficial Online</SelectItem>
+              <SelectItem value="pending">API Oficial Pendente</SelectItem>
+              <SelectItem value="offline">API Oficial Offline/Erro</SelectItem>
+              <SelectItem value="not_configured">API Oficial Não configurada</SelectItem>
+              <SelectItem value="hookcloud">Origem: HookCloud</SelectItem>
+              <SelectItem value="meta_direct">Origem: Meta direta</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -913,8 +1127,9 @@ export default function ConnectionsManager() {
               <TableHead className="cursor-pointer select-none" onClick={() => handleSort('number')}>
                 <div className="flex items-center">Número <SortIcon column="number" /></div>
               </TableHead>
-              <TableHead>API Principal</TableHead>
+              <TableHead>UazAPI</TableHead>
               <TableHead>Sessão Web</TableHead>
+              <TableHead>API Oficial</TableHead>
               <TableHead className="cursor-pointer select-none" onClick={() => handleSort('status')}>
                 <div className="flex items-center">Status Geral <SortIcon column="status" /></div>
               </TableHead>
@@ -925,20 +1140,25 @@ export default function ConnectionsManager() {
           <TableBody>
             {isLoading ? (
               <TableRow>
-                <TableCell colSpan={10} className="text-center py-10">
+                <TableCell colSpan={11} className="text-center py-10">
                   <Loader2 className="h-8 w-8 animate-spin mx-auto text-muted-foreground" />
                 </TableCell>
               </TableRow>
             ) : mergedConnections.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={10} className="text-center py-10 text-muted-foreground">
+                <TableCell colSpan={11} className="text-center py-10 text-muted-foreground">
                   Nenhuma conexão encontrada.
                 </TableCell>
               </TableRow>
             ) : (
               mergedConnections.map((conn) => {
-                const realWaState = conn.uaz?.last_real_whatsapp_state;
-                const isUazConnected = realWaState === 'CONNECTED';
+                // FASE 20B — a coluna "Status UazAPI" usa o MESMO
+                // classificador canônico da coluna "Status Geral"
+                // (`classifyAdminConnection`), em vez de reimplementar a
+                // regra inline: antes as duas colunas podiam divergir (ex.:
+                // heartbeat "UNKNOWN" virava "⚪ Não conectada" aqui, sem
+                // nenhuma distinção do "DISCONNECTED" confirmado).
+                const uazVm = conn.uaz ? classifyAdminConnection(conn.uaz, conn.chromium) : null;
                 const chromStatus = String(
                   conn.chromium?.chromium_status || conn.chromium?.chromiumStatus || conn.chromium?.status || ''
                 ).toLowerCase();
@@ -966,8 +1186,12 @@ export default function ConnectionsManager() {
                       <div className="flex flex-col">
                         <span>{conn.uaz?.custom_name || conn.name}</span>
                         {conn.isOrphan && (
-                          <Badge variant="destructive" className="w-fit text-[10px] h-4 mt-1">
-                            ÓRFÃ (Somente Chromium)
+                          <Badge
+                            variant="destructive"
+                            className="w-fit text-[10px] h-4 mt-1"
+                            title="Sessão Web (Chromium/VPS) sem instância UazAPI correspondente em evolution_instances — não é um provider, é uma pendência de vínculo."
+                          >
+                            Sessão Web sem UazAPI
                           </Badge>
                         )}
                       </div>
@@ -980,21 +1204,30 @@ export default function ConnectionsManager() {
                       {formatBrazilianPhone(conn.uaz?.phone_number || conn.chromium?.chromium_number || conn.chromium?.number) || '---'}
                     </TableCell>
                     <TableCell>
-                      {isUazConnected ? (
-                        <Badge className="bg-green-500 cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)}>
+                      {!uazVm ? (
+                        <Badge variant="outline" className="text-muted-foreground">— Sem UazAPI —</Badge>
+                      ) : uazVm.displayStatus === 'Online' ? (
+                        <Badge className="bg-green-500 cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)} title={uazVm.statusReason}>
                           🟢 UazAPI Online
                         </Badge>
-                      ) : (realWaState === 'PAIRING' || realWaState === 'OPENING') ? (
-                        <Badge className="bg-yellow-500 text-black cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)}>
+                      ) : uazVm.displayStatus === 'Conectando' ? (
+                        <Badge className="bg-yellow-500 text-black cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)} title={uazVm.statusReason}>
                           🟡 Conectando
                         </Badge>
-                      ) : (conn.uaz?.status === 'qr_pending') ? (
-                        <Badge variant="secondary" className="cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)}>
-                          🟡 Aguardando QR
-                        </Badge>
+                      ) : uazVm.isUnconfirmedOffline ? (
+                        <div className="flex flex-col gap-1">
+                          <Badge
+                            variant="outline"
+                            className="border-amber-500 text-amber-600 dark:text-amber-400 cursor-pointer"
+                            onClick={() => setConnectingUaz(conn.uaz)}
+                            title={uazVm.statusReason}
+                          >
+                            ⚪ Offline — sem resposta atual
+                          </Badge>
+                        </div>
                       ) : (
                         <div className="flex flex-col gap-1">
-                          <Badge variant="outline" className="text-muted-foreground cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)}>
+                          <Badge variant="outline" className="text-muted-foreground cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)} title={uazVm.statusReason}>
                             ⚪ Não conectada
                           </Badge>
                           {conn.uaz?.last_health_at && (new Date().getTime() - new Date(conn.uaz.last_health_at).getTime() > 120000) && (
@@ -1029,6 +1262,45 @@ export default function ConnectionsManager() {
                         </Badge>
                       )}
                     </TableCell>
+                    <TableCell>
+                      {/* FASE 20C — coluna independente. "Não configurada"
+                          nunca é tratada como falha; hoje é o estado
+                          esperado nas 16 conexões (0 conexões reais de API
+                          Oficial em produção). */}
+                      {(() => {
+                        const vm = threeChannelByRowId.get(conn.id);
+                        if (!vm) return <Badge variant="outline" className="text-muted-foreground">—</Badge>;
+                        switch (vm.officialApiStatus) {
+                          case 'Online':
+                            return <Badge className="bg-green-500" title={vm.officialApiStatusReason}>🟢 Online</Badge>;
+                          case 'Pendente':
+                            return <Badge className="bg-yellow-500 text-black" title={vm.officialApiStatusReason}>🟡 Pendente</Badge>;
+                          case 'Erro':
+                            return <Badge variant="destructive" title={vm.officialApiStatusReason}>Erro</Badge>;
+                          case 'Offline':
+                            return <Badge variant="destructive" title={vm.officialApiStatusReason}>Offline</Badge>;
+                          case 'Dados indisponíveis':
+                            // FASE 20D — núcleo da correção de segurança:
+                            // uma falha ao CONSULTAR a API Oficial (permissão/
+                            // rede/backend) precisa aparecer visualmente
+                            // distinta de "Não configurada" — nunca cair no
+                            // `default` abaixo, que afirmaria (incorretamente)
+                            // que não existe nenhuma conexão configurada.
+                            return (
+                              <Badge variant="destructive" className="gap-1" title={vm.officialApiStatusReason}>
+                                <AlertTriangle className="h-3 w-3" /> Dados indisponíveis
+                              </Badge>
+                            );
+                          case 'Não configurada':
+                          default:
+                            return (
+                              <Badge variant="outline" className="text-muted-foreground" title={vm.officialApiStatusReason}>
+                                Não configurada
+                              </Badge>
+                            );
+                        }
+                      })()}
+                    </TableCell>
                     <TableCell>{getGeneralStatus(conn)}</TableCell>
                     <TableCell>
                       {conn.uaz ? (
@@ -1057,13 +1329,13 @@ export default function ConnectionsManager() {
                         <DropdownMenuContent align="end">
                           {conn.uaz && (
                             <>
-                              <DropdownMenuItem onClick={() => {
-                                setEditingUaz(conn.uaz);
-                                setEditName(conn.uaz.custom_name || conn.uaz.name);
-                                setIsEditModalOpen(true);
-                              }}>
-                                <Sparkles className="h-4 w-4 mr-2" /> Editar Nome Instância
-                              </DropdownMenuItem>
+                              {/* FASE 20B — "Editar Nome Instância" removida da UI de
+                                  produção: chamava `rename_instance_self` via
+                                  `useRenameWhatsAppInstanceSelf()`, ação sem handler
+                                  em `supabase/functions/whatsapp-proxy/index.ts`
+                                  (retornaria 404 "Action not found"). Reimplementar
+                                  exigiria deploy de Edge Function, fora do escopo
+                                  desta fase. */}
                               <DropdownMenuItem onClick={() => {
                                 setEditingOfferUaz(conn.uaz);
                                 setEditOffer(conn.uaz.offer_name || '');
@@ -1255,51 +1527,6 @@ export default function ConnectionsManager() {
         </DialogContent>
       </Dialog>
 
-      {/* Modal: Editar Nome Instância */}
-      <Dialog open={isEditModalOpen} onOpenChange={setIsEditModalOpen}>
-        <DialogContent className="max-w-md">
-          <form onSubmit={(e) => {
-            e.preventDefault();
-            if (!editingUaz || !editName) return;
-            renameUazMut.mutate({ id: editingUaz.id, name: editName }, {
-              onSuccess: () => {
-                setIsEditModalOpen(false);
-                refetchUaz();
-              }
-            });
-          }}>
-            <DialogHeader>
-              <DialogTitle>Editar Nome Instância</DialogTitle>
-              <DialogDescription>
-                Altere o nome da instância exibido no CRM. Isso não altera o identificador no WhatsApp ou UazAPI.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4 py-4">
-              <div className="space-y-2">
-                <Label htmlFor="editName">Nome Visual (Alias)</Label>
-                <Input 
-                  id="editName" 
-                  value={editName} 
-                  onChange={(e) => setEditName(e.target.value)} 
-                  placeholder="Ex: chip21"
-                  autoFocus
-                />
-              </div>
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setIsEditModalOpen(false)}>Cancelar</Button>
-              <Button 
-                type="submit"
-                disabled={renameUazMut.isPending || !editName}
-              >
-                {renameUazMut.isPending && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
-                Salvar
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-
       {/* Uaz Connect Dialog */}
       {connectingUaz && (
         <UazConnectDialog 
@@ -1357,13 +1584,6 @@ export default function ConnectionsManager() {
         </DialogContent>
       </Dialog>
 
-      {/* Modal: Simular Queda */}
-      <SimulateOutageModal
-        isOpen={isSimulateModalOpen}
-        onClose={() => setIsSimulateModalOpen(false)}
-        connections={mergedConnections}
-        organizationId={profile?.organization_id}
-      />
     </div>
 
   );

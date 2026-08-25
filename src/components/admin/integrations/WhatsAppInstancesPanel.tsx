@@ -26,6 +26,7 @@ import {
   useSyncWhatsAppInstances,
   useRepairWhatsAppWebhook,
   useCheckWhatsAppWebhook,
+  useOfficialApiConnections,
   type WhatsAppInstance as BaseWhatsAppInstance,
 } from '@/hooks/useWhatsAppInstances';
 
@@ -367,6 +368,15 @@ export function WhatsAppInstancesPanel() {
   const { profile } = useAuth();
   const { data: instancesRaw, isLoading } = useWhatsAppInstances();
   const instances = (instancesRaw as WhatsAppInstance[])?.filter(i => (i as any).is_active !== false);
+  // FASE 20D — `meta_cloud_config` não vem mais embutido em cada linha de
+  // `useWhatsAppInstances` (removido por falta de GRANT SELECT direto na
+  // tabela satélite — ver `useWhatsAppInstances.ts`). Buscado separadamente
+  // via a mesma fronteira administrativa (`instances-api`) usada por
+  // `ConnectionsManager.tsx`, para que `classifyConnectionForDisplay`
+  // continue reconhecendo `hookcloud_pending` corretamente (hoje 0 linhas
+  // reais, mas sem esta busca o card `HookCloudPendingCard` nunca
+  // apareceria quando a primeira conexão HookCloud pending existir).
+  const { byInstanceId: officialApiByInstanceId } = useOfficialApiConnections();
 
   const { data: effectivePlan } = useOrganizationEffectivePlan(profile?.organization_id);
   const setDefaultMut = useSetDefaultWhatsAppInstance();
@@ -470,7 +480,7 @@ export function WhatsAppInstancesPanel() {
             // NENHUMA alteração de comportamento) ou uma conexão Meta/
             // HookCloud/desconhecida (nunca recebe ação de transporte
             // UazAPI, nunca chama `whatsapp-proxy`, nunca mostra QR Code).
-            const kind = classifyConnectionForDisplay(inst, inst.meta_cloud_config);
+            const kind = classifyConnectionForDisplay(inst, officialApiByInstanceId.get(inst.id) ?? null);
             if (kind === 'hookcloud_pending') return <HookCloudPendingCard key={inst.id} inst={inst} />;
             if (kind === 'unsupported') return <UnsupportedConnectionCard key={inst.id} inst={inst} />;
             return (

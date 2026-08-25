@@ -175,14 +175,22 @@ export function useWhatsAppInstances() {
   return useQuery({
     queryKey: ['whatsapp-instances', profile?.organization_id],
     queryFn: async (): Promise<WhatsAppInstance[]> => {
-      // FASE 18C: embute o registro 1:1 de `evolution_instances_meta_cloud`
-      // (só para exibição segura — "Pendente de configuração" — nunca para
-      // decidir se uma ação UazAPI é permitida; essa decisão usa só
-      // `provider`, já presente em `select('*')`). Para uma linha UazAPI,
-      // esse embed vem null (nenhuma linha satélite existe para ela).
+      // FASE 20D — removido o embed direto `meta_cloud_config:
+      // evolution_instances_meta_cloud(...)` que existia aqui (Fase 18C).
+      // Motivo: `evolution_instances_meta_cloud` tem RLS habilitada com
+      // policies corretas, mas o role `authenticated` NÃO tem GRANT SELECT
+      // na tabela (confirmado por consulta direta ao banco linkado na Fase
+      // 20D) — um embed PostgREST nessas condições falha com
+      // `42501 permission denied` para a QUERY INTEIRA assim que existir
+      // 1 linha satélite real, quebrando esta tela inteira (não só os dados
+      // de API Oficial). `meta_cloud_config` agora é buscado separadamente
+      // via `useOfficialApiConnections()` (Edge Function `instances-api`,
+      // que autentica/autoriza no servidor com `service_role` e devolve uma
+      // allowlist de colunas), e uma falha nesse fetch aparece como "Dados
+      // indisponíveis" na coluna correspondente — nunca derruba esta query.
       const { data, error } = await supabase
         .from('evolution_instances')
-        .select('*, meta_cloud_config:evolution_instances_meta_cloud(onboarding_state, onboarding_source, phone_number_id)')
+        .select('*')
         .eq('organization_id', profile!.organization_id!)
         .order('created_at', { ascending: true });
       if (error) throw error;
@@ -194,17 +202,103 @@ export function useWhatsAppInstances() {
   });
 }
 
+/**
+ * FASE 20D — busca os metadados sanitizados de API Oficial (HookCloud/Meta
+ * direta) via a fronteira administrativa `instances-api` (nunca consulta
+ * `evolution_instances_meta_cloud` diretamente do cliente — ver comentário
+ * acima em `useWhatsAppInstances`). Retorna um mapa por
+ * `evolution_instance_id` para merge O(1) pelo chamador.
+ */
+// FASE 20D — CORREÇÃO (revisão Codex desta fase): esta função antes
+// engolia QUALQUER falha (rede/HTTP/permissão) e devolvia `{ ok: false }`
+// como um resultado de SUCESSO para o React Query. Isso significava que uma
+// falha transitória de rede ficava cacheada como "resultado válido" por até
+// `refetchInterval` (5 min), sem nenhum retry/backoff — o usuário via
+// "Dados indisponíveis" congelado por até 5 minutos mesmo que a causa real
+// já tivesse se resolvido em segundos. Agora LANÇA em qualquer falha, para
+// o React Query tratar como erro de verdade (retry automático com backoff,
+// `isError` real) — `useOfficialApiConnections`/`useOfficialApiConnectionsAll`
+// abaixo expõem `unavailable` derivado de `isError` (só após os retries se
+// esgotarem), nunca de um `{ok:false}} `"bem-sucedido".
+async function fetchOfficialApiConnections(action: 'officialApi' | 'officialApiAll'): Promise<Map<string, WhatsAppInstanceMetaCloudConfig>> {
+  // `fetch` direto (em vez de `supabase.functions.invoke`) para garantir
+  // método GET + querystring de forma previsível — `invoke` é otimizado
+  // para POST com corpo JSON em várias versões do supabase-js.
+  const { data: sessionData } = await supabase.auth.getSession();
+  const token = sessionData.session?.access_token;
+  if (!token) throw new Error('Sessão ausente ao buscar API Oficial');
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
+  const anonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string;
+  const resp = await fetch(`${supabaseUrl}/functions/v1/instances-api?action=${action}`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}`, apikey: anonKey },
+  });
+  if (!resp.ok) throw new Error(`instances-api ${action} falhou: HTTP ${resp.status}`);
+  const json = await resp.json();
+  if (json?.ok !== true || !Array.isArray(json.rows)) {
+    throw new Error(`instances-api ${action} devolveu resposta malformada`);
+  }
+  const byInstanceId = new Map<string, WhatsAppInstanceMetaCloudConfig>();
+  for (const row of json.rows) {
+    if (row && typeof row.evolution_instance_id === 'string') {
+      byInstanceId.set(row.evolution_instance_id, {
+        onboarding_state: row.onboarding_state ?? null,
+        onboarding_source: row.onboarding_source ?? null,
+        phone_number_id: row.phone_number_id ?? null,
+      });
+    }
+  }
+  return byInstanceId;
+}
+
+export interface OfficialApiHookResult {
+  /** Mapa por `evolution_instance_id` — vazio tanto em "sem linhas reais" quanto durante `unavailable`/loading; o chamador SEMPRE deve checar `unavailable`/`isLoading` antes de tratar um mapa vazio como "Não configurada". */
+  byInstanceId: Map<string, WhatsAppInstanceMetaCloudConfig>;
+  /** `true` SÓ depois que os retries automáticos do React Query se esgotarem — nunca durante uma falha transitória isolada. */
+  unavailable: boolean;
+  isLoading: boolean;
+}
+
+// Org-scoped (admin/manager da própria organização, ou super_admin).
+export function useOfficialApiConnections(): OfficialApiHookResult {
+  const { profile } = useAuth();
+  const q = useQuery({
+    queryKey: ['whatsapp-instances-official-api', profile?.organization_id],
+    queryFn: () => fetchOfficialApiConnections('officialApi'),
+    enabled: !!profile?.organization_id,
+    refetchInterval: 300000,
+    refetchIntervalInBackground: false,
+    retry: 2, // backoff padrão do React Query — nunca 0 (falha transitória isolada não deve virar "Dados indisponíveis" imediatamente)
+  });
+  return { byInstanceId: q.data ?? new Map(), unavailable: q.isError, isLoading: q.isLoading };
+}
+
+// Platform-wide (super_admin) — usado por `useAllWhatsAppInstancesAdmin`.
+export function useOfficialApiConnectionsAll(): OfficialApiHookResult {
+  const { profile } = useAuth();
+  const q = useQuery({
+    queryKey: ['whatsapp-instances-official-api-all'],
+    queryFn: () => fetchOfficialApiConnections('officialApiAll'),
+    enabled: !!profile?.organization_id,
+    refetchInterval: 300000,
+    refetchIntervalInBackground: false,
+    retry: 2,
+  });
+  return { byInstanceId: q.data ?? new Map(), unavailable: q.isError, isLoading: q.isLoading };
+}
+
 // Platform-wide (super admin)
 export function useAllWhatsAppInstancesAdmin() {
   return useQuery({
     queryKey: ['whatsapp-instances-all'],
     queryFn: async (): Promise<WhatsAppInstanceWithOrg[]> => {
-      // FASE 18C: mesmo embed de `useWhatsAppInstances` — só para exibição
-      // segura, RLS já concede `is_super_admin` acesso a todas as linhas
-      // desta tabela satélite (mesma política usada pelo painel org-scoped).
+      // FASE 20D — mesmo motivo de `useWhatsAppInstances`: removido o embed
+      // direto de `evolution_instances_meta_cloud` (falta GRANT SELECT para
+      // `authenticated`; RLS sozinha não basta). Painel de super admin usa
+      // `useOfficialApiConnectionsAll()` separadamente.
       const { data, error } = await supabase
         .from('evolution_instances')
-        .select('*, organization:organizations(id, name), meta_cloud_config:evolution_instances_meta_cloud(onboarding_state, onboarding_source, phone_number_id)')
+        .select('*, organization:organizations(id, name)')
         .order('created_at', { ascending: false });
       if (error) throw error;
       return (data || []) as unknown as WhatsAppInstanceWithOrg[];

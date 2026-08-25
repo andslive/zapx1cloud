@@ -12,7 +12,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog';
-import { Bell, Loader2, Send } from 'lucide-react';
+import { Bell, Loader2 } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
 
@@ -24,7 +24,6 @@ export function AdminStatusNotificationConfig({ organizationId }: AdminStatusNot
   const [phone, setPhone] = useState('');
   const [enabled, setEnabled] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [testing, setTesting] = useState(false);
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -103,40 +102,12 @@ export function AdminStatusNotificationConfig({ organizationId }: AdminStatusNot
     }
   }
 
-  async function handleTest() {
-    const adminStatusNotifyPhone = phone.trim();
-    
-    if (!adminStatusNotifyPhone) {
-      toast.error("Informe um telefone para testar o alerta");
-      return;
-    }
-
-    try {
-      setTesting(true);
-      const { data, error } = await supabase.functions.invoke('whatsapp-proxy', {
-        body: {
-          action: "test_admin_alert",
-          phone: adminStatusNotifyPhone,
-          organization_id: organizationId
-        }
-      });
-
-      if (error) {
-        toast.error(JSON.stringify(error, null, 2));
-        return;
-      }
-
-      if (data?.success || data?.ok) {
-        toast.success("Alerta de teste enviado com sucesso");
-      } else {
-        toast.error(data?.message || data?.error || "Falha ao enviar alerta");
-      }
-    } catch (error: any) {
-      toast.error("Erro inesperado: " + error.message);
-    } finally {
-      setTesting(false);
-    }
-  }
+  // FASE 20B — `handleTest()`/"Testar Alerta" removida: chamava
+  // `test_admin_alert` via `whatsapp-proxy`, ação sem handler correspondente
+  // em `supabase/functions/whatsapp-proxy/index.ts` (retornaria 404 "Action
+  // not found"). Reimplementar exigiria deploy de Edge Function, fora do
+  // escopo desta fase. `handleSave()` (upsert direto em
+  // `admin_status_alert_configs`) continua funcional e não é afetado.
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -183,19 +154,6 @@ export function AdminStatusNotificationConfig({ organizationId }: AdminStatusNot
           </div>
         </div>
         <DialogFooter className="flex flex-col sm:flex-row gap-2">
-          <Button
-            variant="secondary"
-            onClick={handleTest}
-            disabled={testing || !phone || loading}
-            className="w-full sm:w-auto"
-          >
-            {testing ? (
-              <Loader2 className="h-4 w-4 animate-spin mr-2" />
-            ) : (
-              <Send className="h-4 w-4 mr-2" />
-            )}
-            Testar Alerta
-          </Button>
           <Button onClick={handleSave} disabled={loading} className="w-full sm:w-auto">
             {loading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
             Salvar

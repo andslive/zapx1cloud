@@ -489,7 +489,15 @@ function InstancesTable({ provider }: { provider: 'evolution' | 'uazapi' }) {
                 // uma conexão que não seja `provider='uazapi'`. Renomear/
                 // Atribuir/Excluir continuam disponíveis (não chamam a
                 // UazAPI para decidir NADA sobre transporte).
-                const isUazapi = classifyConnectionForDisplay(inst, inst.meta_cloud_config) === 'uazapi';
+                // FASE 20D — `meta_cloud_config` não vem mais embutido em
+                // `inst` (removido de `useAllWhatsAppInstancesAdmin` por
+                // falta de GRANT SELECT direto na tabela satélite). Sem
+                // efeito aqui: este `isUazapi` só usa o resultado
+                // 'uazapi'/não-'uazapi' de `classifyConnectionForDisplay`,
+                // que nunca depende de `metaCloudConfig` para essa
+                // distinção (só usada para 'hookcloud_pending', não
+                // consultado nesta tela).
+                const isUazapi = classifyConnectionForDisplay(inst, undefined) === 'uazapi';
                 return (
                 <TableRow key={inst.id} className={!inst.organization_id ? 'bg-amber-500/5' : ''}>
                   <TableCell className="font-medium">
