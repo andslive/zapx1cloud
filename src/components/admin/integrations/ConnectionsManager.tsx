@@ -15,7 +15,7 @@ import {
   useSyncWhatsAppInstances,
   useCreateWhatsAppInstanceSelf,
   useConnectWhatsAppInstance,
-  useDeleteWhatsAppInstanceSelf,
+  useArchiveWhatsAppInstanceSelf,
   useUpdateWhatsAppInstanceOffer,
   useSetConnectionDefaultFunnel,
   useOfficialApiConnections,
@@ -343,7 +343,10 @@ export default function ConnectionsManager() {
   const { byInstanceId: officialApiByInstanceIdRaw, unavailable: officialApiUnavailableGlobal, isLoading: isLoadingOfficialApi } = useOfficialApiConnections();
   const syncUazMut = useSyncWhatsAppInstances();
   const createUazMut = useCreateWhatsAppInstanceSelf();
-  const deleteUazMut = useDeleteWhatsAppInstanceSelf();
+  // FASE 20H — "Excluir" não faz mais hard delete (ver
+  // `whatsapp-proxy/index.ts`, action `archive_instance`): arquiva a
+  // conexão, preservando 100% do histórico vinculado.
+  const archiveUazMut = useArchiveWhatsAppInstanceSelf();
   const updateOfferMut = useUpdateWhatsAppInstanceOffer();
   const { data: allFunnels, isLoading: isLoadingFunnels } = useFunnels();
   const eligibleFunnels = useMemo(
@@ -364,6 +367,9 @@ export default function ConnectionsManager() {
   const [editingOfferUaz, setEditingOfferUaz] = useState<WhatsAppInstance | null>(null);
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [selectedChromiumId, setSelectedChromiumId] = useState<string | null>(null);
+  // FASE 20H — conexão selecionada para o modal de arquivamento ("Excluir"
+  // → remover da operação, preservando histórico). `null` = modal fechado.
+  const [archivingConn, setArchivingConn] = useState<{ id: string; label: string } | null>(null);
 
 
   const [newName, setNewName] = useState('');
@@ -1378,36 +1384,22 @@ export default function ConnectionsManager() {
                           >
                             <Trash2 className="h-4 w-4 mr-2" /> Excluir Sessão Web
                           </DropdownMenuItem>
-                          <DropdownMenuItem className="text-destructive" onClick={() => {
-                             console.group('[DELETE_HANDLER_START]', { ts: new Date().toISOString(), connName: conn.name });
-                             console.log('[DELETE_INSTANCE_RAW]', conn);
-                             console.log('[DELETE_CHROMIUM_TARGET]', conn.chromium ?? null);
-                             console.log('[DELETE_UAZ_TARGET]', conn.uaz ?? null);
-                             console.log('[DELETE_CHROMIUM_ID]', conn.chromium?.id ?? null);
-                             console.log('[DELETE_UAZ_ID]', conn.uaz?.id ?? null);
-                             console.log('[DELETE_CHROMIUM_NAME]', conn.chromium?.name ?? conn.chromium?.chromium_pushname ?? null);
-                             console.log('[DELETE_UAZ_NAME]', conn.uaz?.custom_name ?? conn.uaz?.name ?? null);
-                             console.log('[DELETE_REQUEST_PLAN]', {
-                               willCallChromium: !!conn.chromium,
-                               chromiumEndpoint: conn.chromium ? `DELETE https://api.x1zap.cloud/connections/${conn.chromium.id}` : null,
-                               willCallUaz: !!conn.uaz,
-                               uazAction: conn.uaz ? { fn: 'whatsapp-proxy', action: 'delete_instance_self', id: conn.uaz.id } : null,
-                             });
-                             if (confirm('Deseja realmente excluir esta conexão permanentemente?')) {
-                               if (conn.chromium) deleteChromiumMut.mutate(conn.chromium.id, {
-                                 onSuccess: (data) => console.log('[DELETE_CHROMIUM_RESULT]', { ok: true, data }),
-                                 onError: (err: any) => console.log('[DELETE_CHROMIUM_RESULT]', { ok: false, status: err?.status, message: err?.message, body: err?.body }),
-                               });
-                               if (conn.uaz) deleteUazMut.mutate(conn.uaz.id, {
-                                 onSuccess: (data) => { console.log('[DELETE_UAZ_RESULT]', { ok: true, data }); refetchUaz(); },
-                                 onError: (err: any) => console.log('[DELETE_UAZ_RESULT]', { ok: false, message: err?.message, err }),
-                               });
-                             } else {
-                               console.log('[DELETE_HANDLER_END]', { cancelled: true });
-                             }
-                             console.log('[DELETE_HANDLER_END]', { dispatched: true });
-                             console.groupEnd();
-                          }}>
+                          {/* FASE 20H — "Excluir" não faz mais hard delete: abre um
+                              modal de confirmação que explica honestamente que a
+                              conexão será removida da operação com o histórico
+                              preservado, e só então chama `archive_instance`
+                              (nunca `delete_instance_self`). */}
+                          <DropdownMenuItem
+                            className="text-destructive"
+                            disabled={!conn.uaz}
+                            onClick={() => {
+                              if (!conn.uaz) return;
+                              setArchivingConn({
+                                id: conn.uaz.id,
+                                label: conn.uaz.custom_name || conn.uaz.name || conn.name,
+                              });
+                            }}
+                          >
                             <Trash2 className="h-4 w-4 mr-2" /> Excluir
                           </DropdownMenuItem>
                         </DropdownMenuContent>
@@ -1420,6 +1412,73 @@ export default function ConnectionsManager() {
           </TableBody>
         </Table>
       </Card>
+
+      {/* FASE 20H — modal "Remover conexão da operação" (arquivamento, nunca
+          hard delete). Fechar/cancelar não chama nada; loading bloqueia
+          clique duplo; sucesso invalida a query canônica (a linha some da
+          tabela sem reload completo) e mostra confirmação; erro mostra
+          mensagem sanitizada (nunca o "Edge Function returned a non-2xx
+          status code" genérico). */}
+      <AlertDialog
+        open={!!archivingConn}
+        onOpenChange={(open) => {
+          if (!open && !archiveUazMut.isPending) setArchivingConn(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remover conexão da operação?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {archivingConn && (
+                <>
+                  Isso vai remover <strong>{archivingConn.label}</strong> da
+                  operação: ela deixará de aparecer na lista operacional e não
+                  poderá receber mensagens, funis ou automações. Leads,
+                  conversas, mensagens, vendas e demais dados anteriores serão
+                  preservados no histórico. Esta ação não apaga o histórico.
+                </>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={archiveUazMut.isPending}>Cancelar</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={archiveUazMut.isPending}
+              onClick={(e) => {
+                // FASE 20H — nunca fecha o `AlertDialog` nativamente aqui:
+                // controlamos o fechamento manualmente só depois da
+                // resposta confirmada do servidor (sucesso OU erro claro),
+                // nunca otimisticamente.
+                e.preventDefault();
+                if (!archivingConn || archiveUazMut.isPending) return;
+                const target = archivingConn;
+                archiveUazMut.mutate(target.id, {
+                  onSuccess: (res) => {
+                    setArchivingConn(null);
+                    toast.success(
+                      res.already_archived
+                        ? `${target.label} já estava fora da operação.`
+                        : `${target.label} foi removida da operação. O histórico foi preservado.`
+                    );
+                  },
+                  onError: (err: any) => {
+                    // Mensagem sempre sanitizada e útil — nunca o texto
+                    // genérico non-2xx, nunca stack/SQL/UUID interno/token
+                    // (ver `archiveErrorMessage` em `useWhatsAppInstances.ts`).
+                    toast.error(err?.message || 'Não foi possível remover a conexão agora.');
+                    // Mantém o modal aberto para o admin tentar de novo ou
+                    // cancelar — nunca fecha silenciosamente num erro.
+                  },
+                });
+              }}
+            >
+              {archiveUazMut.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              Remover da operação
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Modal: Nova Conexão */}
       <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>

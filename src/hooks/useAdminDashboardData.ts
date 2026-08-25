@@ -151,7 +151,8 @@ export function useAdminDashboardData(filters: DashboardFilters) {
         .from('evolution_instances')
         .select('*', { count: 'exact', head: true })
         .eq('organization_id', orgId)
-        .eq('status', 'connected');
+        .eq('status', 'connected')
+        .is('archived_at', null);
 
       const totalLeads = leadsData.length;
       const totalRevenue = uniquePurchases.reduce((acc, p) => acc + Number(p.purchase_value || 0), 0);
