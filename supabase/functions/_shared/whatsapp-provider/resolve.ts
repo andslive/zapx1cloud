@@ -55,7 +55,7 @@ export async function resolveConnectionProvider(
 
   const { data, error } = await supabase
     .from("evolution_instances")
-    .select("id, organization_id, provider")
+    .select("id, organization_id, provider, archived_at")
     .eq("id", connectionId)
     .maybeSingle();
 
@@ -75,6 +75,20 @@ export async function resolveConnectionProvider(
     throw createWhatsAppProviderError(
       "ORG_MISMATCH",
       `Conexão ${connectionId} não pertence à organização informada`,
+    );
+  }
+  // FASE 20I (achado da revisão independente do PR #28) — este era o único
+  // chokepoint de resolução de provider (usado por `dispatchMetaCloudSend`,
+  // por sua vez chamado por `meta-cloud-send/index.ts` diretamente com um
+  // `connection_id` de body, SEM nenhum gate de `archived_at` a montante —
+  // diferente de `uazapi-send/index.ts`, que já filtra `archived_at IS NULL`
+  // antes de chegar aqui) que não recusava uma conexão arquivada. Falha
+  // fechada aqui mesmo, no núcleo compartilhado, protege TODOS os
+  // chamadores atuais e futuros, não só os que já filtram a montante.
+  if (data.archived_at) {
+    throw createWhatsAppProviderError(
+      "CONNECTION_ARCHIVED",
+      `Conexão ${connectionId} está arquivada e não pode ser usada para envio`,
     );
   }
 

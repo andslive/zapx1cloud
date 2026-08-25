@@ -82,6 +82,7 @@ BEGIN
     _connection_id,
     jsonb_build_object(
       'connection_id', _connection_id,
+      'organization_id', _conn.organization_id,
       'old_funnel_id', _old_funnel_id,
       'new_funnel_id', _funnel_id
     )
