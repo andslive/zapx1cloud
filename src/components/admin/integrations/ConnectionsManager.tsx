@@ -15,7 +15,6 @@ import {
   useSyncWhatsAppInstances,
   useCreateWhatsAppInstanceSelf,
   useConnectWhatsAppInstance,
-  useRenameWhatsAppInstanceSelf,
   useDeleteWhatsAppInstanceSelf,
   useUpdateWhatsAppInstanceOffer,
   useSetConnectionDefaultFunnel,
@@ -41,7 +40,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Plus, RefreshCw, MoreVertical, QrCode, Trash2, Info, Loader2, Sparkles, Square, Play, AlertTriangle, User, Search, ArrowUp, ArrowDown, Filter, Pencil, Beaker, Ghost } from 'lucide-react';
+import { Plus, RefreshCw, MoreVertical, QrCode, Trash2, Info, Loader2, Square, Play, AlertTriangle, User, Search, ArrowUp, ArrowDown, Filter, Pencil, Ghost } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useAuth } from '@/hooks/useAuth';
 import { useOrganizationEffectivePlan } from '@/hooks/useOrganizationPlan';
@@ -50,7 +49,6 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { QRCodeCanvas } from 'qrcode.react';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { AdminStatusNotificationConfig } from './AdminStatusNotificationConfig';
-import { SimulateOutageModal } from './SimulateOutageModal';
 import { supabase } from '@/integrations/supabase/client';
 import type { Funnel } from '@/types/funnel';
 import { classifyConnectionForDisplay } from '@/lib/whatsapp/connectionProviderView';
@@ -332,7 +330,6 @@ export default function ConnectionsManager() {
   const { data: uazInstances, isLoading: isLoadingUaz, refetch: refetchUaz } = useWhatsAppInstances();
   const syncUazMut = useSyncWhatsAppInstances();
   const createUazMut = useCreateWhatsAppInstanceSelf();
-  const renameUazMut = useRenameWhatsAppInstanceSelf();
   const deleteUazMut = useDeleteWhatsAppInstanceSelf();
   const updateOfferMut = useUpdateWhatsAppInstanceOffer();
   const { data: allFunnels, isLoading: isLoadingFunnels } = useFunnels();
@@ -349,11 +346,8 @@ export default function ConnectionsManager() {
 
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isQrModalOpen, setIsQrModalOpen] = useState(false);
-  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isOfferModalOpen, setIsOfferModalOpen] = useState(false);
-  const [isSimulateModalOpen, setIsSimulateModalOpen] = useState(false);
   const [connectingUaz, setConnectingUaz] = useState<WhatsAppInstance | null>(null);
-  const [editingUaz, setEditingUaz] = useState<WhatsAppInstance | null>(null);
   const [editingOfferUaz, setEditingOfferUaz] = useState<WhatsAppInstance | null>(null);
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [selectedChromiumId, setSelectedChromiumId] = useState<string | null>(null);
@@ -363,7 +357,6 @@ export default function ConnectionsManager() {
   const [newOffer, setNewOffer] = useState('');
   const [newCreateUaz, setNewCreateUaz] = useState(true);
   const [newCreateChromium, setNewCreateChromium] = useState(true);
-  const [editName, setEditName] = useState('');
   const [editOffer, setEditOffer] = useState('');
 
   // Filtering & Sorting states
@@ -388,8 +381,8 @@ export default function ConnectionsManager() {
   }, [searchParams, isCreateModalOpen, setSearchParams]);
 
   useEffect(() => {
-    console.log('Modals state:', { isCreateModalOpen, isEditModalOpen, isQrModalOpen });
-  }, [isCreateModalOpen, isEditModalOpen, isQrModalOpen]);
+    console.log('Modals state:', { isCreateModalOpen, isQrModalOpen });
+  }, [isCreateModalOpen, isQrModalOpen]);
 
   // Polling da Sessão Web enquanto o modal de QR está aberto
   useEffect(() => {
@@ -724,6 +717,18 @@ export default function ConnectionsManager() {
     const vm = classifyAdminConnection(conn.uaz, conn.chromium);
     if (vm.displayStatus === 'Online') return <Badge className="bg-green-500" title={vm.statusReason}>Online</Badge>;
     if (vm.displayStatus === 'Conectando') return <Badge className="bg-yellow-500 text-black" title={vm.statusReason}>Conectando</Badge>;
+    if (vm.isUnconfirmedOffline) {
+      // FASE 20B — heartbeat "UNKNOWN": não confirma desconexão, só a
+      // ausência de confirmação atual. Badge distinto do "Offline"
+      // confirmado (outline/âmbar, não vermelho sólido) para nunca sugerir
+      // que o ping confirmou queda, mas ainda contada como não-ativa no
+      // agregado (`countAdminConnections`).
+      return (
+        <Badge variant="outline" className="border-amber-500 text-amber-600 dark:text-amber-400" title={vm.statusReason}>
+          Offline — sem resposta atual
+        </Badge>
+      );
+    }
     return <Badge variant="destructive" title={vm.statusReason}>Offline</Badge>;
   };
 
@@ -812,18 +817,14 @@ export default function ConnectionsManager() {
 
           <AdminStatusNotificationConfig organizationId={profile?.organization_id} />
 
-          <Button 
-            variant="outline" 
-            size="sm" 
-            onClick={() => setIsSimulateModalOpen(true)}
-            className="gap-2 border-amber-500/50 hover:bg-amber-500/10 text-amber-600"
-          >
-            <Beaker className="h-4 w-4" />
-            Simular Queda
-          </Button>
+          {/* FASE 20B — botão "Simular Queda" (SimulateOutageModal) removido
+              da UI de produção: toda a ação chamava
+              `simulate_connection_status_change` via `whatsapp-proxy`, ação
+              sem handler correspondente (404 "Action not found").
+              Reimplementar exigiria deploy de Edge Function, fora do escopo
+              desta fase. */}
 
 
-          
           {mergedConnections.some(c => c.isOrphan) && (
             <Button 
               variant="destructive" 
@@ -978,8 +979,13 @@ export default function ConnectionsManager() {
               </TableRow>
             ) : (
               mergedConnections.map((conn) => {
-                const realWaState = conn.uaz?.last_real_whatsapp_state;
-                const isUazConnected = realWaState === 'CONNECTED';
+                // FASE 20B — a coluna "Status UazAPI" usa o MESMO
+                // classificador canônico da coluna "Status Geral"
+                // (`classifyAdminConnection`), em vez de reimplementar a
+                // regra inline: antes as duas colunas podiam divergir (ex.:
+                // heartbeat "UNKNOWN" virava "⚪ Não conectada" aqui, sem
+                // nenhuma distinção do "DISCONNECTED" confirmado).
+                const uazVm = conn.uaz ? classifyAdminConnection(conn.uaz, conn.chromium) : null;
                 const chromStatus = String(
                   conn.chromium?.chromium_status || conn.chromium?.chromiumStatus || conn.chromium?.status || ''
                 ).toLowerCase();
@@ -1025,21 +1031,30 @@ export default function ConnectionsManager() {
                       {formatBrazilianPhone(conn.uaz?.phone_number || conn.chromium?.chromium_number || conn.chromium?.number) || '---'}
                     </TableCell>
                     <TableCell>
-                      {isUazConnected ? (
-                        <Badge className="bg-green-500 cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)}>
+                      {!uazVm ? (
+                        <Badge variant="outline" className="text-muted-foreground">— Sem UazAPI —</Badge>
+                      ) : uazVm.displayStatus === 'Online' ? (
+                        <Badge className="bg-green-500 cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)} title={uazVm.statusReason}>
                           🟢 UazAPI Online
                         </Badge>
-                      ) : (realWaState === 'PAIRING' || realWaState === 'OPENING') ? (
-                        <Badge className="bg-yellow-500 text-black cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)}>
+                      ) : uazVm.displayStatus === 'Conectando' ? (
+                        <Badge className="bg-yellow-500 text-black cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)} title={uazVm.statusReason}>
                           🟡 Conectando
                         </Badge>
-                      ) : (conn.uaz?.status === 'qr_pending') ? (
-                        <Badge variant="secondary" className="cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)}>
-                          🟡 Aguardando QR
-                        </Badge>
+                      ) : uazVm.isUnconfirmedOffline ? (
+                        <div className="flex flex-col gap-1">
+                          <Badge
+                            variant="outline"
+                            className="border-amber-500 text-amber-600 dark:text-amber-400 cursor-pointer"
+                            onClick={() => setConnectingUaz(conn.uaz)}
+                            title={uazVm.statusReason}
+                          >
+                            ⚪ Offline — sem resposta atual
+                          </Badge>
+                        </div>
                       ) : (
                         <div className="flex flex-col gap-1">
-                          <Badge variant="outline" className="text-muted-foreground cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)}>
+                          <Badge variant="outline" className="text-muted-foreground cursor-pointer" onClick={() => setConnectingUaz(conn.uaz)} title={uazVm.statusReason}>
                             ⚪ Não conectada
                           </Badge>
                           {conn.uaz?.last_health_at && (new Date().getTime() - new Date(conn.uaz.last_health_at).getTime() > 120000) && (
@@ -1102,13 +1117,13 @@ export default function ConnectionsManager() {
                         <DropdownMenuContent align="end">
                           {conn.uaz && (
                             <>
-                              <DropdownMenuItem onClick={() => {
-                                setEditingUaz(conn.uaz);
-                                setEditName(conn.uaz.custom_name || conn.uaz.name);
-                                setIsEditModalOpen(true);
-                              }}>
-                                <Sparkles className="h-4 w-4 mr-2" /> Editar Nome Instância
-                              </DropdownMenuItem>
+                              {/* FASE 20B — "Editar Nome Instância" removida da UI de
+                                  produção: chamava `rename_instance_self` via
+                                  `useRenameWhatsAppInstanceSelf()`, ação sem handler
+                                  em `supabase/functions/whatsapp-proxy/index.ts`
+                                  (retornaria 404 "Action not found"). Reimplementar
+                                  exigiria deploy de Edge Function, fora do escopo
+                                  desta fase. */}
                               <DropdownMenuItem onClick={() => {
                                 setEditingOfferUaz(conn.uaz);
                                 setEditOffer(conn.uaz.offer_name || '');
@@ -1300,51 +1315,6 @@ export default function ConnectionsManager() {
         </DialogContent>
       </Dialog>
 
-      {/* Modal: Editar Nome Instância */}
-      <Dialog open={isEditModalOpen} onOpenChange={setIsEditModalOpen}>
-        <DialogContent className="max-w-md">
-          <form onSubmit={(e) => {
-            e.preventDefault();
-            if (!editingUaz || !editName) return;
-            renameUazMut.mutate({ id: editingUaz.id, name: editName }, {
-              onSuccess: () => {
-                setIsEditModalOpen(false);
-                refetchUaz();
-              }
-            });
-          }}>
-            <DialogHeader>
-              <DialogTitle>Editar Nome Instância</DialogTitle>
-              <DialogDescription>
-                Altere o nome da instância exibido no CRM. Isso não altera o identificador no WhatsApp ou UazAPI.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4 py-4">
-              <div className="space-y-2">
-                <Label htmlFor="editName">Nome Visual (Alias)</Label>
-                <Input 
-                  id="editName" 
-                  value={editName} 
-                  onChange={(e) => setEditName(e.target.value)} 
-                  placeholder="Ex: chip21"
-                  autoFocus
-                />
-              </div>
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setIsEditModalOpen(false)}>Cancelar</Button>
-              <Button 
-                type="submit"
-                disabled={renameUazMut.isPending || !editName}
-              >
-                {renameUazMut.isPending && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
-                Salvar
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-
       {/* Uaz Connect Dialog */}
       {connectingUaz && (
         <UazConnectDialog 
@@ -1402,13 +1372,6 @@ export default function ConnectionsManager() {
         </DialogContent>
       </Dialog>
 
-      {/* Modal: Simular Queda */}
-      <SimulateOutageModal
-        isOpen={isSimulateModalOpen}
-        onClose={() => setIsSimulateModalOpen(false)}
-        connections={mergedConnections}
-        organizationId={profile?.organization_id}
-      />
     </div>
 
   );
