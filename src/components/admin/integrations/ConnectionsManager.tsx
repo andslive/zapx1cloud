@@ -10,14 +10,15 @@ import {
   fetchInstanceQr,
 } from '@/hooks/useConnections';
 import { Checkbox } from '@/components/ui/checkbox';
-import { 
-  useWhatsAppInstances, 
+import {
+  useWhatsAppInstances,
   useSyncWhatsAppInstances,
   useCreateWhatsAppInstanceSelf,
   useConnectWhatsAppInstance,
   useDeleteWhatsAppInstanceSelf,
   useUpdateWhatsAppInstanceOffer,
   useSetConnectionDefaultFunnel,
+  useOfficialApiConnections,
   WhatsAppInstance
 } from '@/hooks/useWhatsAppInstances';
 import { useFunnels } from '@/hooks/useFunnels';
@@ -333,6 +334,13 @@ export default function ConnectionsManager() {
 
   // UazAPI hooks
   const { data: uazInstances, isLoading: isLoadingUaz, refetch: refetchUaz } = useWhatsAppInstances();
+  // FASE 20D — API Oficial buscada separadamente via `instances-api`
+  // (nunca embutida na query direta de `evolution_instances` — ver
+  // comentário em `useWhatsAppInstances.ts`). `officialApiUnavailable` só é
+  // `true` quando a busca falhou de verdade E os retries automáticos do
+  // React Query se esgotaram (nunca numa falha transitória isolada) —
+  // usado abaixo para nunca converter uma falha em "Não configurada".
+  const { byInstanceId: officialApiByInstanceIdRaw, unavailable: officialApiUnavailableGlobal, isLoading: isLoadingOfficialApi } = useOfficialApiConnections();
   const syncUazMut = useSyncWhatsAppInstances();
   const createUazMut = useCreateWhatsAppInstanceSelf();
   const deleteUazMut = useDeleteWhatsAppInstanceSelf();
@@ -474,8 +482,15 @@ export default function ConnectionsManager() {
     // arriscar uma regressão de UI por um caminho ainda não exercitado, não
     // um esquecimento. Reforçar o menu de Ações para esse caso é o trabalho
     // recomendado para destravar isso numa fase futura dedicada.
-    const uaz = (uazInstances || []).filter((u) => classifyConnectionForDisplay(u, u.meta_cloud_config) === 'uazapi');
+    // FASE 20D — `meta_cloud_config` não vem mais embutido em `u` (removido
+    // de `useWhatsAppInstances` por falta de GRANT SELECT na tabela
+    // satélite); `classifyConnectionForDisplay` só usa `provider` para essa
+    // decisão (nunca `meta_cloud_config`), então passar `undefined` aqui é
+    // seguro e não muda esse comportamento.
+    const uaz = (uazInstances || []).filter((u) => classifyConnectionForDisplay(u, undefined) === 'uazapi');
     const chrom = chromiumInstances || [];
+    const officialApiByInstanceId = officialApiByInstanceIdRaw;
+    const officialApiFetchOk = !officialApiUnavailableGlobal;
 
     console.log('[AUDIT] UAZAPI CONNECTIONS', { count: uaz.length, items: uaz });
     console.log('[AUDIT] MANAGER CONNECTIONS', { count: chrom.length, items: chrom });
@@ -506,12 +521,14 @@ export default function ConnectionsManager() {
         name: u.custom_name || u.name,
         uaz: u,
         chromium: matchingChrom || null,
-        // FASE 20C — registro satélite da API Oficial embutido na própria
-        // linha UazAPI (FK `evolution_instances_meta_cloud.evolution_instance_id
-        // -> evolution_instances.id`, com FK composta incluindo
-        // organization_id). Sempre `null` hoje (0 linhas satélite reais),
-        // mas propagado em vez de descartado.
-        officialApi: u.meta_cloud_config || null,
+        // FASE 20D — registro satélite da API Oficial buscado via
+        // `instances-api?action=officialApi` (nunca embutido diretamente na
+        // query de `evolution_instances` — ver `useWhatsAppInstances.ts`),
+        // mesclado aqui por `evolution_instance_id` (chave da FK composta
+        // `evolution_instances_meta_cloud.evolution_instance_id ->
+        // evolution_instances.id`, que também inclui `organization_id`).
+        officialApi: officialApiByInstanceId.get(u.id) || null,
+        officialApiUnavailable: !officialApiFetchOk,
         type: 'uaz-first',
         isOrphan: false,
         offer_name: u.offer_name || '---',
@@ -530,6 +547,7 @@ export default function ConnectionsManager() {
           uaz: null,
           chromium: c,
           officialApi: null,
+          officialApiUnavailable: !officialApiFetchOk,
           type: 'chromium-only',
           isOrphan: true,
           offer_name: '---',
@@ -543,7 +561,7 @@ export default function ConnectionsManager() {
 
     console.log('[AUDIT] FINAL TABLE (unfiltered)', { count: results.length, items: results });
     return results;
-  }, [uazInstances, chromiumInstances]);
+  }, [uazInstances, chromiumInstances, officialApiByInstanceIdRaw, officialApiUnavailableGlobal]);
 
   // FASE 20C — view models de 3 canais, SEMPRE derivados do array canônico
   // não filtrado (`allMergedConnections`). Contadores do topo e o filtro de
@@ -562,6 +580,7 @@ export default function ConnectionsManager() {
           webSessionId: conn.chromium?.id ?? null,
           officialApi: conn.officialApi,
           officialApiConnectionId: conn.officialApi ? conn.id : null,
+          officialApiUnavailable: conn.officialApiUnavailable,
           activeFunnel: conn.uaz?.default_funnel_id ?? null,
         }),
       ),
@@ -867,7 +886,15 @@ export default function ConnectionsManager() {
     return groups;
   }, [allMergedConnections]);
 
-  const isLoading = isLoadingUaz || isLoadingChromium;
+  // FASE 20D — inclui o carregamento inicial de API Oficial no gate geral
+  // de loading da tela: sem isso, `officialApiResult` fica `undefined`
+  // durante o primeiro fetch e cada linha marcaria `officialApiUnavailable:
+  // true` (correto para nunca mentir "Não configurada"), mas a tabela
+  // renderizaria momentaneamente um "flash" de "Dados indisponíveis" antes
+  // da resposta real chegar. Esperar o loading inicial evita esse flash
+  // sem reintroduzir o problema original (a distinção erro-real vs.
+  // "Não configurada" continua intacta para qualquer falha PÓS-loading).
+  const isLoading = isLoadingUaz || isLoadingChromium || isLoadingOfficialApi;
 
   // FASE 20C — "Total"/"Limite"/contadores do topo contam só conexões
   // REGISTRADAS (linhas com `conn.uaz` real — mesmo escopo que "Ativas"
@@ -1252,6 +1279,18 @@ export default function ConnectionsManager() {
                             return <Badge variant="destructive" title={vm.officialApiStatusReason}>Erro</Badge>;
                           case 'Offline':
                             return <Badge variant="destructive" title={vm.officialApiStatusReason}>Offline</Badge>;
+                          case 'Dados indisponíveis':
+                            // FASE 20D — núcleo da correção de segurança:
+                            // uma falha ao CONSULTAR a API Oficial (permissão/
+                            // rede/backend) precisa aparecer visualmente
+                            // distinta de "Não configurada" — nunca cair no
+                            // `default` abaixo, que afirmaria (incorretamente)
+                            // que não existe nenhuma conexão configurada.
+                            return (
+                              <Badge variant="destructive" className="gap-1" title={vm.officialApiStatusReason}>
+                                <AlertTriangle className="h-3 w-3" /> Dados indisponíveis
+                              </Badge>
+                            );
                           case 'Não configurada':
                           default:
                             return (
