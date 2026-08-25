@@ -188,3 +188,404 @@ export function countAdminConnections(rows: readonly AdminConnectionViewModel[])
   }
   return { total: rows.length, online, offline, connecting };
 }
+
+// ============================================================================
+// FASE 20C — modelo de TRÊS canais independentes (UazAPI, Sessão Web/Chromium,
+// API Oficial/HookCloud-Meta).
+//
+// Causa raiz corrigida aqui: as Fases 20A/20B já impediram Chromium de
+// determinar o status geral de uma conexão UazAPI (`classifyAdminConnection`
+// acima), mas o módulo inteiro ainda não tinha NENHUM conceito de "API
+// Oficial" — o dado real existe (`evolution_instances_meta_cloud`, FK
+// `evolution_instance_id -> evolution_instances.id` com FK composta incluindo
+// `organization_id`, já embutido como `meta_cloud_config` pela Fase 18C em
+// `useWhatsAppInstances.ts`), mas `ConnectionsManager.tsx` descartava a linha
+// inteira antes do merge (`classifyConnectionForDisplay(...) !== 'uazapi'`)
+// sempre que o provider não era UazAPI, e nunca lia `meta_cloud_config` para
+// as linhas UazAPI que o mantêm (coexistência: uma linha UazAPI pode ter uma
+// API Oficial em onboarding associada à MESMA linha via
+// `evolution_instances_meta_cloud.evolution_instance_id = evolution_instances.id`
+// — ver coluna `coexistence_enabled` na migration
+// `20260810120000_meta_cloud_api_foundation.sql`).
+//
+// NOTA DE RISCO RESIDUAL (documentada, não corrigida nesta fase): em teste
+// direto contra o banco linkado, o role `authenticated` NÃO tem grant SELECT
+// em `evolution_instances_meta_cloud` (só `service_role` tem) — um `SELECT`
+// ou embed PostgREST feito pelo cliente autenticado falha com
+// `42501 permission denied`. Isso é pré-existente (Fase 18C, já em
+// `origin/main`, fora do diff deste PR) e como hoje existem 0 linhas reais
+// nessa tabela o resultado observável não muda (sempre "Não configurada"),
+// mas é um bug latente que pode quebrar a query inteira de
+// `useWhatsAppInstances()` no dia em que uma linha satélite real existir.
+// Corrigir exigiria uma migration (`GRANT SELECT ... TO authenticated`, com
+// exposição cuidadosa das colunas — a tabela também guarda
+// `access_token_secret_ref`/hashes de webhook), fora do escopo autorizado
+// desta fase. Reportado, não corrigido.
+//
+// A Sessão Web (Chromium) continua sem nenhuma FK real (API REST externa na
+// VPS `api.x1zap.cloud`, sem tabela Postgres, sem `organization_id`) — a
+// associação com a linha UazAPI é herdada da heurística pré-existente de
+// `ConnectionsManager.tsx` (campo inexistente -> telefone normalizado -> nome
+// normalizado), que este módulo NÃO redesenha (fora do escopo autorizado:
+// exigiria uma coluna nova, ex. `evolution_instances.chromium_instance_id`).
+// Este módulo só classifica o resultado já resolvido pelo merge existente.
+
+export type WebSessionStatus =
+  | "Online"
+  | "Offline"
+  | "Aguardando QR"
+  | "Não configurada"
+  | "Sem resposta atual"
+  | "Erro";
+
+const WEB_SESSION_QR_RAW_STATES = new Set(["qr_pending", "qr", "pairing"]);
+
+/**
+ * Classifica o canal Sessão Web (Chromium) com o vocabulário completo pedido
+ * pela Fase 20C. Reaproveita `classifyChromiumAuxStatus` (já testado) como
+ * base e só adiciona a distinção Aguardando QR / Não configurada / Sem
+ * resposta atual / Erro em cima dela — nunca reimplementa a regra de
+ * "conectado".
+ */
+export function classifyWebSessionChannel(
+  chrom: ChromiumAuxRaw | null | undefined,
+): { status: WebSessionStatus; reason: string } {
+  if (!chrom) {
+    return {
+      status: "Não configurada",
+      reason: "Nenhuma sessão Web (Chromium) associada a esta conexão.",
+    };
+  }
+  const aux = classifyChromiumAuxStatus(chrom);
+  const raw = String(chrom.chromium_status ?? chrom.chromiumStatus ?? chrom.status ?? "").toLowerCase();
+
+  if (raw === "error" || raw === "erro") {
+    return { status: "Erro", reason: `Sessão Web reportou erro ("${raw}").` };
+  }
+  if (aux === "online") {
+    return { status: "Online", reason: "Sessão Web (Chromium) conectada." };
+  }
+  if (aux === "connecting" || WEB_SESSION_QR_RAW_STATES.has(raw)) {
+    return { status: "Aguardando QR", reason: "Sessão Web em pareamento (aguardando leitura de QR Code)." };
+  }
+  if (aux === "unknown") {
+    return {
+      status: "Sem resposta atual",
+      reason: "Sessão Web sem status recente reportado pela VPS (api.x1zap.cloud).",
+    };
+  }
+  return { status: "Offline", reason: "Sessão Web (Chromium) desconectada." };
+}
+
+export type OfficialApiStatus = "Não configurada" | "Pendente" | "Online" | "Offline" | "Erro";
+/** `unknown` = `onboarding_source` presente mas com valor não reconhecido (ex.: `evohub`) — falha fechada, nunca vira `hookcloud`/`direct_meta` por adivinhação. */
+export type OfficialApiSource = "hookcloud" | "direct_meta" | "unknown" | null;
+
+export interface OfficialApiRaw {
+  onboarding_state?: string | null;
+  onboarding_source?: string | null;
+  phone_number_id?: string | null;
+}
+
+/** Estados de onboarding que ainda não confirmam a API Oficial como operacional, mas também não são erro/desligada. */
+const PENDING_ONBOARDING_STATES = new Set(["pending", "code_exchanged", "waba_linked", "webhook_subscribed"]);
+
+export function classifyOfficialApiSource(source: string | null | undefined): OfficialApiSource {
+  if (source === "hookcloud") return "hookcloud";
+  if (source === "direct_meta") return "direct_meta";
+  if (source) return "unknown";
+  return null;
+}
+
+/**
+ * Classifica o canal API Oficial (HookCloud/Meta Cloud) a partir do registro
+ * satélite `evolution_instances_meta_cloud` (já resolvido/embutido pelo
+ * chamador — este módulo nunca faz I/O). Sem registro -> "Não configurada"
+ * (nunca "Não conectada" — não é uma queda, é ausência de configuração).
+ * Falha fechada: `onboarding_state` desconhecido nunca vira "Online".
+ */
+export function classifyOfficialApi(
+  metaCloud: OfficialApiRaw | null | undefined,
+): { status: OfficialApiStatus; reason: string; source: OfficialApiSource } {
+  const source = classifyOfficialApiSource(metaCloud?.onboarding_source);
+  const state = metaCloud?.onboarding_state ?? null;
+
+  if (!metaCloud || !state) {
+    return {
+      status: "Não configurada",
+      reason: "Nenhuma conexão API Oficial (HookCloud/Meta Cloud) configurada para esta linha.",
+      source,
+    };
+  }
+  if (state === "active") {
+    return { status: "Online", reason: "API Oficial ativa (onboarding_state=\"active\").", source };
+  }
+  if (state === "error") {
+    return { status: "Erro", reason: "API Oficial em estado de erro (onboarding_state=\"error\").", source };
+  }
+  if (state === "offboarded") {
+    return { status: "Offline", reason: "API Oficial desativada (onboarding_state=\"offboarded\").", source };
+  }
+  if (PENDING_ONBOARDING_STATES.has(state)) {
+    return { status: "Pendente", reason: `API Oficial em processo de onboarding (estado "${state}").`, source };
+  }
+  return {
+    status: "Offline",
+    reason: `API Oficial em estado não reconhecido ("${state}") — falha fechada, nunca "Online".`,
+    source,
+  };
+}
+
+export type OverallStatus =
+  | "Online"
+  | "Parcial"
+  | "Offline"
+  | "Somente UazAPI"
+  | "Somente Sessão Web"
+  | "Somente API Oficial"
+  | "Sem canais configurados";
+
+type ChannelBucket = "online" | "down" | "neutral";
+
+function uazapiBucket(status: DisplayStatus | "Não configurada"): ChannelBucket {
+  if (status === "Não configurada") return "neutral";
+  if (status === "Online") return "online";
+  return "down"; // Conectando, Offline, Offline — sem resposta atual, Desconhecido
+}
+
+function webSessionBucket(status: WebSessionStatus): ChannelBucket {
+  if (status === "Não configurada") return "neutral";
+  if (status === "Online") return "online";
+  return "down"; // Offline, Aguardando QR, Sem resposta atual, Erro
+}
+
+function officialApiBucket(status: OfficialApiStatus): ChannelBucket {
+  // "Pendente" nunca reduz o Status Geral (não é uma falha, é onboarding em
+  // andamento) — tratada como neutra para fins de agregação, igual a "Não
+  // configurada"; a nota "API Oficial pendente" é adicionada separadamente.
+  if (status === "Não configurada" || status === "Pendente") return "neutral";
+  if (status === "Online") return "online";
+  return "down"; // Offline, Erro
+}
+
+/**
+ * Implementa exatamente a matriz da Fase 20C (Parte 7): um canal ausente/
+ * "Não configurada" (ou "Pendente" para API Oficial) NUNCA reduz o Status
+ * Geral. "Parcial" só existe quando um canal configurado está indisponível
+ * E outro canal configurado continua operacional.
+ */
+export function computeOverallStatus(
+  uazapiStatus: DisplayStatus | "Não configurada",
+  webSessionStatus: WebSessionStatus,
+  officialApiStatus: OfficialApiStatus,
+): { status: OverallStatus; reason: string } {
+  const buckets: Array<{ channel: "UazAPI" | "Sessão Web" | "API Oficial"; bucket: ChannelBucket }> = [
+    { channel: "UazAPI", bucket: uazapiBucket(uazapiStatus) },
+    { channel: "Sessão Web", bucket: webSessionBucket(webSessionStatus) },
+    { channel: "API Oficial", bucket: officialApiBucket(officialApiStatus) },
+  ];
+  const configured = buckets.filter((b) => b.bucket !== "neutral");
+  const online = configured.filter((b) => b.bucket === "online");
+  const pendingNote = officialApiStatus === "Pendente" ? " (API Oficial pendente)" : "";
+
+  if (configured.length === 0) {
+    return { status: "Sem canais configurados", reason: "Nenhum canal (UazAPI, Sessão Web, API Oficial) configurado para esta conexão." };
+  }
+  if (configured.length === 1) {
+    const only = configured[0];
+    if (only.bucket === "online") {
+      const label = only.channel === "UazAPI" ? "Somente UazAPI" : only.channel === "Sessão Web" ? "Somente Sessão Web" : "Somente API Oficial";
+      return { status: label as OverallStatus, reason: `Único canal configurado (${only.channel}) está online.${pendingNote}` };
+    }
+    return { status: "Offline", reason: `Único canal configurado (${only.channel}) está indisponível.${pendingNote}` };
+  }
+  if (online.length === configured.length) {
+    return { status: "Online", reason: `Todos os ${configured.length} canais configurados estão online.${pendingNote}` };
+  }
+  if (online.length === 0) {
+    return { status: "Offline", reason: `Nenhum dos ${configured.length} canais configurados está online.${pendingNote}` };
+  }
+  return {
+    status: "Parcial",
+    reason: `${online.length} de ${configured.length} canais configurados estão online — pelo menos um canal configurado está indisponível.${pendingNote}`,
+  };
+}
+
+export interface ThreeChannelCapabilities {
+  supportsQr: boolean;
+  supportsReconnect: boolean;
+  supportsDelete: boolean;
+}
+
+export interface ThreeChannelConnectionViewModel {
+  rowId: string;
+  organizationId: string | null;
+  offerId: string | null;
+  offerLabel: string;
+  whatsappIdentity: string | null;
+
+  uazapiConnectionId: string | null;
+  uazapiStatus: DisplayStatus | "Não configurada";
+  uazapiStatusReason: string;
+  uazapiLastActivityAt: string | null;
+  uazapiIsUnconfirmedOffline: boolean;
+
+  webSessionId: string | null;
+  webSessionStatus: WebSessionStatus;
+  webSessionStatusReason: string;
+  webSessionLastActivityAt: string | null;
+
+  officialApiConnectionId: string | null;
+  officialApiSource: OfficialApiSource;
+  officialApiStatus: OfficialApiStatus;
+  officialApiStatusReason: string;
+  officialApiLastActivityAt: string | null;
+
+  overallStatus: OverallStatus;
+  overallStatusReason: string;
+
+  activeFunnel: string | null;
+
+  uazapi: ThreeChannelCapabilities;
+  webSession: ThreeChannelCapabilities;
+  officialApi: ThreeChannelCapabilities;
+}
+
+export interface ThreeChannelRawInput {
+  rowId: string;
+  organizationId?: string | null;
+  offerId?: string | null;
+  offerLabel?: string | null;
+  whatsappIdentity?: string | null;
+  uazapi: AdminConnectionRaw | null | undefined;
+  webSession: ChromiumAuxRaw | null | undefined;
+  webSessionId?: string | null;
+  officialApi: OfficialApiRaw | null | undefined;
+  officialApiConnectionId?: string | null;
+  activeFunnel?: string | null;
+}
+
+/**
+ * Compositor único dos três canais independentes. Nunca deixa a ausência de
+ * um canal opcional (Sessão Web/API Oficial) contaminar o status dos demais
+ * — cada `classify*` é chamado isoladamente, e só `computeOverallStatus`
+ * combina os três resultados já prontos.
+ */
+export function classifyThreeChannelConnection(input: ThreeChannelRawInput): ThreeChannelConnectionViewModel {
+  const isStandaloneOfficialRow = !input.uazapi && input.officialApi != null;
+
+  let uazapiStatus: DisplayStatus | "Não configurada";
+  let uazapiStatusReason: string;
+  let uazapiIsUnconfirmedOffline = false;
+  let uazapiConnectionId: string | null = null;
+  let uazapiLastActivityAt: string | null = null;
+  let uazapiCaps: ThreeChannelCapabilities = { supportsQr: false, supportsReconnect: false, supportsDelete: false };
+
+  if (!input.uazapi) {
+    uazapiStatus = "Não configurada";
+    uazapiStatusReason = "Nenhuma instância UazAPI associada a esta linha.";
+  } else if (input.uazapi.provider === "meta_cloud") {
+    // Linha primária é uma conexão API Oficial standalone (sem UazAPI) —
+    // provider explicitamente diferente, nunca tratado como "Desconhecido"/
+    // falha (que é reservado a providers realmente desconhecidos).
+    uazapiStatus = "Não configurada";
+    uazapiStatusReason = "Esta conexão usa provider \"meta_cloud\" — não há canal UazAPI para esta linha.";
+  } else {
+    const vm = classifyAdminConnection(input.uazapi, input.webSession);
+    uazapiStatus = vm.displayStatus;
+    uazapiStatusReason = vm.statusReason;
+    uazapiIsUnconfirmedOffline = vm.isUnconfirmedOffline;
+    uazapiConnectionId = vm.connectionId || null;
+    uazapiLastActivityAt = null;
+    uazapiCaps = { supportsQr: vm.supportsQr, supportsReconnect: vm.supportsReconnect, supportsDelete: vm.supportsDelete };
+  }
+
+  const webSessionRaw = input.webSession ?? null;
+  const webSessionClassified = classifyWebSessionChannel(webSessionRaw);
+  const webSessionId = input.webSessionId ?? null;
+  const webSessionCaps: ThreeChannelCapabilities = {
+    supportsQr: webSessionClassified.status !== "Não configurada",
+    supportsReconnect: webSessionClassified.status !== "Não configurada",
+    supportsDelete: webSessionClassified.status !== "Não configurada",
+  };
+
+  const officialApiClassified = classifyOfficialApi(input.officialApi ?? null);
+  const officialApiConnectionId = input.officialApiConnectionId ?? null;
+  const officialApiCaps: ThreeChannelCapabilities = {
+    supportsQr: false, // API Oficial nunca usa QR Code
+    supportsReconnect: officialApiClassified.status !== "Não configurada",
+    supportsDelete: officialApiClassified.status !== "Não configurada",
+  };
+
+  const overall = computeOverallStatus(uazapiStatus, webSessionClassified.status, officialApiClassified.status);
+
+  void isStandaloneOfficialRow; // reservado para telemetria futura; sem efeito na classificação hoje.
+
+  return {
+    rowId: input.rowId,
+    organizationId: input.organizationId ?? null,
+    offerId: input.offerId ?? null,
+    offerLabel: input.offerLabel && input.offerLabel.trim() ? input.offerLabel : "Sem oferta",
+    whatsappIdentity: input.whatsappIdentity ?? null,
+
+    uazapiConnectionId,
+    uazapiStatus,
+    uazapiStatusReason,
+    uazapiLastActivityAt,
+    uazapiIsUnconfirmedOffline,
+
+    webSessionId,
+    webSessionStatus: webSessionClassified.status,
+    webSessionStatusReason: webSessionClassified.reason,
+    webSessionLastActivityAt: null,
+
+    officialApiConnectionId,
+    officialApiSource: officialApiClassified.source,
+    officialApiStatus: officialApiClassified.status,
+    officialApiStatusReason: officialApiClassified.reason,
+    officialApiLastActivityAt: null,
+
+    overallStatus: overall.status,
+    overallStatusReason: overall.reason,
+
+    activeFunnel: input.activeFunnel ?? null,
+
+    uazapi: uazapiCaps,
+    webSession: webSessionCaps,
+    officialApi: officialApiCaps,
+  };
+}
+
+export interface ThreeChannelCounts {
+  total: number;
+  operational: number;
+  offline: number;
+  uazapiOnline: number;
+  webSessionOnline: number;
+  officialApiOnline: number;
+}
+
+/**
+ * Contadores canônicos do topo — SEMPRE derivados do mesmo array de view
+ * models (nunca uma contagem separada, nunca filtrado pelos filtros da UI:
+ * o chamador deve passar o array COMPLETO, não o array já filtrado para
+ * exibição — caso contrário os contadores mudam quando o usuário filtra a
+ * tabela, o que seria enganoso).
+ */
+export function countThreeChannelConnections(rows: readonly ThreeChannelConnectionViewModel[]): ThreeChannelCounts {
+  let operational = 0;
+  let offline = 0;
+  let uazapiOnline = 0;
+  let webSessionOnline = 0;
+  let officialApiOnline = 0;
+  for (const row of rows) {
+    const hasOnlineChannel =
+      row.uazapiStatus === "Online" || row.webSessionStatus === "Online" || row.officialApiStatus === "Online";
+    if (hasOnlineChannel) operational++;
+    else offline++;
+    if (row.uazapiStatus === "Online") uazapiOnline++;
+    if (row.webSessionStatus === "Online") webSessionOnline++;
+    if (row.officialApiStatus === "Online") officialApiOnline++;
+  }
+  return { total: rows.length, operational, offline, uazapiOnline, webSessionOnline, officialApiOnline };
+}
