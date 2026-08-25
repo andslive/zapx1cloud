@@ -250,12 +250,15 @@ async function handleAdminStatusAlert(supabase: any, instance: any, newState: st
     
     const message = `${emoji} *${title}*\n\n*Instância:* ${instance.name}\n*Número:* +${instance.phone_number || "Desconhecido"}\n*Estado Anterior:* ${oldRealState || oldStatus}\n*Estado Atual:* ${newState}\n*Motivo:* ${reason}\n*Horário:* ${timestamp}\n\n_Ação sugerida: Verifique a instância no painel de Conexões._`;
 
-    // Find a healthy instance to send the alert
+    // Find a healthy instance to send the alert.
+    // FASE 20H — uma conexão arquivada nunca pode ser escolhida como
+    // remetente do alerta administrativo.
     const { data: sender } = await supabase
         .from("evolution_instances")
         .select("*")
         .eq("status", "connected")
         .eq("organization_id", orgId)
+        .is("archived_at", null)
         .limit(1)
         .maybeSingle();
 
@@ -698,8 +701,11 @@ Deno.serve(async (req) => {
     }
 
     // 2. Health Monitoring
-    let query = supabase.from("evolution_instances").select("*");
-    
+    // FASE 20H — o cron de health monitoring nunca processa conexão
+    // arquivada como se fosse ativa (nenhum ping/reparo/sync automático
+    // para uma conexão retirada da operação).
+    let query = supabase.from("evolution_instances").select("*").is("archived_at", null);
+
     if (payload.organization_id) {
         query = query.eq("organization_id", payload.organization_id);
     }

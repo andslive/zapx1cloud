@@ -1345,10 +1345,14 @@ ${formResponses ? `\nRespostas do Formulário:\n${formResponses}` : ''}`;
       if (whatsappProvider === 'evolution_go') {
         const preferredInstanceId = (provSettings?.evolution_instance_id as string) || null;
 
+        // FASE 20H — nunca resolve uma conexão arquivada, nem via
+        // `preferredInstanceId` salvo previamente nem no fallback
+        // "primeira conectada".
         let instanceQuery = supabase
           .from('evolution_instances')
           .select('id, name, status')
-          .eq('organization_id', webhook.organization_id);
+          .eq('organization_id', webhook.organization_id)
+          .is('archived_at', null);
 
         if (preferredInstanceId) {
           instanceQuery = instanceQuery.eq('id', preferredInstanceId);
@@ -1695,11 +1699,13 @@ ${formResponses ? `\nRespostas do Formulário:\n${formResponses}` : ''}`;
 
         if (messageText) {
           // Resolve instância
+          // FASE 20H — mesma regra: nunca resolve conexão arquivada.
           const preferredInstanceId = config.flow_evolution_instance_id || null;
           let instanceQuery = supabase
             .from('evolution_instances')
             .select('id, name, status')
-            .eq('organization_id', webhook.organization_id);
+            .eq('organization_id', webhook.organization_id)
+            .is('archived_at', null);
           if (preferredInstanceId) {
             instanceQuery = instanceQuery.eq('id', preferredInstanceId);
           } else {

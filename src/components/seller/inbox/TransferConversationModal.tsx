@@ -169,6 +169,7 @@ export function TransferConversationModal({
         .from('evolution_instances')
         .select('id, name, phone_number, status, provider')
         .eq('organization_id', profile.organization_id)
+        .is('archived_at', null)
         .order('is_default', { ascending: false })
         .order('name', { ascending: true });
       if (error) throw error;

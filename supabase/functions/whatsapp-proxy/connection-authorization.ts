@@ -74,6 +74,7 @@ export type AuthorizeConnectionResult =
   | { kind: "service_role_organization_required" }
   | { kind: "not_found" } // cobre também "pertence a outra organização" — nunca distinguível pelo chamador
   | { kind: "unsupported_provider" }
+  | { kind: "archived" } // FASE 20H — conexão arquivada: nenhuma ação de transporte pode prosseguir
   | { kind: "authorized"; instance: Record<string, any> };
 
 /**
@@ -142,6 +143,18 @@ export async function authorizeUazapiConnectionAccess(
     return { kind: "unsupported_provider" };
   }
 
+  // FASE 20H — conexão arquivada (`archived_at IS NOT NULL`) nunca pode
+  // seguir para nenhuma ação de transporte (`connect_instance`,
+  // `repair_webhook`, `check_webhook`, `delete_instance_self`) — nenhum
+  // novo job/reparo/reconexão/sincronização pode ser iniciado por uma
+  // conexão retirada da operação. Checado DEPOIS do escopo de organização/
+  // provider (mesma ordem de gates da Fase 18D), nunca antes — uma
+  // conexão arquivada de outra organização continua indistinguível de uma
+  // inexistente para quem não tem acesso a ela.
+  if (instance.archived_at) {
+    return { kind: "archived" };
+  }
+
   return { kind: "authorized", instance };
 }
 
@@ -167,5 +180,103 @@ export function authorizationFailureResponseBody(
       return { status: 404, body: { error: "Not found" } };
     case "unsupported_provider":
       return { status: 409, body: { ok: false, error: "unsupported_provider" } };
+    case "archived":
+      return { status: 409, body: { ok: false, error: "archived" } };
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FASE 20H — autorização dedicada para `archive_instance`.
+//
+// Deliberadamente SEPARADA de `authorizeUazapiConnectionAccess`: aquela
+// função autoriza usuário comum/admin da PRÓPRIA organização OU
+// super_admin, e só aceita provider UazAPI (`isUazapiInstance`).
+// `archive_instance` tem uma política mais restrita, exigida
+// explicitamente pela Fase 20H:
+//   1) só super_admin real, comprovado no banco via a MESMA RPC
+//      `is_super_admin` já usada acima (nunca um claim do cliente, nunca
+//      um usuário comum/admin de organização — mesmo que seja dono da
+//      própria conexão);
+//   2) qualquer provider conhecido (`uazapi`, `meta_cloud`, ou legado
+//      sem `provider` tratado como `uazapi` pela mesma retrocompatibilidade
+//      da Fase 18C) — arquivamento não é uma ação de transporte UazAPI,
+//      então não usa `isUazapiInstance`/`isSupportedArchiveProvider`
+//      aqui; a validação de provider acontece depois de resolver a
+//      instância, no chamador (`index.ts`), porque só ali sabemos qual
+//      linha foi encontrada.
+// Nunca aceita `organization_id` do body — um super_admin comprovado
+// opera qualquer organização, sempre a partir da linha real encontrada
+// depois desta autorização, nunca de texto do cliente.
+export type AuthorizeSuperAdminResult =
+  | { kind: "unauthenticated" }
+  | { kind: "profile_invalid" }
+  | { kind: "not_super_admin" }
+  | { kind: "authorized" };
+
+export async function authorizeSuperAdminForArchive(params: {
+  supabase: SupabaseAdminLike;
+  userId: string | null;
+}): Promise<AuthorizeSuperAdminResult> {
+  const { supabase, userId } = params;
+
+  if (!userId) {
+    return { kind: "unauthenticated" };
+  }
+
+  const { data: profile, error: profileErr } = await supabase
+    .from("profiles")
+    .select("id, is_active")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (profileErr || !profile) {
+    return { kind: "profile_invalid" };
+  }
+  if (profile.is_active === false) {
+    return { kind: "profile_invalid" };
+  }
+
+  const { data: isSuper } = await supabase.rpc("is_super_admin", { _user_id: userId });
+  if (isSuper !== true) {
+    return { kind: "not_super_admin" };
+  }
+
+  return { kind: "authorized" };
+}
+
+export function superAdminAuthorizationFailureResponseBody(
+  result: Exclude<AuthorizeSuperAdminResult, { kind: "authorized" }>,
+): { status: number; body: Record<string, unknown> } {
+  switch (result.kind) {
+    case "unauthenticated":
+      return { status: 401, body: { error: "Unauthorized" } };
+    case "profile_invalid":
+      return { status: 403, body: { error: "forbidden" } };
+    case "not_super_admin":
+      // FASE 20H — deliberadamente o MESMO status/corpo de `profile_invalid`
+      // (403 `{ error: "forbidden" }`), nunca uma mensagem distinta tipo
+      // "requer super_admin": nenhuma pista sobre POR QUE foi negado, nem
+      // sobre a existência da conexão-alvo, deve vazar para um chamador
+      // não autorizado.
+      return { status: 403, body: { error: "forbidden" } };
+  }
+}
+
+/**
+ * FASE 20H — resolve o provider real de uma linha `evolution_instances`
+ * para fins de `archive_instance`: `uazapi`, `meta_cloud`, ou `null` para
+ * QUALQUER outro valor (falha fechada — nunca arquiva um provider que o
+ * código não conhece explicitamente). Legado sem `provider` (null/vazio)
+ * é tratado como `uazapi`, mesma retrocompatibilidade de `isUazapiInstance`
+ * (Fase 18C) — conexões de produção criadas antes da coluna `provider`
+ * existir dependem disso.
+ */
+export function resolveKnownArchiveProvider(
+  instance: { provider?: string | null } | null | undefined,
+): "uazapi" | "meta_cloud" | null {
+  if (!instance) return null;
+  const provider = instance.provider;
+  if (provider === null || provider === undefined || provider === "") return "uazapi";
+  if (provider === "uazapi" || provider === "meta_cloud") return provider;
+  return null;
 }

@@ -136,7 +136,7 @@ serve(async (req) => {
       // Auditoria e Debug
       const { data: allInstances } = await supabase
         .from('evolution_instances')
-        .select('id, name, phone_number, status')
+        .select('id, name, phone_number, status, is_default, archived_at')
         .eq('organization_id', orgId);
       
       const resolvedInstance = allInstances?.find(i => i.id === resolvedInstanceId);
@@ -160,9 +160,14 @@ serve(async (req) => {
       }
 
       if (!resolvedInstanceId) {
-        const defaultInst = allInstances?.filter(i => i.status === 'connected' || i.status === 'online')
+        // FASE 20H — o fallback "primeira conectada" nunca escolhe uma
+        // conexão arquivada. Não altera o ramo acima (conexão já vinculada
+        // explicitamente) — se ela estiver arquivada, o requisito
+        // pré-existente "não trocar sozinho" continua valendo, e o envio
+        // real (via `uazapi-send`) falha fechado do mesmo jeito.
+        const defaultInst = allInstances?.filter(i => (i.status === 'connected' || i.status === 'online') && !i.archived_at)
           .sort((a, b) => (a.is_default === b.is_default ? 0 : a.is_default ? -1 : 1))[0];
-        
+
         resolvedInstanceId = defaultInst?.id || null;
         resolutionSource = "fallback_default";
       }

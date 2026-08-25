@@ -43,7 +43,8 @@ export function FunnelChannelsTab({ funnel }: FunnelChannelsTabProps) {
         .from('evolution_instances')
         .select('id, name, phone_number, status, provider, organization_id, is_active')
         .eq('organization_id', funnel.organization_id)
-        .eq('is_active', true);
+        .eq('is_active', true)
+        .is('archived_at', null);
       // FASE 18D — este seletor persiste `evolution_instance_id` no funil
       // (o funil VAI enviar mensagens por essa conexão). Uma conexão
       // Meta/HookCloud pendente (ou provider desconhecido) nunca pode

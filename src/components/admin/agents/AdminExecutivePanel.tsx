@@ -112,6 +112,7 @@ export function AdminExecutivePanel({ compact = false }: AdminExecutivePanelProp
         .from('evolution_instances')
         .select('id, name, status, is_default, phone_number, provider')
         .eq('organization_id', profile.organization_id)
+        .is('archived_at', null)
         .order('is_default', { ascending: false });
       // FASE 18E — este painel envia uma mensagem de teste REAL via
       // `admin-agent-handle-inbound` usando `instance_id` (inclusive por

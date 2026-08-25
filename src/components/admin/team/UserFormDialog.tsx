@@ -70,7 +70,8 @@ export function UserFormDialog({ member, open, onOpenChange }: UserFormDialogPro
       const { data, error } = await supabase
         .from('evolution_instances')
         .select('id, name, phone_number, provider')
-        .eq('organization_id', profile.organization_id);
+        .eq('organization_id', profile.organization_id)
+        .is('archived_at', null);
       if (error) return [];
       // FASE 18D — este seletor persiste `default_connection_id` (o
       // vendedor manda mensagem por essa conexão por padrão) e também

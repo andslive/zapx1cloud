@@ -370,21 +370,26 @@ export async function runPostSaleActions(
     try {
       // Pré-checagem: instância WhatsApp precisa estar conectada antes de tentar enviar.
       // Se a action tem instance_id específico, valida ela; senão, basta existir alguma `connected` na org.
+      // FASE 20H — pré-checagem nunca considera conexão arquivada
+      // "conectada", nem por `evolution_instance_id` explícito nem no
+      // fallback "qualquer conectada da org" — evita disparar outreach
+      // pós-venda de IA por uma conexão retirada da operação.
       let instanceOk = false;
       if (action.evolution_instance_id) {
         const { data: inst } = await supabase
           .from('evolution_instances')
-          .select('status')
+          .select('status, archived_at')
           .eq('id', action.evolution_instance_id)
           .eq('organization_id', ctx.organizationId)
           .maybeSingle();
-        instanceOk = inst?.status === 'connected' || inst?.status === 'online';
+        instanceOk = !inst?.archived_at && (inst?.status === 'connected' || inst?.status === 'online');
       } else {
         const { data: anyInst } = await supabase
           .from('evolution_instances')
           .select('id')
           .eq('organization_id', ctx.organizationId)
           .or('status.eq.connected,status.eq.online')
+          .is('archived_at', null)
           .limit(1)
           .maybeSingle();
         instanceOk = !!anyInst?.id;

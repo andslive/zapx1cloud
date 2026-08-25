@@ -201,9 +201,14 @@ export async function handleUazapiSendRequest(req: Request): Promise<Response> {
 
     let instance: any;
     if (instance_id) {
-      const { data } = await supabase.from("evolution_instances").select("*").eq("id", instance_id).eq("organization_id", organization_id).single();
+      // FASE 20H — este é o chokepoint real de envio do CRM (ver
+      // comentário abaixo); uma conexão arquivada (`archived_at IS NOT
+      // NULL`) nunca pode ser resolvida aqui, mesmo com `instance_id`
+      // explícito — cai no mesmo ramo `INSTANCE_NOT_FOUND` sanitizado
+      // abaixo, nunca envia por ela.
+      const { data } = await supabase.from("evolution_instances").select("*").eq("id", instance_id).eq("organization_id", organization_id).is("archived_at", null).maybeSingle();
       instance = data;
-    } 
+    }
 
     if (!instance) {
       return new Response(JSON.stringify({ 

@@ -2977,7 +2977,16 @@ Deno.serve(async (req) => {
     // possível — ver relatório da Fase 18I para o plano de correção
     // separado (exigiria autenticação real do webhook e/ou constraint de
     // unicidade, fora do escopo de "isolamento HookCloud" desta PR).
-    const textCandidates = (rawInstances || []).filter((i) => isUazapiInstance(i));
+    // FASE 20H — mesmo princípio e mesmo ponto de aplicação do filtro
+    // `isUazapiInstance` da Fase 18I (excluir ANTES de qualquer lógica de
+    // prioridade, nunca depois): uma conexão arquivada (`archived_at IS
+    // NOT NULL`) nunca pode ser candidata a resolver um evento inbound —
+    // falha fechada antes de qualquer criação/atualização de
+    // lead/conversa/mensagem. Deliberadamente distinto de `is_active`
+    // (coluna pré-existente, usada abaixo só para o redirecionamento
+    // "parceiro ativo" por mesmo `phone_number" — semântica diferente,
+    // não tocada aqui).
+    const textCandidates = (rawInstances || []).filter((i) => isUazapiInstance(i) && !i.archived_at);
 
     console.log("[uazapi-webhook] candidates found:", textCandidates?.length || 0, "for", norm.instance);
 
@@ -3059,7 +3068,9 @@ Deno.serve(async (req) => {
         .order("is_active", { ascending: false });
       // FASE 18I — mesmo filtro do lookup primário: um evento real da
       // UazAPI nunca pode resolver para uma conexão Meta/HookCloud.
-      const byMetaTextCandidates = (rawByMeta || []).filter((i) => isUazapiInstance(i));
+      // FASE 20H — e, pelo mesmo motivo do lookup primário, nunca para
+      // uma conexão arquivada.
+      const byMetaTextCandidates = (rawByMeta || []).filter((i) => isUazapiInstance(i) && !i.archived_at);
       // FASE 18K/18N — mesma autenticação por token e mesma política por
       // modo do lookup primário.
       const secondaryTokenAuthEvaluation = evaluateUazapiWebhookTokenAuth(

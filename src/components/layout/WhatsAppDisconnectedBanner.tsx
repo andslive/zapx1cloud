@@ -23,7 +23,8 @@ export function WhatsAppDisconnectedBanner() {
       const { data: rows } = await supabase
         .from('evolution_instances')
         .select('status')
-        .eq('organization_id', orgId);
+        .eq('organization_id', orgId)
+        .is('archived_at', null);
       const total = rows?.length ?? 0;
       const connected = (rows ?? []).filter((r: any) => r.status === 'connected').length;
       return { total, connected };

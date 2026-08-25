@@ -9,7 +9,7 @@ import { assertEquals, assertRejects } from "https://deno.land/std@0.208.0/asser
 import { resolveConnectionProvider, type SupabaseLike } from "./resolve.ts";
 import { isWhatsAppProviderError } from "./errors.ts";
 
-type Row = { id: string; organization_id: string; provider: string | null };
+type Row = { id: string; organization_id: string; provider: string | null; archived_at?: string | null };
 
 function fakeSupabase(rows: Row[]): SupabaseLike {
   return {
@@ -86,4 +86,36 @@ Deno.test("connectionId ausente (string vazia) é recusado antes de qualquer con
   const err = await assertRejects(() => resolveConnectionProvider(supabase, "", "org-a"));
   if (!isWhatsAppProviderError(err)) throw new Error("esperava WhatsAppProviderError");
   assertEquals(err.code, "CONNECTION_NOT_FOUND");
+});
+
+// FASE 20I — achado da revisão independente do PR #28: este era o único
+// chokepoint de resolução de provider que NÃO recusava uma conexão
+// arquivada (`archived_at IS NOT NULL`). Diferente de `uazapi-send/index.ts`
+// (que já filtra `archived_at IS NULL` antes de chegar aqui),
+// `meta-cloud-send/index.ts` chama `dispatchMetaCloudSend` → esta função
+// diretamente com um `connection_id` de body, sem gate a montante.
+Deno.test("conexão arquivada (uazapi) => CONNECTION_ARCHIVED, nunca resolve para envio", async () => {
+  const supabase = fakeSupabase([
+    { id: "conn-1", organization_id: "org-a", provider: "uazapi", archived_at: "2026-08-24T12:00:00.000Z" },
+  ]);
+  const err = await assertRejects(() => resolveConnectionProvider(supabase, "conn-1", "org-a"));
+  if (!isWhatsAppProviderError(err)) throw new Error("esperava WhatsAppProviderError");
+  assertEquals(err.code, "CONNECTION_ARCHIVED");
+});
+
+Deno.test("conexão arquivada (meta_cloud) => CONNECTION_ARCHIVED, nunca resolve para envio", async () => {
+  const supabase = fakeSupabase([
+    { id: "conn-1", organization_id: "org-a", provider: "meta_cloud", archived_at: "2026-08-24T12:00:00.000Z" },
+  ]);
+  const err = await assertRejects(() => resolveConnectionProvider(supabase, "conn-1", "org-a"));
+  if (!isWhatsAppProviderError(err)) throw new Error("esperava WhatsAppProviderError");
+  assertEquals(err.code, "CONNECTION_ARCHIVED");
+});
+
+Deno.test("conexão NÃO arquivada (archived_at null) continua resolvendo normalmente", async () => {
+  const supabase = fakeSupabase([
+    { id: "conn-1", organization_id: "org-a", provider: "uazapi", archived_at: null },
+  ]);
+  const ref = await resolveConnectionProvider(supabase, "conn-1", "org-a");
+  assertEquals(ref.provider, "uazapi");
 });

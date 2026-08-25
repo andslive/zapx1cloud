@@ -61,6 +61,10 @@ export interface WhatsAppInstance {
   webhook_events?: string[] | null;
   webhook_url?: string | null;
   metadata?: { webhook_error?: string | null; webhook_last_attempt_at?: string | null; [k: string]: any } | null;
+  /** FASE 20H — `null`/ausente = operacional; timestamp = arquivada (retirada da operação, histórico preservado). */
+  archived_at?: string | null;
+  archived_by?: string | null;
+  archive_reason?: string | null;
 }
 
 
@@ -188,10 +192,17 @@ export function useWhatsAppInstances() {
       // que autentica/autoriza no servidor com `service_role` e devolve uma
       // allowlist de colunas), e uma falha nesse fetch aparece como "Dados
       // indisponíveis" na coluna correspondente — nunca derruba esta query.
+      // FASE 20H — esta é a fonte canônica de `ConnectionsManager`/
+      // `WhatsAppInstancesPanel` (lista da tela, contadores do topo e o
+      // limite do plano derivam TODOS deste mesmo array). Uma conexão
+      // arquivada (`archived_at IS NOT NULL`) nunca deve aparecer na lista
+      // operacional nem ocupar vaga do limite de conexões do plano — por
+      // isso o filtro entra aqui, na fonte, em vez de em cada consumidor.
       const { data, error } = await supabase
         .from('evolution_instances')
         .select('*')
         .eq('organization_id', profile!.organization_id!)
+        .is('archived_at', null)
         .order('created_at', { ascending: true });
       if (error) throw error;
       return (data || []) as unknown as WhatsAppInstance[];
@@ -296,9 +307,13 @@ export function useAllWhatsAppInstancesAdmin() {
       // direto de `evolution_instances_meta_cloud` (falta GRANT SELECT para
       // `authenticated`; RLS sozinha não basta). Painel de super admin usa
       // `useOfficialApiConnectionsAll()` separadamente.
+      // FASE 20H — mesmo princípio de `useWhatsAppInstances`: painel
+      // platform-wide de super admin também não deve listar conexões
+      // arquivadas na visão operacional padrão.
       const { data, error } = await supabase
         .from('evolution_instances')
         .select('*, organization:organizations(id, name)')
+        .is('archived_at', null)
         .order('created_at', { ascending: false });
       if (error) throw error;
       return (data || []) as unknown as WhatsAppInstanceWithOrg[];
@@ -405,6 +420,167 @@ export function useDeleteWhatsAppInstance() {
       toast.success('Instância removida');
     },
     onError: (e: any) => toast.error('Erro: ' + e.message),
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FASE 20H — arquivamento seguro de conexão (substitui, na UI de Admin →
+// Conexões, o botão "Excluir" que antes chamava `delete_instance_self`,
+// um hard delete que falhava com FK 23503/non-2xx sempre que a conexão
+// tinha histórico real vinculado — ver `whatsapp-proxy/index.ts`, action
+// `archive_instance`). Nunca apaga a linha; só marca `archived_at`.
+
+export interface ArchivedInstanceDto {
+  id: string;
+  organization_id: string;
+  name: string;
+  provider: string;
+  status: string;
+  archived_at: string;
+  archived_by: string | null;
+  archive_reason: string | null;
+}
+
+export interface ArchiveInstanceResult {
+  ok: true;
+  already_archived: boolean;
+  instance: ArchivedInstanceDto;
+}
+
+/** Códigos sanitizados que `archive_instance` pode devolver — nunca SQL/stack/UUID interno/token. */
+export type ArchiveInstanceErrorCode =
+  | 'Unauthorized'
+  | 'forbidden'
+  | 'invalid_id'
+  | 'not_found'
+  | 'unsupported_provider'
+  | 'internal_error'
+  | 'network_ambiguous'
+  | undefined;
+
+function archiveErrorMessage(code: ArchiveInstanceErrorCode): string {
+  switch (code) {
+    case 'Unauthorized':
+      return 'Sua sessão expirou. Faça login novamente para continuar.';
+    case 'forbidden':
+      return 'Apenas um Super Admin pode remover esta conexão da operação.';
+    case 'invalid_id':
+      return 'Identificador de conexão inválido.';
+    case 'not_found':
+      return 'Esta conexão não foi encontrada (pode já ter sido removida).';
+    case 'unsupported_provider':
+      return 'Este tipo de conexão ainda não pode ser removido por aqui.';
+    case 'network_ambiguous':
+      return 'Não foi possível confirmar a remoção — verifique sua conexão e tente novamente.';
+    case 'internal_error':
+    default:
+      return 'Não foi possível remover a conexão agora. Tente novamente em instantes.';
+  }
+}
+
+export class ArchiveInstanceError extends Error {
+  code: ArchiveInstanceErrorCode;
+  constructor(code: ArchiveInstanceErrorCode) {
+    super(archiveErrorMessage(code));
+    this.name = 'ArchiveInstanceError';
+    this.code = code;
+  }
+}
+
+// FASE 20H — extrai o código sanitizado (`{ error: "..." }`) do corpo real
+// da resposta non-2xx. `supabase.functions.invoke` (supabase-js v2), numa
+// resposta non-2xx, joga um `FunctionsHttpError` cujo `.message` é sempre
+// o texto genérico "Edge Function returned a non-2xx status code" — o
+// corpo JSON de verdade só está em `error.context` (a `Response` real).
+// Sem isto, TODO erro do backend (403/404/409/500) aparecia para o
+// usuário como essa mesma frase genérica, inútil — a causa raiz do
+// problema relatado nesta fase.
+async function extractSanitizedErrorCode(error: any): Promise<ArchiveInstanceErrorCode> {
+  try {
+    const ctx = error?.context;
+    if (ctx && typeof ctx.json === 'function') {
+      const body = await ctx.json();
+      if (body && typeof body.error === 'string') return body.error as ArchiveInstanceErrorCode;
+    }
+  } catch {
+    // Corpo não-JSON, já consumido, ou requisição nunca chegou a ter
+    // resposta HTTP real (falha de rede) — cai no `undefined` genérico.
+  }
+  return undefined;
+}
+
+// FASE 20H — distingue "o servidor respondeu com um erro real" (tem
+// `error.context`, uma `Response` HTTP de verdade) de "a requisição nunca
+// chegou a ter uma resposta" (timeout/rede — `FunctionsFetchError` ou
+// exceção de `fetch`, sem `context`). Só o segundo caso é ambíguo o
+// bastante para justificar reconciliar em vez de reportar erro direto.
+function isNetworkAmbiguousError(error: any): boolean {
+  if (!error) return false;
+  if (error?.context) return false; // resposta HTTP real chegou — nunca ambíguo
+  return true;
+}
+
+// Chamada crua de `archive_instance`: nunca lança `ArchiveInstanceError`
+// diretamente — devolve `{ result }` em sucesso ou `{ ambiguous }`/`{ code }`
+// em falha, para o chamador (`invokeArchiveInstanceWithReconciliation`)
+// decidir se reconcilia ou reporta. Mantém a distinção rede-ambígua vs.
+// erro HTTP real visível no ponto de decisão, sem depender de encadear
+// `.cause` por cima de uma classe de erro.
+type RawArchiveAttempt =
+  | { ok: true; result: ArchiveInstanceResult }
+  | { ok: false; ambiguous: true }
+  | { ok: false; ambiguous: false; code: ArchiveInstanceErrorCode };
+
+async function attemptArchiveInstance(id: string): Promise<RawArchiveAttempt> {
+  const { data, error } = await supabase.functions.invoke('whatsapp-proxy', {
+    body: { action: 'archive_instance', id },
+  });
+  if (error) {
+    if (isNetworkAmbiguousError(error)) {
+      return { ok: false, ambiguous: true };
+    }
+    const code = await extractSanitizedErrorCode(error);
+    return { ok: false, ambiguous: false, code };
+  }
+  if (!data || data.ok !== true) {
+    return { ok: false, ambiguous: false, code: data?.error };
+  }
+  return { ok: true, result: data as ArchiveInstanceResult };
+}
+
+/**
+ * FASE 20H — `archive_instance` é idempotente no servidor (`WHERE
+ * archived_at IS NULL`, e uma linha já arquivada devolve
+ * `already_archived: true` sem escrever de novo) — por isso, diante de um
+ * resultado AMBÍGUO (timeout/erro de rede, nunca um erro HTTP real),
+ * reconciliar significa chamar a MESMA action mais uma vez (nunca uma
+ * ação distinta): se a segunda chamada confirma sucesso (arquivada agora
+ * OU já estava), o resultado original é tratado como bem-sucedido; se a
+ * segunda chamada também for ambígua ou vier um erro HTTP real, o
+ * chamador vê um erro claro — nunca um "sucesso" inventado sem confirmação
+ * do servidor, e nunca uma terceira tentativa automática.
+ */
+async function invokeArchiveInstanceWithReconciliation(id: string): Promise<ArchiveInstanceResult> {
+  const first = await attemptArchiveInstance(id);
+  if (first.ok) return first.result;
+  if (!first.ambiguous) throw new ArchiveInstanceError(first.code);
+
+  const second = await attemptArchiveInstance(id);
+  if (second.ok) return second.result;
+  if (!second.ambiguous) throw new ArchiveInstanceError(second.code);
+  throw new ArchiveInstanceError('network_ambiguous');
+}
+
+// Self-service: Super Admin remove a conexão da operação (arquiva — nunca
+// apaga a linha nem o histórico vinculado).
+export function useArchiveWhatsAppInstanceSelf() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => invokeArchiveInstanceWithReconciliation(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['whatsapp-instances'] });
+      qc.invalidateQueries({ queryKey: ['whatsapp-instances-all'] });
+    },
   });
 }
 
