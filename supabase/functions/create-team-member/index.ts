@@ -141,13 +141,16 @@ Deno.serve(async (req) => {
     // existentes (todas continuam elegíveis exatamente como antes).
     let resolvedConnectionId: string | null = body.default_connection_id || null;
     if (!resolvedConnectionId) {
+      // FASE 20H — mesmo ponto de aplicação do filtro `isUazapiInstance`:
+      // uma conexão arquivada nunca pode virar a conexão padrão de um
+      // vendedor novo, mesmo implicitamente (admin não selecionou nenhuma).
       const { data: orgInstances } = await admin
         .from('evolution_instances')
-        .select('id, provider')
+        .select('id, provider, archived_at')
         .eq('organization_id', orgId)
         .order('created_at', { ascending: true })
         .limit(50);
-      const firstEligible = (orgInstances || []).find((inst) => isUazapiInstance(inst));
+      const firstEligible = (orgInstances || []).find((inst) => isUazapiInstance(inst) && !inst.archived_at);
       resolvedConnectionId = firstEligible?.id || null;
     }
 

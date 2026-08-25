@@ -142,11 +142,14 @@ Deno.serve(async (req) => {
     }
 
     // GET /instances or action=list
+    // FASE 20H — listagem operacional: nunca inclui conexão arquivada
+    // (mesmo princípio da tela de Conexões — `useWhatsAppInstances`).
     if ((path === "/instances" || path === "/" || action === "list") && req.method === "GET") {
       const { data, error } = await supabase
         .from("evolution_instances")
         .select("*")
         .eq("organization_id", profile.organization_id)
+        .is("archived_at", null)
         .order("created_at", { ascending: false });
       
       if (error) throw error;

@@ -56,11 +56,15 @@ async function sendViaEvolutionSend(
   message: string,
   preferredInstanceId?: string
 ): Promise<{ ok: boolean; messageId: string | null; error?: string; diagnostics?: Record<string, any> }> {
-  // Pick best instance: connected first, then default
+  // Pick best instance: connected first, then default.
+  // FASE 20H — nunca considera conexão arquivada, nem como candidata do
+  // fallback nem (via `chosen` abaixo) quando `preferredInstanceId`
+  // aponta para uma que foi arquivada depois de salva em algum lugar.
   const { data: instances, error: instErr } = await supabase
     .from("evolution_instances")
-    .select("id, name, status, is_default")
-    .eq("organization_id", organizationId);
+    .select("id, name, status, is_default, archived_at")
+    .eq("organization_id", organizationId)
+    .is("archived_at", null);
 
   if (instErr) {
     return { ok: false, messageId: null, error: `query instances failed: ${instErr.message}` };

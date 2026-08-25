@@ -20,6 +20,12 @@ export async function sendUazapiTextMessage(params: SendWhatsAppParams) {
   console.log(`[whatsapp-service] [${source}] manual_send_start to ${phone} org=${organization_id}`);
 
   // 1. Resolve instance
+  // FASE 20H — uma conexão arquivada (`archived_at IS NOT NULL`) nunca
+  // pode ser o fallback automático de envio nem, mesmo quando um
+  // `instance_id` explícito é passado pelo chamador (ex.: referência
+  // salva antes do arquivamento), efetivamente usada para enviar. Falha
+  // fechada nos dois casos — nunca uma exceção "porque foi pedida
+  // explicitamente".
   let resolvedInstanceId = instance_id;
   if (!resolvedInstanceId) {
     const { data: inst } = await supabase
@@ -27,11 +33,21 @@ export async function sendUazapiTextMessage(params: SendWhatsAppParams) {
       .select("id")
       .eq("organization_id", organization_id)
       .or("status.eq.connected,status.eq.online")
+      .is("archived_at", null)
       .order("is_default", { ascending: false })
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
     resolvedInstanceId = inst?.id;
+  } else {
+    const { data: explicitInst } = await supabase
+      .from("evolution_instances")
+      .select("id, archived_at")
+      .eq("id", resolvedInstanceId)
+      .maybeSingle();
+    if (!explicitInst || explicitInst.archived_at) {
+      resolvedInstanceId = undefined;
+    }
   }
 
   if (!resolvedInstanceId) {
