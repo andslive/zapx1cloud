@@ -8,7 +8,8 @@
 // Reaproveita, sem duplicar: o MESMO padrão de autorização real já usado
 // em hookcloud-provision-connection/index.ts (JWT via anon client +
 // profiles.organization_id + profiles.disabled/is_active + user_roles,
-// papel mínimo admin/super_admin); generateHookCloudCallbackSecret/
+// papel mínimo EXCLUSIVAMENTE super_admin desde a Fase 21B — ver
+// REQUIRED_ROLES abaixo); generateHookCloudCallbackSecret/
 // generateHookCloudVerifyToken + hash (Fase 11A/13A/14A); a RPC atômica
 // `rotate_hookcloud_webhook_credentials` (migration 20260819300000, NÃO
 // aplicada).
@@ -45,7 +46,11 @@ import {
 // aplicado só quando há um `Origin` de navegador real e permitido —
 // nunca um valor estático, nunca `*`.
 
-const REQUIRED_ROLES = new Set(["admin", "super_admin"]);
+// FASE 21B — mesmo contrato exclusivo de hookcloud-provision-connection:
+// só 'super_admin'. Rotação de credenciais é tão sensível quanto o
+// provisionamento original (invalida segredos vivos, devolve a conexão
+// para 'pending') — não há motivo para um papel mais permissivo aqui.
+const REQUIRED_ROLES = new Set(["super_admin"]);
 
 export interface AuthClientLike {
   auth: { getUser(): Promise<{ data: { user: { id: string } | null } }> };

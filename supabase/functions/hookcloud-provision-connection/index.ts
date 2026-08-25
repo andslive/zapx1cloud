@@ -58,11 +58,17 @@ import {
 // aplicado só quando há um `Origin` de navegador real e permitido —
 // nunca um valor estático, nunca `*`.
 
-// Papel mínimo exigido — mais restrito que create-team-member (que aceita
-// 'manager' para a maioria das operações). Provisionar uma conexão com um
-// Meta Access Token real é mais sensível do que gerenciar membros de
-// equipe, então só 'admin'/'super_admin' — nunca 'manager'/'seller'.
-const REQUIRED_ROLES = new Set(["admin", "super_admin"]);
+// FASE 21B — contrato do piloto HookCloud restringe este endpoint a
+// EXCLUSIVAMENTE 'super_admin'. Até a Fase 21A, este conjunto também
+// incluía 'admin' de organização (comentário histórico: "papel mínimo
+// exigido — mais restrito que create-team-member... só 'admin'/
+// 'super_admin' — nunca 'manager'/'seller'"). O gate de prontidão da
+// Fase 21A confirmou que isso não satisfazia o requisito literal de
+// "autorização exclusiva de Super Admin" definido para este piloto —
+// provisionar uma conexão com um Meta Access Token real é sensível o
+// bastante para não confiar em nenhum papel de organização, mesmo
+// 'admin'. 'manager'/'seller' continuam, como sempre, fora de cogitação.
+const REQUIRED_ROLES = new Set(["super_admin"]);
 
 // ── Interfaces mínimas — injetáveis para teste, sem tipo concreto do SDK ─
 
