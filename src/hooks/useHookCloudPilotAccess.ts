@@ -18,27 +18,37 @@
 // HookCloud é deliberadamente opt-in por organização, nunca ligado por
 // uma flag global de "todo mundo".
 //
-// O papel exigido para VER o card (`admin`/`super_admin`) é mais estrito
-// que a RLS (que também deixaria `manager` ler a linha) — isso é
-// intencional: a autorização real de quem pode PROVISIONAR já é
-// admin/super_admin no backend (`hookcloud-provision-connection`,
-// auditado); a UI só espelha essa mesma regra para nunca mostrar um
-// botão que o backend recusaria.
+// FASE 21B — o papel exigido para VER o card foi restringido de
+// `admin`/`super_admin` para EXCLUSIVAMENTE `super_admin`, para
+// acompanhar a mesma restrição aplicada ao backend
+// (`hookcloud-provision-connection`/`hookcloud-rotate-credentials`, ver
+// `REQUIRED_ROLES` em ambos). O gate de prontidão da Fase 21A encontrou
+// essa divergência (UI/backend antes aceitavam `admin`, contrato do
+// piloto exige exclusivamente Super Admin) e classificou como pendente
+// de correção antes de qualquer provisionamento real.
+//
+// Isto é mais estrito que a RLS real da tabela (que também deixaria
+// `admin`/`manager` ler a linha `scope='organization'` da própria
+// organização) — deliberado: esconder o card no frontend NUNCA foi (e
+// continua não sendo) a proteção real; é só espelho para nunca mostrar
+// um botão que o backend agora recusa com mais rigor. A autorização que
+// importa de fato é sempre revalidada no backend, de forma independente
+// desta consulta.
 
 import { useQuery } from '@tanstack/react-query';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
 
 interface UseHookCloudPilotAccessResult {
-  /** `true` somente quando a flag da organização está ligada E o usuário é admin/super_admin. Nunca `true` durante o carregamento. */
+  /** `true` somente quando a flag da organização está ligada E o usuário é EXCLUSIVAMENTE super_admin. Nunca `true` durante o carregamento. */
   visible: boolean;
   isLoading: boolean;
 }
 
 export function useHookCloudPilotAccess(): UseHookCloudPilotAccessResult {
-  const { profile, isAdmin } = useAuth();
+  const { profile, isSuperAdmin } = useAuth();
   const organizationId = profile?.organization_id ?? null;
-  const authorizedRole = isAdmin(); // admin || super_admin — mesmo helper já usado em toda a app
+  const authorizedRole = isSuperAdmin(); // EXCLUSIVAMENTE super_admin — Fase 21B
 
   const query = useQuery({
     queryKey: ['hookcloud-pilot-flag', organizationId],
