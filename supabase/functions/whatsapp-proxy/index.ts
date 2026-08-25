@@ -1,5 +1,11 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { authorizationFailureResponseBody, authorizeUazapiConnectionAccess } from "./connection-authorization.ts";
+import {
+  authorizationFailureResponseBody,
+  authorizeUazapiConnectionAccess,
+  authorizeSuperAdminForArchive,
+  superAdminAuthorizationFailureResponseBody,
+} from "./connection-authorization.ts";
+import { performArchiveInstance } from "./archive-instance.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -388,6 +394,64 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ ok: true, remote }), { headers: corsHeaders });
     }
 
+    // FASE 20H — substitui, para a UI de Admin → Conexões, o botão
+    // "Excluir" que antes disparava `delete_instance_self` (hard delete,
+    // ver bloco acima — falha com FK 23503/non-2xx sempre que a conexão
+    // tem histórico real vinculado, ex. `admin_notification_logs`, que tem
+    // `delete_rule = NO ACTION`). Esta ação NUNCA apaga a linha, NUNCA
+    // chama a UazAPI/Meta, NUNCA toca Chromium, NUNCA lê/retorna token —
+    // só marca `archived_at`/`archived_by`/`archive_reason` na própria
+    // linha, condicionalmente (`WHERE id=... AND archived_at IS NULL`),
+    // preservando 100% do histórico (leads/conversas/mensagens/vendas/
+    // comprovantes/auditorias continuam com o mesmo `connection_id`).
+    // `delete_instance_self` continua existindo, inalterado, para os
+    // outros chamadores identificados (`WhatsAppInstancesPanel.tsx`,
+    // `WhatsAppManager.tsx`) — fora do escopo desta fase, documentado como
+    // risco residual no relatório.
+    if (action === "archive_instance") {
+      // Gate 1+2: autenticação + super_admin real comprovado no banco
+      // (nunca um claim do cliente, nunca um admin/usuário comum de
+      // organização — mesmo que seja dono da própria conexão). Ordem
+      // idêntica à Fase 18D: autenticação → papel → só então a busca da
+      // conexão (feita dentro de `performArchiveInstance`).
+      const authz = await authorizeSuperAdminForArchive({ supabase, userId: user?.id ?? null });
+      if (authz.kind !== "authorized") {
+        const { status, body: failBody } = superAdminAuthorizationFailureResponseBody(authz);
+        return new Response(JSON.stringify(failBody), { status, headers: corsHeaders });
+      }
+
+      // Gates 3+4 (id válido, conexão existe, provider conhecido) + escrita
+      // condicional + reconciliação: ver `archive-instance.ts` (módulo
+      // testável isoladamente, mesmo padrão de `connection-authorization.ts`).
+      // `organization_id` nunca é lido do body aqui — só da própria linha,
+      // dentro do módulo.
+      const outcome = await performArchiveInstance({
+        supabase,
+        id: body.id,
+        actingUserId: user!.id,
+        reason: body.reason,
+      });
+
+      switch (outcome.kind) {
+        case "invalid_id":
+          return new Response(JSON.stringify({ ok: false, error: "invalid_id" }), { status: 400, headers: corsHeaders });
+        case "not_found":
+          return new Response(JSON.stringify({ ok: false, error: "not_found" }), { status: 404, headers: corsHeaders });
+        case "unsupported_provider":
+          return new Response(JSON.stringify({ ok: false, error: "unsupported_provider" }), { status: 409, headers: corsHeaders });
+        case "internal_error":
+          console.error(`[${requestId}] [ARCHIVE_INSTANCE] internal error for id=${body.id}`);
+          return new Response(JSON.stringify({ ok: false, error: "internal_error" }), { status: 500, headers: corsHeaders });
+        case "success":
+          console.log(`[${requestId}] [ARCHIVE_INSTANCE] id=${outcome.instance.id} already_archived=${outcome.alreadyArchived} by=${user!.id}`);
+          return new Response(JSON.stringify({
+            ok: true,
+            already_archived: outcome.alreadyArchived,
+            instance: outcome.instance,
+          }), { headers: corsHeaders });
+      }
+    }
+
     if (action === "sync_instances") {
       const orgId = body.organization_id;
       const source = body.source || 'manual_sync';
@@ -401,7 +465,14 @@ Deno.serve(async (req) => {
         for (const item of res.body) {
           const parsed = parseInstanceFromList(item, 'uazapi');
           if (parsed.uuid) {
-            await supabase.from("evolution_instances").update({ status: parsed.status }).eq("instance_id", parsed.uuid).eq("organization_id", orgId);
+            // FASE 20H — uma conexão arquivada nunca deve ser tocada por
+            // `sync_instances` (nenhuma sincronização automática/manual
+            // pode reativar o campo `status` de uma conexão retirada da
+            // operação).
+            await supabase.from("evolution_instances").update({ status: parsed.status })
+              .eq("instance_id", parsed.uuid)
+              .eq("organization_id", orgId)
+              .is("archived_at", null);
           }
         }
       }

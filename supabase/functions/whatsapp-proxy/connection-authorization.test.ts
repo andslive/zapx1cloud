@@ -10,7 +10,12 @@
 // nenhuma chamada de rede real, sem credencial real.
 
 import { assertEquals } from "https://deno.land/std@0.208.0/assert/mod.ts";
-import { authorizeUazapiConnectionAccess, type SupabaseAdminLike } from "./connection-authorization.ts";
+import {
+  authorizeUazapiConnectionAccess,
+  authorizeSuperAdminForArchive,
+  resolveKnownArchiveProvider,
+  type SupabaseAdminLike,
+} from "./connection-authorization.ts";
 
 interface FakeProfile {
   id: string;
@@ -23,6 +28,7 @@ interface FakeInstance {
   instance_id?: string | null;
   organization_id: string;
   provider?: string | null;
+  archived_at?: string | null;
 }
 
 function makeFakeSupabase(opts: {
@@ -274,4 +280,117 @@ Deno.test("alsoMatchInstanceId: instance_id de OUTRA organização continua not_
     supabase, connectionId: "uazapi-side-uuid-b", isServiceRole: false, userId: USER_A, alsoMatchInstanceId: true,
   });
   assertEquals(result.kind, "not_found");
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// FASE 20H — conexão arquivada nunca autoriza nenhuma ação de transporte
+// (connect_instance/repair_webhook/check_webhook/delete_instance_self).
+
+Deno.test("FASE 20H — conexão UazAPI arquivada => kind 'archived', nunca 'authorized' (bloqueia connect/repair/check/delete)", async () => {
+  const supabase = makeFakeSupabase({
+    profiles: PROFILES,
+    instances: [{ id: "conn-archived", organization_id: ORG_A, provider: "uazapi", archived_at: "2026-08-01T00:00:00.000Z" } as any],
+  });
+  const result = await authorizeUazapiConnectionAccess({
+    supabase, connectionId: "conn-archived", isServiceRole: false, userId: USER_A,
+  });
+  assertEquals(result.kind, "archived");
+});
+
+Deno.test("FASE 20H — conexão UazAPI arquivada de OUTRA organização continua not_found (arquivamento nunca revela existência cross-tenant)", async () => {
+  const supabase = makeFakeSupabase({
+    profiles: PROFILES,
+    instances: [{ id: "conn-archived-b", organization_id: ORG_B, provider: "uazapi", archived_at: "2026-08-01T00:00:00.000Z" } as any],
+  });
+  const result = await authorizeUazapiConnectionAccess({
+    supabase, connectionId: "conn-archived-b", isServiceRole: false, userId: USER_A,
+  });
+  assertEquals(result.kind, "not_found");
+});
+
+Deno.test("FASE 20H — super_admin também é bloqueado por conexão arquivada nas ações de transporte (arquivamento não é bypassável por papel)", async () => {
+  const supabase = makeFakeSupabase({
+    profiles: PROFILES,
+    instances: [{ id: "conn-archived", organization_id: ORG_A, provider: "uazapi", archived_at: "2026-08-01T00:00:00.000Z" } as any],
+  });
+  const result = await authorizeUazapiConnectionAccess({
+    supabase, connectionId: "conn-archived", isServiceRole: false, userId: USER_SUPER,
+  });
+  assertEquals(result.kind, "archived");
+});
+
+Deno.test("FASE 20H — conexão UazAPI NÃO arquivada (archived_at null) continua authorized normalmente", async () => {
+  const result = await authorizeUazapiConnectionAccess({
+    supabase: supa(), connectionId: CONN_UAZAPI_A.id, isServiceRole: false, userId: USER_A,
+  });
+  assertEquals(result.kind, "authorized");
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// FASE 20H — `authorizeSuperAdminForArchive`: autorização dedicada e mais
+// restrita de `archive_instance` (só super_admin real, nunca admin/usuário
+// comum de organização — mesmo dono da própria conexão).
+
+function supaSuperAdminOnly() {
+  return makeFakeSupabase({ profiles: PROFILES, instances: [], superAdminIds: [USER_SUPER] });
+}
+
+Deno.test("archive: sem userId (sem JWT) => unauthenticated", async () => {
+  const result = await authorizeSuperAdminForArchive({ supabase: supaSuperAdminOnly(), userId: null });
+  assertEquals(result.kind, "unauthenticated");
+});
+
+Deno.test("archive: perfil inexistente => profile_invalid", async () => {
+  const result = await authorizeSuperAdminForArchive({ supabase: supaSuperAdminOnly(), userId: "usuario-sem-perfil" });
+  assertEquals(result.kind, "profile_invalid");
+});
+
+Deno.test("archive: perfil desativado (is_active=false) => profile_invalid, mesmo se fosse super_admin", async () => {
+  const supabase = makeFakeSupabase({ profiles: PROFILES, instances: [], superAdminIds: ["user-inactive"] });
+  const result = await authorizeSuperAdminForArchive({ supabase, userId: "user-inactive" });
+  assertEquals(result.kind, "profile_invalid");
+});
+
+Deno.test("archive: usuário comum de organização (admin/manager real, mas NÃO super_admin) => not_super_admin, mesmo dono da própria conexão", async () => {
+  const result = await authorizeSuperAdminForArchive({ supabase: supaSuperAdminOnly(), userId: USER_A });
+  assertEquals(result.kind, "not_super_admin");
+});
+
+Deno.test("archive: super_admin real comprovado via RPC => authorized", async () => {
+  const result = await authorizeSuperAdminForArchive({ supabase: supaSuperAdminOnly(), userId: USER_SUPER });
+  assertEquals(result.kind, "authorized");
+});
+
+Deno.test("archive: 'super_admin' só na aparência (não está em superAdminIds, ou seja, RPC real diz não) => not_super_admin, nunca confia em claim implícito", async () => {
+  const supabase = makeFakeSupabase({ profiles: PROFILES, instances: [], superAdminIds: [] });
+  const result = await authorizeSuperAdminForArchive({ supabase, userId: USER_SUPER });
+  assertEquals(result.kind, "not_super_admin");
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// FASE 20H — `resolveKnownArchiveProvider`: provider real, falha fechada.
+
+Deno.test("resolveKnownArchiveProvider: 'uazapi' => 'uazapi'", () => {
+  assertEquals(resolveKnownArchiveProvider({ provider: "uazapi" }), "uazapi");
+});
+
+Deno.test("resolveKnownArchiveProvider: 'meta_cloud' => 'meta_cloud' (archive_instance é agnóstico de provider)", () => {
+  assertEquals(resolveKnownArchiveProvider({ provider: "meta_cloud" }), "meta_cloud");
+});
+
+Deno.test("resolveKnownArchiveProvider: ausente/null/vazio (legado) => 'uazapi', retrocompatibilidade preservada", () => {
+  assertEquals(resolveKnownArchiveProvider({ provider: null }), "uazapi");
+  assertEquals(resolveKnownArchiveProvider({ provider: undefined }), "uazapi");
+  assertEquals(resolveKnownArchiveProvider({ provider: "" }), "uazapi");
+  assertEquals(resolveKnownArchiveProvider({}), "uazapi");
+});
+
+Deno.test("resolveKnownArchiveProvider: valor desconhecido (ex.: 'chromium') => null, falha fechada", () => {
+  assertEquals(resolveKnownArchiveProvider({ provider: "chromium" }), null);
+  assertEquals(resolveKnownArchiveProvider({ provider: "evolution" }), null);
+});
+
+Deno.test("resolveKnownArchiveProvider: instância null/undefined => null", () => {
+  assertEquals(resolveKnownArchiveProvider(null), null);
+  assertEquals(resolveKnownArchiveProvider(undefined), null);
 });
