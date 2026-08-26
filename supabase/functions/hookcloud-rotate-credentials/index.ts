@@ -8,8 +8,9 @@
 // Reaproveita, sem duplicar: o MESMO padrão de autorização real já usado
 // em hookcloud-provision-connection/index.ts (JWT via anon client +
 // profiles.organization_id + profiles.disabled/is_active + user_roles,
-// papel mínimo EXCLUSIVAMENTE super_admin desde a Fase 21B — ver
-// REQUIRED_ROLES abaixo); generateHookCloudCallbackSecret/
+// papel restrito a admin/super_admin — Fase 21G, política canônica
+// única em `_shared/hookcloud-authorization.ts`, nunca duplicada aqui);
+// generateHookCloudCallbackSecret/
 // generateHookCloudVerifyToken + hash (Fase 11A/13A/14A); a RPC atômica
 // `rotate_hookcloud_webhook_credentials` (migration 20260819300000, NÃO
 // aplicada).
@@ -29,6 +30,7 @@ import {
   hashHookCloudVerifyToken,
   hashHookCloudWebhookSecret,
 } from "../_shared/meta-webhook-hookcloud-secret.ts";
+import { isHookCloudAuthorizedRole } from "../_shared/hookcloud-authorization.ts";
 import {
   buildCorsDecision,
   CREDENTIAL_RESPONSE_HEADERS,
@@ -46,11 +48,12 @@ import {
 // aplicado só quando há um `Origin` de navegador real e permitido —
 // nunca um valor estático, nunca `*`.
 
-// FASE 21B — mesmo contrato exclusivo de hookcloud-provision-connection:
-// só 'super_admin'. Rotação de credenciais é tão sensível quanto o
-// provisionamento original (invalida segredos vivos, devolve a conexão
-// para 'pending') — não há motivo para um papel mais permissivo aqui.
-const REQUIRED_ROLES = new Set(["super_admin"]);
+// FASE 21G — mesma política canônica de hookcloud-provision-connection,
+// importada de `_shared/hookcloud-authorization.ts` (nunca um
+// `new Set([...])` duplicado aqui). Rotação de credenciais é tão
+// sensível quanto o provisionamento original (invalida segredos vivos,
+// devolve a conexão para 'pending') — usa exatamente a mesma allowlist,
+// nunca uma mais permissiva nem mais restrita.
 
 export interface AuthClientLike {
   auth: { getUser(): Promise<{ data: { user: { id: string } | null } }> };
@@ -139,8 +142,7 @@ export async function handleRotateCredentialsRequest(req: Request, deps: RotateH
     .select("role")
     .eq("user_id", caller.id);
   const roles: string[] = (roleRows ?? []).map((r: any) => r.role);
-  const isAuthorizedRole = roles.some((r) => REQUIRED_ROLES.has(r));
-  if (!isAuthorizedRole) {
+  if (!isHookCloudAuthorizedRole(roles)) {
     return jsonResponse(403, { error: "insufficient_role" });
   }
 
@@ -351,9 +353,10 @@ export async function routeRotateCredentialsRequest(
 // `meta-cloud-webhook/index.ts` desde a Fase 2A e em
 // `hookcloud-provision-connection/index.ts` (Fase 16B). Nenhum código
 // roda no carregamento do módulo além de literais estáticos
-// (`REQUIRED_ROLES`) — nenhuma chamada de banco, nenhuma geração de
-// credencial, nenhuma leitura de body acontece até que uma requisição
-// HTTP real chegue.
+// (`HOOKCLOUD_AUTHORIZED_ROLES` importado de
+// `_shared/hookcloud-authorization.ts`) — nenhuma chamada de banco,
+// nenhuma geração de credencial, nenhuma leitura de body acontece até
+// que uma requisição HTTP real chegue.
 
 if (import.meta.main) {
   const supabaseUrl = Deno.env.get("SUPABASE_URL");

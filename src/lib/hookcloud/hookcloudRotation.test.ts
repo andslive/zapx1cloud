@@ -163,7 +163,7 @@ Deno.test("classifyRotateInvokeResult: nunca lança exceção com corpo de erro 
 Deno.test("publicRotateErrorMessageForCode: códigos conhecidos retornam mensagem curta e específica", () => {
   assertEquals(
     publicRotateErrorMessageForCode(403, "insufficient_role"),
-    "Apenas Super Admin pode rotacionar credenciais HookCloud.",
+    "Apenas administradores podem rotacionar credenciais HookCloud.",
   );
   assertEquals(publicRotateErrorMessageForCode(400, "nothing_to_rotate"), "Selecione pelo menos um valor para rotacionar.");
   assertEquals(publicRotateErrorMessageForCode(404, "connection_not_found"), "Conexão não encontrada.");

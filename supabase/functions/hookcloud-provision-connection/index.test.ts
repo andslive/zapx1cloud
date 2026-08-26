@@ -193,34 +193,32 @@ Deno.test("4b) manager sozinho NÃO é suficiente => 403", async () => {
   });
 });
 
-// FASE 21B — contrato do piloto restringe o provisionamento
-// EXCLUSIVAMENTE a super_admin. `admin` de organização (que antes era
-// suficiente, achado da Fase 21A) agora é explicitamente rejeitado —
-// mesmo padrão de resposta genérica que qualquer outro papel insuficiente
-// (403 "insufficient_role"), nunca revela que "quase" tinha permissão.
-Deno.test("4c) admin de organização (sem super_admin) NÃO é mais suficiente => 403", async () => {
+// FASE 21G — a Fase 21B havia restringido este endpoint a exclusivamente
+// super_admin (achado da Fase 21A). Por decisão explícita do usuário,
+// `admin` da própria organização volta a ser suficiente — mesma
+// allowlist canônica de `_shared/hookcloud-authorization.ts`, importada
+// também por `hookcloud-rotate-credentials` (nunca duplicada/divergente).
+Deno.test("4c) admin de organização é suficiente (Fase 21G reverteu a restrição exclusiva a super_admin da Fase 21B) => 201", async () => {
   await withHookCloudPilotEnv(async () => {
     const res = await handleProvisionRequest(
       req(validPayload()),
       baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }) }),
     );
-    assertEquals(res.status, 403);
-    const body = await res.json();
-    assertEquals(body.error, "insufficient_role");
+    assertEquals(res.status, 201);
   });
 });
 
-Deno.test("4d) usuário com admin E manager, mas sem super_admin, ainda é rejeitado (múltiplos papéis insuficientes não se somam) => 403", async () => {
+Deno.test("4d) admin junto com manager também é suficiente (um papel autorizado entre vários basta) => 201", async () => {
   await withHookCloudPilotEnv(async () => {
     const res = await handleProvisionRequest(
       req(validPayload()),
       baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin", "manager"] }) }),
     );
-    assertEquals(res.status, 403);
+    assertEquals(res.status, 201);
   });
 });
 
-Deno.test("4e) super_admin é suficiente (único papel autorizado no contrato do piloto) => 201", async () => {
+Deno.test("4e) super_admin é suficiente => 201", async () => {
   await withHookCloudPilotEnv(async () => {
     const res = await handleProvisionRequest(req(validPayload()), baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"] }) }));
     assertEquals(res.status, 201);
@@ -243,6 +241,67 @@ Deno.test("4g) usuário sem NENHUM papel em user_roles => 403, mesma resposta ge
     assertEquals(res.status, 403);
     const body = await res.json();
     assertEquals(body.error, "insufficient_role");
+  });
+});
+
+Deno.test("4h) papel desconhecido/inventado NÃO é suficiente => 403", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["papel_inventado"] }) }),
+    );
+    assertEquals(res.status, 403);
+  });
+});
+
+Deno.test("4i) capitalização/grafia inválida do papel (\"Admin\"/\"ADMIN\"/\"Super_Admin\") NÃO autoriza — comparação exata, nunca normalizada => 403", async () => {
+  await withHookCloudPilotEnv(async () => {
+    for (const bogusRole of ["Admin", "ADMIN", "Super_Admin", "SUPER_ADMIN"]) {
+      const res = await handleProvisionRequest(
+        req(validPayload()),
+        baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: [bogusRole] }) }),
+      );
+      assertEquals(res.status, 403, `papel "${bogusRole}" não deveria autorizar`);
+    }
+  });
+});
+
+Deno.test("4j) admin tentando enviar organizationId de OUTRA organização no corpo => 403 ANTES de qualquer verificação de papel/RPC, nunca amplia o escopo do admin para a organização alheia", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    const res = await handleProvisionRequest(
+      req(validPayload({ organizationId: "org-outra-organizacao" })),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+    );
+    assertEquals(res.status, 403);
+    const body = await res.json();
+    assertEquals(body.error, "organization_mismatch");
+    assertEquals(rpcCalls.length, 0, "RPC nunca deveria ser chamada quando a organização do corpo diverge da real");
+  });
+});
+
+Deno.test("4k) corpo contendo role: 'super_admin' não eleva o privilégio de um admin comum — autorização vem SOMENTE de user_roles no banco, nunca de um campo do corpo", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload({ role: "super_admin" })),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }) }),
+    );
+    // Como "admin" já é suficiente na allowlist da Fase 21G, o resultado
+    // esperado é sucesso — o ponto do teste é que a presença de
+    // `role: "super_admin"` no corpo não muda NADA no comportamento:
+    // nem eleva um papel insuficiente, nem é lida em lugar nenhum do
+    // fluxo de autorização (que consulta exclusivamente `user_roles`).
+    assertEquals(res.status, 201);
+  });
+});
+
+Deno.test("4l) corpo contendo role: 'super_admin' NÃO eleva um papel realmente insuficiente (seller) => continua 403", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const res = await handleProvisionRequest(
+      req(validPayload({ role: "super_admin" })),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["seller"] }) }),
+    );
+    assertEquals(res.status, 403);
   });
 });
 

@@ -137,7 +137,7 @@ export function publicRotateErrorMessageForCode(status: number, code: string): s
     case 'user_disabled':
       return 'Sua conta não tem permissão para rotacionar credenciais HookCloud.';
     case 'insufficient_role':
-      return 'Apenas Super Admin pode rotacionar credenciais HookCloud.';
+      return 'Apenas administradores podem rotacionar credenciais HookCloud.';
     case 'organization_mismatch':
       return 'Não foi possível confirmar sua organização. Atualize a página e tente novamente.';
     case 'invalid_connection_id':

@@ -18,37 +18,39 @@
 // HookCloud é deliberadamente opt-in por organização, nunca ligado por
 // uma flag global de "todo mundo".
 //
-// FASE 21B — o papel exigido para VER o card foi restringido de
-// `admin`/`super_admin` para EXCLUSIVAMENTE `super_admin`, para
-// acompanhar a mesma restrição aplicada ao backend
-// (`hookcloud-provision-connection`/`hookcloud-rotate-credentials`, ver
-// `REQUIRED_ROLES` em ambos). O gate de prontidão da Fase 21A encontrou
-// essa divergência (UI/backend antes aceitavam `admin`, contrato do
-// piloto exige exclusivamente Super Admin) e classificou como pendente
-// de correção antes de qualquer provisionamento real.
+// FASE 21G — o papel exigido para VER o card usa a decisão canônica
+// `canManageHookCloud` (`admin` OU `super_admin`), a MESMA allowlist do
+// backend (`_shared/hookcloud-authorization.ts`, importada por
+// `hookcloud-provision-connection`/`hookcloud-rotate-credentials`).
+//
+// Histórico: a Fase 21B havia restringido isto para exclusivamente
+// `super_admin` (achado da Fase 21A). A Fase 21G reverteu essa
+// restrição por decisão explícita do usuário — `admin` volta a ser
+// permitido, mas continua sujeito às MESMAS regras de isolamento
+// (organização derivada do perfil, nunca do cliente) já aplicadas no
+// backend, que é sempre a autoridade real e independente desta consulta.
 //
 // Isto é mais estrito que a RLS real da tabela (que também deixaria
-// `admin`/`manager` ler a linha `scope='organization'` da própria
-// organização) — deliberado: esconder o card no frontend NUNCA foi (e
-// continua não sendo) a proteção real; é só espelho para nunca mostrar
-// um botão que o backend agora recusa com mais rigor. A autorização que
-// importa de fato é sempre revalidada no backend, de forma independente
-// desta consulta.
+// `manager` ler a linha `scope='organization'` da própria organização)
+// — deliberado: esconder o card no frontend NUNCA foi (e continua não
+// sendo) a proteção real; é só espelho para nunca mostrar um botão que
+// o backend recusaria.
 
 import { useQuery } from '@tanstack/react-query';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
+import { canManageHookCloud } from '@/lib/hookcloud/hookCloudAuthorization';
 
 interface UseHookCloudPilotAccessResult {
-  /** `true` somente quando a flag da organização está ligada E o usuário é EXCLUSIVAMENTE super_admin. Nunca `true` durante o carregamento. */
+  /** `true` somente quando a flag da organização está ligada E o usuário tem papel `admin` ou `super_admin`. Nunca `true` durante o carregamento. */
   visible: boolean;
   isLoading: boolean;
 }
 
 export function useHookCloudPilotAccess(): UseHookCloudPilotAccessResult {
-  const { profile, isSuperAdmin } = useAuth();
+  const { profile, roles } = useAuth();
   const organizationId = profile?.organization_id ?? null;
-  const authorizedRole = isSuperAdmin(); // EXCLUSIVAMENTE super_admin — Fase 21B
+  const authorizedRole = canManageHookCloud(roles); // admin || super_admin — Fase 21G, mesma allowlist do backend
 
   const query = useQuery({
     queryKey: ['hookcloud-pilot-flag', organizationId],
