@@ -118,30 +118,28 @@ Deno.test("papel insuficiente (seller) => 403", async () => {
   assertEquals(res.status, 403);
 });
 
-// FASE 21B — contrato do piloto restringe a rotação EXCLUSIVAMENTE a
-// super_admin, mesma mudança de hookcloud-provision-connection. 'admin'
-// de organização, que antes era suficiente, agora é rejeitado (403,
-// mesma resposta genérica "insufficient_role" de qualquer outro papel
-// insuficiente — nunca revela que "quase" tinha permissão).
-Deno.test("admin de organização (sem super_admin) NÃO é mais suficiente => 403", async () => {
+// FASE 21G — a Fase 21B havia restringido a rotação a exclusivamente
+// super_admin (achado da Fase 21A). Por decisão explícita do usuário,
+// `admin` da própria organização volta a ser suficiente — mesma
+// allowlist canônica de `_shared/hookcloud-authorization.ts`, idêntica
+// à de `hookcloud-provision-connection` (nunca duplicada/divergente).
+Deno.test("admin de organização é suficiente (Fase 21G reverteu a restrição exclusiva a super_admin da Fase 21B) => 200", async () => {
   const res = await handleRotateCredentialsRequest(
     req(validPayload()),
     baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }) }),
   );
-  assertEquals(res.status, 403);
-  const body = await res.json();
-  assertEquals(body.error, "insufficient_role");
+  assertEquals(res.status, 200);
 });
 
-Deno.test("admin junto com manager, sem super_admin, ainda é rejeitado => 403", async () => {
+Deno.test("admin junto com manager também é suficiente => 200", async () => {
   const res = await handleRotateCredentialsRequest(
     req(validPayload()),
     baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin", "manager"] }) }),
   );
-  assertEquals(res.status, 403);
+  assertEquals(res.status, 200);
 });
 
-Deno.test("super_admin é suficiente (único papel autorizado no contrato do piloto) => 200", async () => {
+Deno.test("super_admin é suficiente => 200", async () => {
   const res = await handleRotateCredentialsRequest(
     req(validPayload()),
     baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"] }) }),
@@ -155,6 +153,52 @@ Deno.test("super_admin junto com admin também é suficiente => 200", async () =
     baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin", "super_admin"] }) }),
   );
   assertEquals(res.status, 200);
+});
+
+Deno.test("papel desconhecido/inventado NÃO é suficiente => 403", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["papel_inventado"] }) }),
+  );
+  assertEquals(res.status, 403);
+});
+
+Deno.test("capitalização/grafia inválida do papel NÃO autoriza — comparação exata, nunca normalizada => 403", async () => {
+  for (const bogusRole of ["Admin", "ADMIN", "Super_Admin", "SUPER_ADMIN"]) {
+    const res = await handleRotateCredentialsRequest(
+      req(validPayload()),
+      baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: [bogusRole] }) }),
+    );
+    assertEquals(res.status, 403, `papel "${bogusRole}" não deveria autorizar`);
+  }
+});
+
+Deno.test("admin tentando enviar organizationId de OUTRA organização no corpo => 403 ANTES da RPC, nunca amplia o escopo do admin para a organização alheia", async () => {
+  const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload({ organizationId: "org-outra-organizacao" })),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], rpcCalls }) }),
+  );
+  assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "organization_mismatch");
+  assertEquals(rpcCalls.length, 0, "RPC nunca deveria ser chamada quando a organização do corpo diverge da real");
+});
+
+Deno.test("corpo contendo role: 'super_admin' não eleva o privilégio de um admin comum — resultado é o mesmo de um admin normal (200, admin já é suficiente), nunca lido do corpo", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload({ role: "super_admin" })),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"] }) }),
+  );
+  assertEquals(res.status, 200);
+});
+
+Deno.test("corpo contendo role: 'super_admin' NÃO eleva um papel realmente insuficiente (seller) => continua 403", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload({ role: "super_admin" })),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["seller"] }) }),
+  );
+  assertEquals(res.status, 403);
 });
 
 Deno.test("usuário sem NENHUM papel em user_roles => 403, mesma resposta genérica de papel insuficiente", async () => {

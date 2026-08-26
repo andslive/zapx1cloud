@@ -41,6 +41,7 @@ import {
 } from "../_shared/meta-webhook-hookcloud-secret.ts";
 import { resolveHookCloudWebhookMode } from "../_shared/meta-webhook-hookcloud-mode.ts";
 import { isMetaCloudApiEnabled } from "../_shared/meta-cloud-flags.ts";
+import { isHookCloudAuthorizedRole } from "../_shared/hookcloud-authorization.ts";
 import {
   buildCorsDecision,
   CREDENTIAL_RESPONSE_HEADERS,
@@ -58,17 +59,15 @@ import {
 // aplicado só quando há um `Origin` de navegador real e permitido —
 // nunca um valor estático, nunca `*`.
 
-// FASE 21B — contrato do piloto HookCloud restringe este endpoint a
-// EXCLUSIVAMENTE 'super_admin'. Até a Fase 21A, este conjunto também
-// incluía 'admin' de organização (comentário histórico: "papel mínimo
-// exigido — mais restrito que create-team-member... só 'admin'/
-// 'super_admin' — nunca 'manager'/'seller'"). O gate de prontidão da
-// Fase 21A confirmou que isso não satisfazia o requisito literal de
-// "autorização exclusiva de Super Admin" definido para este piloto —
-// provisionar uma conexão com um Meta Access Token real é sensível o
-// bastante para não confiar em nenhum papel de organização, mesmo
-// 'admin'. 'manager'/'seller' continuam, como sempre, fora de cogitação.
-const REQUIRED_ROLES = new Set(["super_admin"]);
+// FASE 21G — decisão de papel canônica, importada de
+// `_shared/hookcloud-authorization.ts` (única fonte, nunca duplicada
+// aqui ou em `hookcloud-rotate-credentials`). Histórico: a Fase 21B
+// havia restringido para exclusivamente 'super_admin' (achado da
+// Fase 21A); a Fase 21G reverteu isso por decisão explícita do usuário
+// — 'admin' volta a ser permitido, mas só dentro da própria organização
+// do perfil autenticado (ver derivação de `organizationId` abaixo, que
+// nunca aceita o valor do cliente como autoridade). 'manager'/'seller'
+// continuam, como sempre, fora de cogitação.
 
 // ── Interfaces mínimas — injetáveis para teste, sem tipo concreto do SDK ─
 
@@ -222,8 +221,7 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
     .select("role")
     .eq("user_id", caller.id);
   const roles: string[] = (roleRows ?? []).map((r: any) => r.role);
-  const isAuthorizedRole = roles.some((r) => REQUIRED_ROLES.has(r));
-  if (!isAuthorizedRole) {
+  if (!isHookCloudAuthorizedRole(roles)) {
     return jsonResponse(403, { error: "insufficient_role" });
   }
 
@@ -509,9 +507,10 @@ export async function routeProvisionConnectionRequest(
 // rodam sem `--allow-net`) — mesmo padrão já usado em
 // `meta-cloud-webhook/index.ts` desde a Fase 2A. Nenhum código roda no
 // carregamento do módulo além de literais estáticos (`corsHeaders`
-// removido, `REQUIRED_ROLES`) — nenhuma chamada de banco, nenhuma
-// geração de credencial, nenhuma leitura de body acontece até que uma
-// requisição HTTP real chegue.
+// removido, `HOOKCLOUD_AUTHORIZED_ROLES` importado de
+// `_shared/hookcloud-authorization.ts`) — nenhuma chamada de banco,
+// nenhuma geração de credencial, nenhuma leitura de body acontece até
+// que uma requisição HTTP real chegue.
 
 if (import.meta.main) {
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
