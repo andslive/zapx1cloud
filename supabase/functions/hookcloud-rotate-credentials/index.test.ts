@@ -15,6 +15,7 @@ import {
 } from "./index.ts";
 import { hashHookCloudVerifyToken, hashHookCloudWebhookSecret } from "../_shared/meta-webhook-hookcloud-secret.ts";
 import { HOOKCLOUD_ADMIN_MAX_BODY_BYTES } from "../_shared/hookcloud-admin-http.ts";
+import { assertOnlyRealProfileColumns } from "../_shared/hookcloud-profiles-fixture.ts";
 
 const CALLER_ID = "user-1";
 const ORG_ID = "org-a";
@@ -25,10 +26,14 @@ function authClient(userId: string | null): AuthClientLike {
   return { auth: { getUser: async () => ({ data: { user: userId ? { id: userId } : null } }) } };
 }
 
+/** FASE 21K.1 — mesmos cenários reais de `is_active` usados em `hookcloud-provision-connection/index.test.ts` — nunca mais um `profileDisabled` que não corresponde a nenhuma coluna real. */
+type ProfileIsActiveScenario = boolean | null | "absent" | "invalid_type";
+
 interface AdminMockConfig {
   profileOrgId?: string | null;
-  profileDisabled?: boolean;
-  profileIsActive?: boolean;
+  profileIsActive?: ProfileIsActiveScenario;
+  /** Simula um erro real de consulta (coluna inexistente, RLS, rede) — `data` sempre `null` nesse caso, como o supabase-js real faria. */
+  profileQueryError?: boolean;
   roles?: string[];
   rpcResult?: { data: any; error: { code?: string; message?: string } | null };
   rpcCalls?: Array<{ fn: string; args: Record<string, unknown> }>;
@@ -40,6 +45,13 @@ function adminClient(config: AdminMockConfig): AdminSupabaseLike {
     from(table: string) {
       return {
         select(_columns: string) {
+          if (table === "profiles") {
+            // FASE 21K.1 — mesma validação que o PostgREST real faria:
+            // qualquer coluna que não exista de verdade em `profiles`
+            // (ex.: `disabled`) faz o mock lançar, nunca aceitar em
+            // silêncio.
+            assertOnlyRealProfileColumns(_columns);
+          }
           return {
             eq(_column: string, _value: unknown) {
               const thenable = {
@@ -52,16 +64,18 @@ function adminClient(config: AdminMockConfig): AdminSupabaseLike {
                 },
                 async maybeSingle() {
                   if (table === "profiles") {
-                    return {
-                      data: config.profileOrgId !== undefined && config.profileOrgId !== null
-                        ? {
-                          organization_id: config.profileOrgId,
-                          disabled: config.profileDisabled ?? false,
-                          is_active: config.profileIsActive ?? true,
-                        }
-                        : null,
-                      error: null,
-                    };
+                    if (config.profileQueryError) {
+                      return { data: null, error: { message: "simulated: coluna inexistente ou falha de rede" } };
+                    }
+                    if (config.profileOrgId === undefined || config.profileOrgId === null) {
+                      return { data: null, error: null };
+                    }
+                    const scenario: ProfileIsActiveScenario = config.profileIsActive === undefined ? true : config.profileIsActive;
+                    const row: Record<string, unknown> = { organization_id: config.profileOrgId };
+                    if (scenario !== "absent") {
+                      row.is_active = scenario === "invalid_type" ? "yes" : scenario;
+                    }
+                    return { data: row, error: null };
                   }
                   return { data: null, error: null };
                 },
@@ -211,12 +225,106 @@ Deno.test("usuário sem NENHUM papel em user_roles => 403, mesma resposta genér
   assertEquals(body.error, "insufficient_role");
 });
 
-Deno.test("usuário desativado (profiles.disabled=true) => 403", async () => {
+Deno.test("21K.1) profiles.is_active=true, papel admin => permitido", async () => {
   const res = await handleRotateCredentialsRequest(
     req(validPayload()),
-    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileDisabled: true }) }),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileIsActive: true }) }),
+  );
+  assertEquals(res.status, 200);
+});
+
+Deno.test("21K.1) profiles.is_active=true, papel super_admin => permitido", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileIsActive: true }) }),
+  );
+  assertEquals(res.status, 200);
+});
+
+Deno.test("usuário desativado (profiles.is_active=false) => 403", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileIsActive: false }) }),
   );
   assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "user_disabled");
+});
+
+Deno.test("21K.1) profiles.is_active=null => 403 (falha fechada, nunca trata null como ativo)", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileIsActive: null }) }),
+  );
+  assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "user_disabled");
+});
+
+Deno.test("21K.1) profiles.is_active ausente da linha retornada => 403 (falha fechada, nunca trata undefined como ativo)", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileIsActive: "absent" }) }),
+  );
+  assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "user_disabled");
+});
+
+Deno.test("21K.1) profiles.is_active com tipo inválido (string, não boolean) => 403 (comparação estrita ===true)", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileIsActive: "invalid_type" }) }),
+  );
+  assertEquals(res.status, 403);
+});
+
+Deno.test("21K.1) perfil não encontrado (nenhuma linha em profiles) => 403 no_organization", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: null, roles: ["super_admin"] }) }),
+  );
+  assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "no_organization");
+});
+
+Deno.test("21K.1) erro real na consulta a profiles (coluna inexistente/RLS/rede) => falha fechada com a MESMA resposta genérica, nunca 500 nem detalhe do erro", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileQueryError: true }) }),
+  );
+  assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "no_organization");
+});
+
+Deno.test("21K.1) mock contendo SOMENTE colunas reais de profiles funciona normalmente", async () => {
+  const res = await handleRotateCredentialsRequest(
+    req(validPayload()),
+    baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["admin"], profileIsActive: true }) }),
+  );
+  assertEquals(res.status, 200);
+});
+
+Deno.test("21K.1) assertOnlyRealProfileColumns rejeita 'disabled' diretamente — é isto que protege os dois endpoints de regressão", async () => {
+  const { assertOnlyRealProfileColumns } = await import("../_shared/hookcloud-profiles-fixture.ts");
+  let threw = false;
+  try {
+    assertOnlyRealProfileColumns("organization_id, disabled, is_active");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "assertOnlyRealProfileColumns deveria rejeitar 'disabled' — coluna que não existe em profiles");
+});
+
+Deno.test("21K.1) endpoint real (index.ts) nunca mais seleciona 'disabled' de profiles — prova estrutural lendo o próprio arquivo-fonte", async () => {
+  const source = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  const selectCalls = source.match(/\.select\("organization_id[^"]*"\)/g) ?? [];
+  assert(selectCalls.length > 0, "esperava encontrar ao menos um .select(\"organization_id...\") no arquivo");
+  for (const call of selectCalls) {
+    assert(!call.includes("disabled"), `select() de profiles não deve mais pedir 'disabled': ${call}`);
+  }
 });
 
 Deno.test("organization_id enviado divergente do real => 403, cross-tenant rejeitado ANTES da RPC", async () => {

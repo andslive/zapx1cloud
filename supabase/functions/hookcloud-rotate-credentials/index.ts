@@ -7,7 +7,7 @@
 //
 // Reaproveita, sem duplicar: o MESMO padrão de autorização real já usado
 // em hookcloud-provision-connection/index.ts (JWT via anon client +
-// profiles.organization_id + profiles.disabled/is_active + user_roles,
+// profiles.organization_id + profiles.is_active + user_roles,
 // papel restrito a admin/super_admin — Fase 21G, política canônica
 // única em `_shared/hookcloud-authorization.ts`, nunca duplicada aqui);
 // generateHookCloudCallbackSecret/
@@ -123,16 +123,27 @@ export async function handleRotateCredentialsRequest(req: Request, deps: RotateH
 
   // 2) organization_id do perfil real — nunca do corpo da requisição —
   // e checagem de usuário desativado/suspenso (mesmo achado da Fase 13B).
+  //
+  // FASE 21K.1 (achado crítico da Fase 21K) — `profiles` real no Cloud
+  // nunca teve coluna `disabled` (só `is_active`, boolean, nullable,
+  // default `true` — confirmado via `information_schema`/`pg_attribute`).
+  // O `.select()` anterior pedindo `disabled` falhava contra o schema
+  // real, deixando `profile` sempre `null` para qualquer chamada
+  // autenticada real — nunca pego pelos testes, cujo mock incluía um
+  // campo inexistente no banco de verdade. Corrigido para usar
+  // EXCLUSIVAMENTE `is_active`, mesma semântica do resto do app: só
+  // `is_active === true` estrito é considerado ativo — `false`, `null`,
+  // `undefined` ou qualquer outro tipo falha fechado.
   const { data: profile } = await deps.adminClient
     .from("profiles")
-    .select("organization_id, disabled, is_active")
+    .select("organization_id, is_active")
     .eq("id", caller.id)
     .maybeSingle();
 
   if (!profile?.organization_id) {
     return jsonResponse(403, { error: "no_organization" });
   }
-  if (profile.disabled === true || profile.is_active === false) {
+  if (profile.is_active !== true) {
     return jsonResponse(403, { error: "user_disabled" });
   }
 
