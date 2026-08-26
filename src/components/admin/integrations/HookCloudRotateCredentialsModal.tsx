@@ -29,10 +29,10 @@
 //     navegador enquanto o segredo não foi confirmado como salvo, e
 //     `beforeunload` cobre reload/fechamento de aba — mesmos hooks já
 //     testados usados por `IntegrationsManager.tsx`;
-//   - visível e utilizável SOMENTE por super_admin (mesmo contrato
-//     exclusivo do backend, `REQUIRED_ROLES` em
-//     `hookcloud-rotate-credentials/index.ts`) — esconder o botão aqui
-//     não substitui a checagem do backend, é defesa complementar.
+//   - visível e utilizável somente por admin/super_admin (Fase 21G,
+//     mesma política canônica do backend — `canManageHookCloud`/
+//     `_shared/hookcloud-authorization.ts`) — esconder o botão aqui não
+//     substitui a checagem do backend, é defesa complementar.
 
 import { useState } from 'react';
 import {
@@ -64,6 +64,7 @@ import {
 import { getHookCloudCallbackExpectedOrigin } from '@/lib/hookcloud/hookcloudRuntimeConfig';
 import type { HookCloudSensitiveLifecycle } from '@/lib/hookcloud/hookcloudProvisioning';
 import { hookCloudLifecycleBlockMessage } from '@/lib/hookcloud/hookcloudProvisioning';
+import { canManageHookCloud } from '@/lib/hookcloud/hookCloudAuthorization';
 import { HookCloudSecretRevealModal, type HookCloudSecretRevealModalContent } from './HookCloudSecretRevealModal';
 
 interface HookCloudRotateCredentialsModalProps {
@@ -89,7 +90,7 @@ function buildRotateRevealContent(result: HookCloudRotateSuccess): HookCloudSecr
 
 export function HookCloudRotateCredentialsModal({ connectionId }: HookCloudRotateCredentialsModalProps) {
   const queryClient = useQueryClient();
-  const { profile, isSuperAdmin } = useAuth();
+  const { profile, roles } = useAuth();
   const [formOpen, setFormOpen] = useState(false);
   const [rotateCallback, setRotateCallback] = useState(true);
   const [rotateVerify, setRotateVerify] = useState(true);
@@ -157,16 +158,17 @@ export function HookCloudRotateCredentialsModal({ connectionId }: HookCloudRotat
     }
   };
 
-  // FASE 21B — mesma restrição do backend (`hookcloud-rotate-credentials`,
-  // REQUIRED_ROLES exclusivo de super_admin): esconder este botão para
-  // quem não é super_admin NÃO é a proteção real (o backend já rejeita
-  // de forma independente), mas evita oferecer uma ação que sempre
-  // resultaria em 403 e evita expor a existência do fluxo de rotação a
-  // um papel que nunca deveria vê-lo. Hooks acima continuam sendo
-  // chamados incondicionalmente (regra de hooks do React) — para
-  // qualquer usuário sem acesso, `formOpen`/`result` nunca saem de seus
-  // valores iniciais, então esses hooks permanecem inertes.
-  if (!isSuperAdmin()) return null;
+  // FASE 21G — mesma política canônica do backend
+  // (`hookcloud-rotate-credentials`, `canManageHookCloud`): esconder
+  // este botão para quem não é admin/super_admin NÃO é a proteção real
+  // (o backend já rejeita de forma independente), mas evita oferecer
+  // uma ação que sempre resultaria em 403 e evita expor a existência do
+  // fluxo de rotação a um papel que nunca deveria vê-lo. Hooks acima
+  // continuam sendo chamados incondicionalmente (regra de hooks do
+  // React) — para qualquer usuário sem acesso, `formOpen`/`result`
+  // nunca saem de seus valores iniciais, então esses hooks permanecem
+  // inertes.
+  if (!canManageHookCloud(roles)) return null;
 
   return (
     <>
