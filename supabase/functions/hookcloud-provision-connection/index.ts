@@ -197,19 +197,33 @@ export async function handleProvisionRequest(req: Request, deps: ProvisionHookCl
   // organization_id, ele só é usado para CONFIRMAR que bate com o real;
   // nunca como autoridade por si só — ver validação cross-tenant abaixo).
   // FASE 13B (achado de revisão): também confirma que o usuário não está
-  // desativado/suspenso (`profiles.disabled`/`is_active`) — um JWT ainda
-  // válido não deveria bastar para provisionar uma conexão Meta real se a
-  // conta já foi desativada pela própria organização.
+  // desativado — um JWT ainda válido não deveria bastar para provisionar
+  // uma conexão Meta real se a conta já foi desativada pela própria
+  // organização.
+  //
+  // FASE 21K.1 (achado crítico da Fase 21K) — `profiles` real no Cloud
+  // NUNCA teve uma coluna `disabled` (confirmado via `information_schema`
+  // e `pg_attribute`; só existe `is_active`, boolean, nullable, default
+  // `true`). O `.select()` anterior pedia `disabled` e falhava contra o
+  // schema real — PostgREST rejeita coluna inexistente — fazendo
+  // `profile` ficar sempre `null` para QUALQUER chamada autenticada real
+  // (nunca detectado pelos testes, cujo mock de `profiles` incluía um
+  // campo que nunca existiu no banco de verdade). Corrigido para usar
+  // EXCLUSIVAMENTE `is_active`, com a mesma semântica já usada em todo o
+  // resto do app (`.eq('is_active', true)` — ver outras dezenas de
+  // ocorrências no repositório): perfil só é considerado ativo quando
+  // `is_active === true` estritamente — `false`, `null`, `undefined` ou
+  // qualquer tipo que não seja o booleano `true` falha fechado.
   const { data: profile } = await deps.adminClient
     .from("profiles")
-    .select("organization_id, disabled, is_active")
+    .select("organization_id, is_active")
     .eq("id", caller.id)
     .maybeSingle();
 
   if (!profile?.organization_id) {
     return jsonResponse(403, { error: "no_organization" });
   }
-  if (profile.disabled === true || profile.is_active === false) {
+  if (profile.is_active !== true) {
     return jsonResponse(403, { error: "user_disabled" });
   }
 
