@@ -15,7 +15,7 @@ import {
 } from "./index.ts";
 import { hashHookCloudVerifyToken, hashHookCloudWebhookSecret } from "../_shared/meta-webhook-hookcloud-secret.ts";
 import { HOOKCLOUD_ADMIN_MAX_BODY_BYTES } from "../_shared/hookcloud-admin-http.ts";
-import { assertOnlyRealProfileColumns } from "../_shared/hookcloud-profiles-fixture.ts";
+import { assertOnlyRealProfileColumns, type CanonicalHookCloudProfileRow } from "../_shared/hookcloud-profiles-fixture.ts";
 
 const CALLER_ID = "user-1";
 const ORG_ID = "org-a";
@@ -71,9 +71,14 @@ function adminClient(config: AdminMockConfig): AdminSupabaseLike {
                       return { data: null, error: null };
                     }
                     const scenario: ProfileIsActiveScenario = config.profileIsActive === undefined ? true : config.profileIsActive;
-                    const row: Record<string, unknown> = { organization_id: config.profileOrgId };
+                    // FASE 21K.2 (achado da revisão independente) — mesma
+                    // correção do teste de provisionamento: tipado como
+                    // `Partial<CanonicalHookCloudProfileRow>`, não mais
+                    // `Record<string, unknown>`, para que o excess property
+                    // checking do TypeScript realmente se aplique aqui.
+                    const row: Partial<CanonicalHookCloudProfileRow> = { organization_id: config.profileOrgId };
                     if (scenario !== "absent") {
-                      row.is_active = scenario === "invalid_type" ? "yes" : scenario;
+                      row.is_active = scenario === "invalid_type" ? ("yes" as any) : scenario;
                     }
                     return { data: row, error: null };
                   }
@@ -277,6 +282,45 @@ Deno.test("21K.1) profiles.is_active com tipo inválido (string, não boolean) =
     baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileIsActive: "invalid_type" }) }),
   );
   assertEquals(res.status, 403);
+});
+
+// FASE 21K.2 (achado da revisão independente) — mesmo caso numérico
+// adicionado no teste de provisionamento, para manter a equivalência
+// exata entre os dois endpoints.
+Deno.test("21K.1/21K.2) profiles.is_active=1 (número, não boolean) => 403 — comparação estrita nunca trata 1 como true", async () => {
+  const numericAdminClient: AdminSupabaseLike = {
+    from(table: string) {
+      return {
+        select(_columns: string) {
+          if (table === "profiles") assertOnlyRealProfileColumns(_columns);
+          return {
+            eq(_column: string, _value: unknown) {
+              const thenable = {
+                then(resolve: (v: { data: any[] | null; error: any }) => void) {
+                  if (table === "user_roles") resolve({ data: [{ role: "super_admin" }], error: null });
+                  else resolve({ data: [], error: null });
+                },
+                async maybeSingle() {
+                  if (table === "profiles") {
+                    return { data: { organization_id: ORG_ID, is_active: 1 }, error: null };
+                  }
+                  return { data: null, error: null };
+                },
+              };
+              return thenable as any;
+            },
+          };
+        },
+      };
+    },
+    async rpc() {
+      return { data: { connection_id: CONNECTION_ID, onboarding_state: "pending" }, error: null };
+    },
+  };
+  const res = await handleRotateCredentialsRequest(req(validPayload()), baseDeps({ adminClient: numericAdminClient }));
+  assertEquals(res.status, 403);
+  const body = await res.json();
+  assertEquals(body.error, "user_disabled");
 });
 
 Deno.test("21K.1) perfil não encontrado (nenhuma linha em profiles) => 403 no_organization", async () => {

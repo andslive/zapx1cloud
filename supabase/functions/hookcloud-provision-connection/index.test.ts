@@ -22,7 +22,7 @@ import {
   verifyHookCloudVerifyToken,
   verifyHookCloudWebhookSecret,
 } from "../_shared/meta-webhook-hookcloud-secret.ts";
-import { assertOnlyRealProfileColumns } from "../_shared/hookcloud-profiles-fixture.ts";
+import { assertOnlyRealProfileColumns, type CanonicalHookCloudProfileRow } from "../_shared/hookcloud-profiles-fixture.ts";
 
 const CALLER_ID = "user-1";
 const ORG_ID = "org-a";
@@ -86,9 +86,17 @@ function adminClient(config: AdminMockConfig): AdminSupabaseLike {
                       return { data: null, error: null };
                     }
                     const scenario: ProfileIsActiveScenario = config.profileIsActive === undefined ? true : config.profileIsActive;
-                    const row: Record<string, unknown> = { organization_id: config.profileOrgId };
+                    // FASE 21K.2 (achado da revisão independente) — tipado
+                    // como `Partial<CanonicalHookCloudProfileRow>`, não mais
+                    // `Record<string, unknown>`: agora o TypeScript aplica
+                    // "excess property checking" de verdade nesta linha —
+                    // atribuir `row.qualquerCoisa = ...` deixaria de
+                    // compilar. `as any` só no cenário deliberado de tipo
+                    // inválido (o próprio propósito daquele teste é
+                    // simular um valor corrompido em runtime).
+                    const row: Partial<CanonicalHookCloudProfileRow> = { organization_id: config.profileOrgId };
                     if (scenario !== "absent") {
-                      row.is_active = scenario === "invalid_type" ? "yes" : scenario;
+                      row.is_active = scenario === "invalid_type" ? ("yes" as any) : scenario;
                     }
                     return { data: row, error: null };
                   }
@@ -783,6 +791,49 @@ Deno.test("21K.1) profiles.is_active com tipo inválido (string, não boolean) =
       baseDeps({ adminClient: adminClient({ profileOrgId: ORG_ID, roles: ["super_admin"], profileIsActive: "invalid_type" }) }),
     );
     assertEquals(res.status, 403);
+  });
+});
+
+// FASE 21K.2 (achado da revisão independente) — o cenário numérico (`1`,
+// que em JS é "truthy" mas NUNCA `=== true`) não estava coberto
+// explicitamente por nenhum teste, apesar de `!== true` já ser
+// estritamente correto para esse caso. Mock ad-hoc local, fora do enum
+// `ProfileIsActiveScenario`, exatamente para exercitar esse valor exato.
+Deno.test("21K.1/21K.2) profiles.is_active=1 (número, não boolean) => 403 — comparação estrita nunca trata 1 como true", async () => {
+  await withHookCloudPilotEnv(async () => {
+    const numericAdminClient: AdminSupabaseLike = {
+      from(table: string) {
+        return {
+          select(_columns: string) {
+            if (table === "profiles") assertOnlyRealProfileColumns(_columns);
+            return {
+              eq(_column: string, _value: unknown) {
+                const thenable = {
+                  then(resolve: (v: { data: any[] | null; error: any }) => void) {
+                    if (table === "user_roles") resolve({ data: [{ role: "super_admin" }], error: null });
+                    else resolve({ data: [], error: null });
+                  },
+                  async maybeSingle() {
+                    if (table === "profiles") {
+                      return { data: { organization_id: ORG_ID, is_active: 1 }, error: null };
+                    }
+                    return { data: null, error: null };
+                  },
+                };
+                return thenable as any;
+              },
+            };
+          },
+        };
+      },
+      async rpc() {
+        return { data: { connection_id: "conn-numeric", onboarding_state: "pending" }, error: null };
+      },
+    };
+    const res = await handleProvisionRequest(req(validPayload()), baseDeps({ adminClient: numericAdminClient }));
+    assertEquals(res.status, 403);
+    const body = await res.json();
+    assertEquals(body.error, "user_disabled");
   });
 });
 
