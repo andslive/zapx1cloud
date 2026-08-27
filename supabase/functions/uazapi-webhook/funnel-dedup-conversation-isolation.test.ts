@@ -112,20 +112,30 @@ Deno.test("acquireFunnelRunGate: erro genérico de banco -> acquired=false, reas
   }
 });
 
-Deno.test("acquireFunnelRunGate: sem leadId -> acquired=true, gated=false, NENHUM insert é tentado", async () => {
+Deno.test("acquireFunnelRunGate: sem leadId (null) -> acquired=false, reason=missing_lead_id, FALHA FECHADA, nenhum insert (revisão adversarial 2026-08-27)", async () => {
   const client = fakeSupabase();
   const result = await acquireFunnelRunGate(client, { leadId: null, funnelId: FUNNEL_ID });
-  assertEquals(result.acquired, true);
-  if (result.acquired) {
-    assertEquals(result.gated, false);
+  assertEquals(result.acquired, false);
+  if (!result.acquired) {
+    assertEquals((result as any).reason, "missing_lead_id");
   }
   assertEquals(client._insertCalls.length, 0);
 });
 
-Deno.test("acquireFunnelRunGate: leadId undefined (não só null) também não gateia e não insere", async () => {
+Deno.test("acquireFunnelRunGate: leadId undefined (não só null) também falha fechada e não insere", async () => {
   const client = fakeSupabase();
   const result = await acquireFunnelRunGate(client, { leadId: undefined, funnelId: FUNNEL_ID });
-  assertEquals(result.acquired, true);
+  assertEquals(result.acquired, false);
+  if (!result.acquired) {
+    assertEquals((result as any).reason, "missing_lead_id");
+  }
+  assertEquals(client._insertCalls.length, 0);
+});
+
+Deno.test("acquireFunnelRunGate: leadId vazio ('') também falha fechada (mesmo tratamento que null/undefined)", async () => {
+  const client = fakeSupabase();
+  const result = await acquireFunnelRunGate(client, { leadId: "", funnelId: FUNNEL_ID });
+  assertEquals(result.acquired, false);
   assertEquals(client._insertCalls.length, 0);
 });
 
@@ -203,4 +213,19 @@ Deno.test("Parte B: compensação (releaseFunnelRunGate) é chamada quando a cor
 Deno.test("Parte B: acquireFunnelRunGate e releaseFunnelRunGate são exportados (testáveis isoladamente)", async () => {
   assertEquals(typeof acquireFunnelRunGate, "function");
   assertEquals(typeof releaseFunnelRunGate, "function");
+});
+
+Deno.test("Achado da revisão adversarial: convData.lead_id local é atualizado após vincular/criar lead (evita gate stale-null)", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  assertEquals(
+    src.includes("(convData as any).lead_id = lead.id;"),
+    true,
+  );
+});
+
+Deno.test("Nenhum call site pode chegar ao gate com leadId potencialmente stale sem o fix acima presente antes da checagem de funil existente", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  const fixIdx = src.indexOf("(convData as any).lead_id = lead.id;");
+  const gateIdx = src.indexOf("leadId: convData?.lead_id,");
+  assertEquals(fixIdx > 0 && gateIdx > 0 && fixIdx < gateIdx, true);
 });
