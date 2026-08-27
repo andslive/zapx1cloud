@@ -306,6 +306,101 @@ type FunnelResolutionOrigin =
   | "connection_not_found"
   | "resolution_error";
 
+export type FunnelGateResult =
+  // gated=true: linha inserida em lead_funnel_history (historyId devolvido
+  // para permitir compensação — ver releaseFunnelRunGate), dedupe protegido.
+  // gated=false: sem lead_id ainda — não há chave de dedupe possível, segue
+  // o mesmo comportamento de hoje (sem proteção), só para observabilidade.
+  | { acquired: true; gated: true; historyId: string }
+  | { acquired: true; gated: false }
+  | { acquired: false; reason: "already_running" }
+  | { acquired: false; reason: "error"; message: string };
+
+/**
+ * Gate atômico de execução de funil (decisão de produto 2026-08-27, achado:
+ * o mesmo lead podia iniciar o mesmo funil em paralelo em duas conexões
+ * diferentes, sem nenhuma garantia atômica — a checagem "já completou?" não
+ * cobre "já está running agora"). O ledger `lead_funnel_history` deixa de
+ * ser só telemetria e passa a ser o próprio mecanismo de exclusão mútua:
+ * o INSERT com status='running' É a aquisição do direito de iniciar. Se o
+ * índice único parcial `idx_lead_funnel_history_one_running` (migration
+ * 20260827150100, ainda não aplicada em produção) já existir, um segundo
+ * INSERT concorrente para o mesmo (lead_id, funnel_id) falha com 23505 —
+ * tratado aqui como "already_running", nunca como erro genérico.
+ *
+ * Contrato: o chamador NUNCA deve setar current_flow_id/current_block_id
+ * nem enviar qualquer bloco antes de checar `acquired === true` aqui.
+ */
+export async function acquireFunnelRunGate(
+  supabase: any,
+  { leadId, funnelId }: { leadId: string | null | undefined; funnelId: string },
+): Promise<FunnelGateResult> {
+  if (!leadId) {
+    // Sem lead ainda vinculado: nada para dedupe contra. Não bloqueia —
+    // preserva o comportamento pré-existente para esse caso de borda.
+    return { acquired: true, gated: false };
+  }
+
+  const { data, error } = await supabase
+    .from("lead_funnel_history")
+    .insert({
+      lead_id: leadId,
+      funnel_id: funnelId,
+      status: "running",
+      started_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (!error) {
+    return { acquired: true, gated: true, historyId: data.id };
+  }
+
+  if ((error as any).code === "23505") {
+    console.log(
+      "[FUNNEL_GATE] already_running — segunda execução automática bloqueada:",
+      JSON.stringify({ lead_id: leadId, funnel_id: funnelId }),
+    );
+    return { acquired: false, reason: "already_running" };
+  }
+
+  // Fail-closed: qualquer outro erro de banco NUNCA inicia o funil.
+  // Deliberadamente SEM catch silencioso — este é o gate autoritativo.
+  console.error(
+    "[FUNNEL_GATE] db_error acquiring run gate — funnel NOT started (fail-closed):",
+    JSON.stringify({ lead_id: leadId, funnel_id: funnelId, message: (error as any)?.message }),
+  );
+  return { acquired: false, reason: "error", message: (error as any)?.message || String(error) };
+}
+
+/**
+ * Compensação: usada quando o gate foi adquirido (linha 'running' inserida)
+ * mas o funil acabou não sendo efetivamente fixado na conversa (ex.: perdeu
+ * a corrida de CAS para outra mensagem quase simultânea NA MESMA conversa).
+ * Sem isso, a linha 'running' órfã bloquearia para sempre uma nova tentativa
+ * legítima do mesmo (lead_id, funnel_id) em qualquer conexão.
+ */
+export async function releaseFunnelRunGate(
+  supabase: any,
+  historyId: string,
+): Promise<void> {
+  const { error } = await supabase
+    .from("lead_funnel_history")
+    .delete()
+    .eq("id", historyId);
+  if (error) {
+    console.error(
+      "[FUNNEL_GATE] failed to release orphaned running row (compensation failed):",
+      JSON.stringify({ historyId, message: error.message }),
+    );
+  } else {
+    console.log(
+      "[FUNNEL_GATE] released orphaned running row (lost CAS pin race on same conversation):",
+      JSON.stringify({ historyId }),
+    );
+  }
+}
+
 export async function resolveFunnelCandidates(
   supabase: any,
   { organizationId, connectionId }: { organizationId: string; connectionId: string | null },
@@ -4232,20 +4327,23 @@ Deno.serve(async (req) => {
         senderName,
       );
 
-      // Find or create conversation for this phone + org.
-      // Estratégia tolerante a troca de instância:
-      //   1) Tenta achar conversa aberta com a MESMA instância.
-      //   2) Se não achar, busca qualquer conversa aberta do mesmo (org, telefone, whatsapp)
-      //      sem filtrar instância — assim PRESERVAMOS o histórico do contato mesmo
-      //      quando o número é reconectado/migrado para outra instância.
-      // NÃO fechamos conversas duplicadas automaticamente: o histórico do atendente
-      // nunca pode sumir por trás dele. Se houver duplicatas, o atendente encerra
-      // manualmente quando quiser.
+      // Find or create conversation for this phone + org + CONEXÃO.
+      // Decisão de produto (auditoria 2026-08-27, achado: mensagem do
+      // chip17new sendo anexada à conversa da instância piloto): cada
+      // conexão tem sua própria conversa. O lead continua compartilhado por
+      // telefone dentro da organização, mas NUNCA reutilizamos, movemos ou
+      // sobrescrevemos automaticamente uma conversa de outra conexão — nem
+      // mesmo quando a conexão antiga está inativa/arquivada. Migração de
+      // histórico entre conexões é, deliberadamente, uma operação manual
+      // futura, fora deste webhook.
       let conversationId: string | null = null;
       let existing: { id: string } | null = null;
 
-      // Busca por telefone NORMALIZADO (canonical BR), tolerante a 55/+55/9 móvel.
-      // Aceita também conversa FECHADA do mesmo número e reabre — assim nunca duplicamos.
+      // Busca por telefone NORMALIZADO (canonical BR) + MESMA conexão que
+      // recebeu este evento. Aceita também conversa FECHADA do mesmo número
+      // NESTA conexão e reabre — assim nunca duplicamos dentro da mesma
+      // conexão. Não há fallback para "qualquer conversa aberta do mesmo
+      // telefone" em outra conexão — isso é proibido por decisão de produto.
       const { data: existingByPhone } = await supabase
         .from("webchat_conversations")
         .select(
@@ -4254,7 +4352,7 @@ Deno.serve(async (req) => {
         .eq("organization_id", instance.organization_id)
         .eq("channel", "whatsapp")
         .eq("visitor_phone_normalized", phoneCanonical)
-        .order("evolution_instance_id", { ascending: false, nullsFirst: false })
+        .eq("connection_id", instance.id)
         .order("product_id", { ascending: false, nullsFirst: false })
         .order("status", { ascending: true }) // 'closed' fica por último
         .order("last_message_at", { ascending: false, nullsFirst: false })
@@ -4269,6 +4367,7 @@ Deno.serve(async (req) => {
           let funnelToRunReopen:
             | { id: string; start_block_id: string | null }
             | null = null;
+          let funnelToRunReopenGateHistoryId: string | null = null;
           let funnelResolutionOriginReopen: FunnelResolutionOrigin = "connection_not_found";
           try {
             const { candidates, origin } = await resolveFunnelCandidates(supabase, {
@@ -4328,6 +4427,23 @@ Deno.serve(async (req) => {
                 }
               }
 
+              // Gate atômico: adquire o direito de rodar ANTES de setar
+              // qualquer coisa na conversa. Se outra conexão já está com
+              // este (lead_id, funnel_id) running, não inicia aqui.
+              const reopenGate = await acquireFunnelRunGate(supabase, {
+                leadId,
+                funnelId: cand.id,
+              });
+              if (!reopenGate.acquired) {
+                console.log(
+                  "[FUNNEL_RESOLUTION] gate not acquired (reopen) — automação não iniciada nesta conexão:",
+                  JSON.stringify({ reason: (reopenGate as any).reason, lead_id: leadId, funnel_id: cand.id, conversation_id: existingByPhone.id, ctx: "reopen" }),
+                );
+                continue;
+              }
+              if (reopenGate.gated) {
+                funnelToRunReopenGateHistoryId = reopenGate.historyId;
+              }
 
               funnelToRunReopen = {
                 id: cand.id,
@@ -4385,6 +4501,13 @@ Deno.serve(async (req) => {
               "[FUNNEL_RESOLUTION] reopen race lost — conversation already reopened by a concurrent request:",
               JSON.stringify({ conversation_id: existingByPhone.id, persisted_flow_id: reopenResult.current_flow_id }),
             );
+            // Perdemos a corrida de CAS na MESMA conversa: o funil que
+            // adquirimos o gate para rodar não foi de fato fixado. Libera a
+            // linha 'running' órfã para não bloquear uma tentativa futura
+            // legítima do mesmo (lead_id, funnel_id).
+            if (funnelToRunReopenGateHistoryId) {
+              await releaseFunnelRunGate(supabase, funnelToRunReopenGateHistoryId);
+            }
           }
           console.log(
             "[uazapi-webhook] reopened closed conversation for phone:",
@@ -4395,7 +4518,9 @@ Deno.serve(async (req) => {
         }
       }
 
-      // Telemetria: se houver mais de uma conversa aberta, apenas logamos.
+      // Telemetria: com conversa por conexão, é NORMAL um mesmo telefone ter
+      // mais de uma conversa aberta simultânea (uma por conexão). Isto é
+      // apenas contagem informativa, não um alerta de duplicidade indevida.
       try {
         const { count: openCount } = await supabase
           .from("webchat_conversations")
@@ -4406,7 +4531,7 @@ Deno.serve(async (req) => {
           .neq("status", "closed");
         if ((openCount ?? 0) > 1) {
           console.log(
-            `[uazapi-webhook] multiple open conversations for phone=${phone} count=${openCount} (NOT auto-closing — preserving history)`,
+            `[uazapi-webhook] phone=${phone} has ${openCount} open conversations across connections (expected with per-connection conversations)`,
           );
         }
       } catch (_) { /* non-fatal */ }
@@ -4489,6 +4614,7 @@ Deno.serve(async (req) => {
         let funnelToRunExisting:
           | { id: string; start_block_id: string | null }
           | null = null;
+        let funnelToRunExistingGateHistoryId: string | null = null;
 
         let funnelResolutionOriginExisting: FunnelResolutionOrigin = "connection_not_found";
         try {
@@ -4560,6 +4686,24 @@ Deno.serve(async (req) => {
 
               }
 
+              // Gate atômico: adquire o direito de rodar ANTES de setar
+              // qualquer coisa na conversa. Se outra conexão já está com
+              // este (lead_id, funnel_id) running, não inicia aqui.
+              const existingGate = await acquireFunnelRunGate(supabase, {
+                leadId: convData?.lead_id,
+                funnelId: cand.id,
+              });
+              if (!existingGate.acquired) {
+                console.log(
+                  "[FUNNEL_RESOLUTION] gate not acquired (existing) — automação não iniciada nesta conexão:",
+                  JSON.stringify({ reason: (existingGate as any).reason, lead_id: convData?.lead_id, funnel_id: cand.id, conversation_id: existing.id, ctx: "existing" }),
+                );
+                continue;
+              }
+              if (existingGate.gated) {
+                funnelToRunExistingGateHistoryId = existingGate.historyId;
+              }
+
               funnelToRunExisting = {
                 id: cand.id,
                 start_block_id: (cand as any).start_block_id || null,
@@ -4607,16 +4751,16 @@ Deno.serve(async (req) => {
               }),
             );
 
-            // Registrar início no histórico (só se nós de fato fixamos o funil)
-            if (wonPinning && convData?.lead_id) {
-              try {
-                await supabase.from("lead_funnel_history").insert({
-                  lead_id: convData.lead_id,
-                  funnel_id: funnelToRunExisting.id,
-                  status: 'running',
-                  started_at: new Date().toISOString()
-                });
-              } catch (_) { /* noop */ }
+            // O registro em lead_funnel_history já foi feito pelo gate
+            // atômico (acquireFunnelRunGate), ANTES de tentarmos fixar o
+            // funil na conversa. Se perdemos a corrida de CAS na MESMA
+            // conversa (outra mensagem quase simultânea já fixou outro
+            // valor), o funil que adquirimos o gate para rodar não foi de
+            // fato iniciado aqui — libera a linha 'running' órfã para não
+            // bloquear uma tentativa futura legítima do mesmo par
+            // (lead_id, funnel_id).
+            if (!wonPinning && funnelToRunExistingGateHistoryId) {
+              await releaseFunnelRunGate(supabase, funnelToRunExistingGateHistoryId);
             }
 
             console.log(
@@ -5127,6 +5271,7 @@ Deno.serve(async (req) => {
         // canal WhatsApp habilitado/compatível com "qualquer instância".
         let funnelToRun: { id: string; start_block_id: string | null } | null =
           null;
+        let funnelToRunGateHistoryId: string | null = null;
         let funnelResolutionOriginNew: FunnelResolutionOrigin = "connection_not_found";
         try {
           const { candidates, origin } = await resolveFunnelCandidates(supabase, {
@@ -5179,6 +5324,23 @@ Deno.serve(async (req) => {
               }
             }
 
+            // Gate atômico: adquire o direito de rodar ANTES de setar
+            // qualquer coisa na conversa nova. Se outra conexão já está com
+            // este (lead_id, funnel_id) running, não inicia aqui.
+            const newGate = await acquireFunnelRunGate(supabase, {
+              leadId: lead?.id,
+              funnelId: cand.id,
+            });
+            if (!newGate.acquired) {
+              console.log(
+                "[FUNNEL_RESOLUTION] gate not acquired (new) — automação não iniciada nesta conexão:",
+                JSON.stringify({ reason: (newGate as any).reason, lead_id: lead?.id, funnel_id: cand.id, ctx: "new" }),
+              );
+              continue;
+            }
+            if (newGate.gated) {
+              funnelToRunGateHistoryId = newGate.historyId;
+            }
 
             funnelToRun = {
               id: cand.id,
@@ -5292,35 +5454,37 @@ Deno.serve(async (req) => {
             connection_id: instance.id
           });
           
-          // Registrar início no histórico
+          // O registro em lead_funnel_history já foi feito pelo gate
+          // atômico (acquireFunnelRunGate) antes de `newConv` ser montado —
+          // aqui só logamos, sem inserir de novo.
           if (lead?.id && funnelToRun) {
             console.log("[INBOUND_FUNNEL_TRIGGERED] SUCCESS", {
               funnel_id: funnelToRun.id,
               lead_id: lead.id
             });
-            try {
-              await supabase.from("lead_funnel_history").insert({
-                lead_id: lead.id,
-                funnel_id: funnelToRun.id,
-                status: 'running',
-                started_at: new Date().toISOString()
-              });
-            } catch (_) { /* noop */ }
           } else if (lead?.id && !funnelToRun) {
             console.log("[INBOUND_FUNNEL_NOT_TRIGGERED] Reason: No matching funnel found for connection/content");
           }
         }
 
         if (convErr) {
+          // A conversa com o funil que adquirimos o gate para rodar NÃO foi
+          // criada — libera a linha 'running' órfã antes de decidir o que
+          // fazer com o erro (fail-closed: nunca deixa o ledger mentir).
+          if (funnelToRunGateHistoryId) {
+            await releaseFunnelRunGate(supabase, funnelToRunGateHistoryId);
+          }
 
           if ((convErr as any).code === "23505") {
-            // Race com outro fluxo — reusar conversa existente do mesmo telefone
+            // Race com outro fluxo — reusar conversa existente do mesmo
+            // telefone NESTA MESMA CONEXÃO (nunca de outra conexão — Parte A).
             const { data: race } = await supabase
               .from("webchat_conversations")
               .select("id")
               .eq("organization_id", instance.organization_id)
               .eq("channel", "whatsapp")
               .eq("visitor_phone_normalized", phoneCanonical)
+              .eq("connection_id", instance.id)
               .neq("status", "closed")
               .order("last_message_at", { ascending: false, nullsFirst: false })
               .limit(1)
@@ -5328,7 +5492,7 @@ Deno.serve(async (req) => {
             if (race?.id) {
               conversationId = race.id;
               console.log(
-                "[uazapi-webhook] reused conversation after 23505 race:",
+                "[uazapi-webhook] reused conversation after 23505 race (same connection):",
                 conversationId,
               );
             } else {
