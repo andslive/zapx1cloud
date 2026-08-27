@@ -8,6 +8,7 @@ import { encodeBase64 } from "https://deno.land/std@0.207.0/encoding/base64.ts";
 import { normalizePhoneBR, phoneVariantsBR } from "../_shared/phone.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { resolveAIProvider } from "../_shared/ai-credentials.ts";
+import { isConversationIsolationEnabled } from "../_shared/conversation-isolation-flags.ts";
 import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
 import {
   classifyReceiptMediaReadOnly,
@@ -310,6 +311,11 @@ export type FunnelGateResult =
   // gated=true: linha inserida em lead_funnel_history (historyId devolvido
   // para permitir compensação — ver releaseFunnelRunGate), dedupe protegido.
   | { acquired: true; gated: true; historyId: string }
+  // gated=false: SÓ ocorre em legacyMode (rollout gradual da feature flag,
+  // ver conversation_isolation_feature_flags) — replica o comportamento
+  // pré-existente sem nenhuma proteção de dedupe. Nunca ocorre fora do
+  // legacyMode.
+  | { acquired: true; gated: false }
   | { acquired: false; reason: "already_running" }
   | { acquired: false; reason: "missing_lead_id" }
   | { acquired: false; reason: "error"; message: string };
@@ -339,8 +345,30 @@ export type FunnelGateResult =
  */
 export async function acquireFunnelRunGate(
   supabase: any,
-  { leadId, funnelId }: { leadId: string | null | undefined; funnelId: string },
+  { leadId, funnelId, legacyMode }: { leadId: string | null | undefined; funnelId: string; legacyMode?: boolean },
 ): Promise<FunnelGateResult> {
+  // legacyMode: rollout gradual via conversation_isolation_feature_flags
+  // (migration 20260827145000). Enquanto a flag estiver desligada para a
+  // organização, replica EXATAMENTE o comportamento pré-existente
+  // (be3116b): insere em lead_funnel_history só se houver lead_id, ignora
+  // qualquer conflito (catch/noop), nunca bloqueia o início do funil.
+  // Existe só para permitir aplicar 150200 (drop do índice antigo) somente
+  // depois que 100% das organizações relevantes já estiverem na flag nova
+  // — nunca para contornar o gate em produção já migrada.
+  if (legacyMode) {
+    if (leadId) {
+      try {
+        await supabase.from("lead_funnel_history").insert({
+          lead_id: leadId,
+          funnel_id: funnelId,
+          status: "running",
+          started_at: new Date().toISOString(),
+        });
+      } catch (_) { /* legado: mesmo comportamento de be3116b, sem gate */ }
+    }
+    return { acquired: true, gated: false };
+  }
+
   if (!leadId) {
     console.error(
       "[FUNNEL_GATE] missing_lead_id — funnel NOT started (fail-closed, nenhum caso legítimo comprovado):",
@@ -3804,6 +3832,21 @@ Deno.serve(async (req) => {
 
     const instance = resolution.instance;
 
+    // Rollout gradual (migration 20260827145000, conversation_isolation_feature_flags):
+    // enquanto desligada para a organização, o comportamento é idêntico ao
+    // legado (be3116b) — necessário para poder aplicar 150000/150100 e
+    // publicar esta function ANTES do DROP do índice antigo
+    // (webchat_conv_open_phone_unique), sem depender de reentrega da UazAPI
+    // para nenhuma organização ainda não migrada.
+    // `as any`: mesma instanciação genérica excessivamente profunda de
+    // @supabase/supabase-js já contornada em startTyping() neste arquivo
+    // (duas instanciações distintas resolvidas via esm.sh) — não é uma
+    // mudança de comportamento, só evita o erro de tipo pré-existente.
+    const conversationIsolationEnabled = await isConversationIsolationEnabled(
+      supabase as any,
+      instance.organization_id,
+    );
+
     console.log("[INBOUND_INSTANCE_RESOLUTION] SUCCESS", {
       instance_id: instance.id,
       name: instance.name,
@@ -4352,15 +4395,24 @@ Deno.serve(async (req) => {
       // NESTA conexão e reabre — assim nunca duplicamos dentro da mesma
       // conexão. Não há fallback para "qualquer conversa aberta do mesmo
       // telefone" em outra conexão — isso é proibido por decisão de produto.
-      const { data: existingByPhone } = await supabase
+      //
+      // legacyMode (flag desligada para a org): replica a busca antiga,
+      // sem filtro de connection_id — rollout gradual, ver
+      // conversation_isolation_feature_flags.
+      let existingByPhoneQuery = supabase
         .from("webchat_conversations")
         .select(
           "id, status, lead_id, current_flow_id, flow_completed, product_id",
         )
         .eq("organization_id", instance.organization_id)
         .eq("channel", "whatsapp")
-        .eq("visitor_phone_normalized", phoneCanonical)
-        .eq("connection_id", instance.id)
+        .eq("visitor_phone_normalized", phoneCanonical);
+      if (conversationIsolationEnabled) {
+        existingByPhoneQuery = existingByPhoneQuery.eq("connection_id", instance.id);
+      } else {
+        existingByPhoneQuery = existingByPhoneQuery.order("evolution_instance_id", { ascending: false, nullsFirst: false });
+      }
+      const { data: existingByPhone } = await existingByPhoneQuery
         .order("product_id", { ascending: false, nullsFirst: false })
         .order("status", { ascending: true }) // 'closed' fica por último
         .order("last_message_at", { ascending: false, nullsFirst: false })
@@ -4441,6 +4493,7 @@ Deno.serve(async (req) => {
               const reopenGate = await acquireFunnelRunGate(supabase, {
                 leadId,
                 funnelId: cand.id,
+                legacyMode: !conversationIsolationEnabled,
               });
               if (!reopenGate.acquired) {
                 console.log(
@@ -4710,6 +4763,7 @@ Deno.serve(async (req) => {
               const existingGate = await acquireFunnelRunGate(supabase, {
                 leadId: convData?.lead_id,
                 funnelId: cand.id,
+                legacyMode: !conversationIsolationEnabled,
               });
               if (!existingGate.acquired) {
                 console.log(
@@ -5348,6 +5402,7 @@ Deno.serve(async (req) => {
             const newGate = await acquireFunnelRunGate(supabase, {
               leadId: lead?.id,
               funnelId: cand.id,
+              legacyMode: !conversationIsolationEnabled,
             });
             if (!newGate.acquired) {
               console.log(
@@ -5495,14 +5550,22 @@ Deno.serve(async (req) => {
 
           if ((convErr as any).code === "23505") {
             // Race com outro fluxo — reusar conversa existente do mesmo
-            // telefone NESTA MESMA CONEXÃO (nunca de outra conexão — Parte A).
-            const { data: race } = await supabase
+            // telefone NESTA MESMA CONEXÃO (nunca de outra conexão — Parte
+            // A). Em legacyMode (flag desligada), replica a busca antiga
+            // sem filtro de connection_id — inclusive cobre o conflito
+            // vindo do índice ANTIGO (webchat_conv_open_phone_unique,
+            // sem connection_id na chave), que só pode ocorrer enquanto
+            // 150200 (DROP do índice antigo) ainda não foi aplicada.
+            let raceQuery = supabase
               .from("webchat_conversations")
               .select("id")
               .eq("organization_id", instance.organization_id)
               .eq("channel", "whatsapp")
-              .eq("visitor_phone_normalized", phoneCanonical)
-              .eq("connection_id", instance.id)
+              .eq("visitor_phone_normalized", phoneCanonical);
+            if (conversationIsolationEnabled) {
+              raceQuery = raceQuery.eq("connection_id", instance.id);
+            }
+            const { data: race } = await raceQuery
               .neq("status", "closed")
               .order("last_message_at", { ascending: false, nullsFirst: false })
               .limit(1)

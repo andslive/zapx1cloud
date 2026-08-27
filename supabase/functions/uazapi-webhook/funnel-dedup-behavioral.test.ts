@@ -237,3 +237,104 @@ Deno.test("F: 23505 na criação de conversa nova recupera exclusivamente a conv
   assertEquals(recovered, null, "não deve recuperar a conversa da piloto para a conexão chip17new");
   assertEquals(recovered === pilotoConv, false);
 });
+
+// ---------------------------------------------------------------------
+// Coexistência transitória: índice antigo (sem connection_id) ainda existe
+// + índice novo (com connection_id) também existe + function nova já
+// publicada + flag de rollout controla o comportamento por organização.
+// Reproduz o cenário exato pedido na revisão adversarial: conversa aberta
+// na piloto, mensagem chega no chip17new.
+// ---------------------------------------------------------------------
+
+function fakeConversationStoreWithOldIndex() {
+  // Simula as DUAS constraints coexistindo:
+  //   old: UNIQUE (org, channel, phone) WHERE status<>'closed'
+  //   new: UNIQUE (org, channel, phone, connection_id) WHERE status<>'closed'
+  const rows: { id: string; organization_id: string; channel: string; visitor_phone_normalized: string; connection_id: string; status: string }[] = [];
+  return {
+    rows,
+    insert(row: { organization_id: string; channel: string; visitor_phone_normalized: string; connection_id: string; status: string }) {
+      const oldConflict = rows.some(
+        (r) => r.organization_id === row.organization_id && r.channel === row.channel &&
+          r.visitor_phone_normalized === row.visitor_phone_normalized && r.status !== "closed",
+      );
+      if (oldConflict) {
+        return { data: null, error: { code: "23505", constraint: "webchat_conv_open_phone_unique" } };
+      }
+      const newConflict = rows.some(
+        (r) => r.organization_id === row.organization_id && r.channel === row.channel &&
+          r.visitor_phone_normalized === row.visitor_phone_normalized &&
+          r.connection_id === row.connection_id && r.status !== "closed",
+      );
+      if (newConflict) {
+        return { data: null, error: { code: "23505", constraint: "webchat_conv_open_phone_connection_unique" } };
+      }
+      const created = { id: crypto.randomUUID(), ...row };
+      rows.push(created);
+      return { data: created, error: null };
+    },
+    findByConnection(orgId: string, phone: string, connectionId: string) {
+      return rows.find(
+        (r) => r.organization_id === orgId && r.visitor_phone_normalized === phone &&
+          r.connection_id === connectionId && r.status !== "closed",
+      ) || null;
+    },
+    findByPhoneAnyConnection(orgId: string, phone: string) {
+      return rows.find(
+        (r) => r.organization_id === orgId && r.visitor_phone_normalized === phone && r.status !== "closed",
+      ) || null;
+    },
+  };
+}
+
+Deno.test("Coexistência, flag DESLIGADA (legado): conversa da piloto aberta + mensagem no chip17new -> 23505 do índice ANTIGO, recuperação SEM filtro de connection_id encontra a conversa da piloto, NENHUMA mensagem perdida", () => {
+  const store = fakeConversationStoreWithOldIndex();
+  const ORG = "org-1";
+  const PHONE = "557491946784";
+  const PILOTO = "piloto-conn";
+  const CHIP17NEW = "chip17new-conn";
+
+  // Conversa já aberta na piloto.
+  const pilotoConv = store.insert({ organization_id: ORG, channel: "whatsapp", visitor_phone_normalized: PHONE, connection_id: PILOTO, status: "human_active" });
+  assertEquals(pilotoConv.error, null);
+
+  // Mensagem chega no chip17new: tenta criar conversa própria da conexão.
+  const attempt = store.insert({ organization_id: ORG, channel: "whatsapp", visitor_phone_normalized: PHONE, connection_id: CHIP17NEW, status: "bot_active" });
+  // Bate no índice ANTIGO primeiro (é o mais amplo, conflita primeiro).
+  assertEquals(attempt.error?.code, "23505");
+  assertEquals(attempt.error?.constraint, "webchat_conv_open_phone_unique");
+
+  // Reação em legacyMode: busca SEM filtro de connection_id (replica be3116b).
+  const recovered = store.findByPhoneAnyConnection(ORG, PHONE);
+  assertEquals(recovered?.id, pilotoConv.data!.id, "em legacyMode, a mensagem é anexada à conversa da piloto — comportamento idêntico ao pré-existente, NENHUMA mensagem perdida (é exatamente o comportamento de produção hoje, antes desta correção)");
+});
+
+Deno.test("Coexistência, flag LIGADA (novo): mesmo cenário -> 23505 do índice antigo, recuperação COM filtro de connection_id NÃO encontra nada, falha fechada (sem cruzar conexão)", () => {
+  const store = fakeConversationStoreWithOldIndex();
+  const ORG = "org-1";
+  const PHONE = "557491946784";
+  const PILOTO = "piloto-conn";
+  const CHIP17NEW = "chip17new-conn";
+
+  const pilotoConv = store.insert({ organization_id: ORG, channel: "whatsapp", visitor_phone_normalized: PHONE, connection_id: PILOTO, status: "human_active" });
+  assertEquals(pilotoConv.error, null);
+
+  const attempt = store.insert({ organization_id: ORG, channel: "whatsapp", visitor_phone_normalized: PHONE, connection_id: CHIP17NEW, status: "bot_active" });
+  assertEquals(attempt.error?.code, "23505");
+  assertEquals(attempt.error?.constraint, "webchat_conv_open_phone_unique", "o conflito, quando ocorre, é sempre do índice ANTIGO nesta janela — o novo nunca conflitaria aqui, pois não existe ainda conversa do chip17new");
+
+  // Reação com a flag ligada: busca COM filtro de connection_id.
+  const recovered = store.findByConnection(ORG, PHONE, CHIP17NEW);
+  assertEquals(recovered, null, "não deve recuperar a conversa da piloto — resultado correto é falhar fechado (500), nunca reutilizar conexão errada");
+});
+
+Deno.test("Coexistência: com a flag ligada e SEM conflito nenhum (nenhuma conversa prévia), a criação da conversa do chip17new funciona normalmente respeitando os dois índices", () => {
+  const store = fakeConversationStoreWithOldIndex();
+  const ORG = "org-2"; // organização diferente, sem conflito possível
+  const PHONE = "557491946784";
+  const CHIP17NEW = "chip17new-conn";
+
+  const attempt = store.insert({ organization_id: ORG, channel: "whatsapp", visitor_phone_normalized: PHONE, connection_id: CHIP17NEW, status: "bot_active" });
+  assertEquals(attempt.error, null);
+  assertEquals(attempt.data?.connection_id, CHIP17NEW);
+});

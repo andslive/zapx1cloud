@@ -162,10 +162,10 @@ Deno.test("releaseFunnelRunGate: erro no delete não lança exceção (loga, mas
 // mesmo padrão já usado nas outras frentes desta sessão).
 // ---------------------------------------------------------------------
 
-Deno.test("Parte A: busca de conversa existente é escopada por connection_id (achado: mensagem do chip17new anexada à conversa da piloto)", async () => {
+Deno.test("Parte A: busca de conversa existente é escopada por connection_id QUANDO a flag de rollout está ligada (achado: mensagem do chip17new anexada à conversa da piloto)", async () => {
   const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
   assertEquals(
-    src.includes('.eq("visitor_phone_normalized", phoneCanonical)\n        .eq("connection_id", instance.id)'),
+    src.includes('if (conversationIsolationEnabled) {\n        existingByPhoneQuery = existingByPhoneQuery.eq("connection_id", instance.id);'),
     true,
   );
 });
@@ -176,10 +176,10 @@ Deno.test("Parte A: NENHUM fallback textual para 'qualquer conversa aberta do me
   assertEquals(src.includes("sem filtrar instância — assim PRESERVAMOS"), false);
 });
 
-Deno.test("Parte A: query de reaproveitamento após 23505 na criação de conversa nova também é escopada por connection_id", async () => {
+Deno.test("Parte A: query de reaproveitamento após 23505 na criação de conversa nova também é escopada por connection_id QUANDO a flag está ligada", async () => {
   const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
   assertEquals(
-    src.includes('.eq("visitor_phone_normalized", phoneCanonical)\n              .eq("connection_id", instance.id)\n              .neq("status", "closed")'),
+    src.includes('if (conversationIsolationEnabled) {\n              raceQuery = raceQuery.eq("connection_id", instance.id);'),
     true,
   );
 });
@@ -190,11 +190,17 @@ Deno.test("Parte B: os 3 call sites (reopen/existing/new) chamam acquireFunnelRu
   assertEquals(occurrences, 3);
 });
 
-Deno.test("Parte B: nenhum INSERT direto e não-gateado de status='running' sobrevive nos 3 call sites (o insert agora é feito só dentro do gate)", async () => {
+Deno.test("Parte B: nenhum INSERT direto e não-gateado de status='running' sobrevive nos 3 call sites — os únicos 2 inserts restantes vivem dentro de acquireFunnelRunGate (modo normal + legacyMode)", async () => {
   const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
-  // Só deve sobrar UM insert de status 'running' em lead_funnel_history: o de dentro do próprio acquireFunnelRunGate.
-  const occurrences = src.split("status: \"running\"").length - 1 + src.split("status: 'running'").length - 1;
-  assertEquals(occurrences, 1);
+  const gateFnStart = src.indexOf("export async function acquireFunnelRunGate(");
+  const gateFnEnd = src.indexOf("\n}\n\n/**\n * Compensação:");
+  const gateFnBody = src.slice(gateFnStart, gateFnEnd);
+  const occurrencesInGate = gateFnBody.split("status: \"running\"").length - 1 + gateFnBody.split("status: 'running'").length - 1;
+  const occurrencesTotal = src.split("status: \"running\"").length - 1 + src.split("status: 'running'").length - 1;
+  // As 2 ocorrências que sobram (modo normal + legacyMode) estão AMBAS
+  // dentro de acquireFunnelRunGate — nenhuma nos 3 call sites do handler.
+  assertEquals(occurrencesInGate, 2);
+  assertEquals(occurrencesTotal, 2);
 });
 
 Deno.test("Parte B: nenhum catch silencioso (/* noop */) envolve mais o registro de running no ledger", async () => {
@@ -228,4 +234,62 @@ Deno.test("Nenhum call site pode chegar ao gate com leadId potencialmente stale 
   const fixIdx = src.indexOf("(convData as any).lead_id = lead.id;");
   const gateIdx = src.indexOf("leadId: convData?.lead_id,");
   assertEquals(fixIdx > 0 && gateIdx > 0 && fixIdx < gateIdx, true);
+});
+
+// ---------------------------------------------------------------------
+// legacyMode: rollout gradual via conversation_isolation_feature_flags
+// (achado da revisão adversarial: janela de proteção reduzida entre o
+// DROP do índice antigo e o deploy da function nova).
+// ---------------------------------------------------------------------
+
+Deno.test("acquireFunnelRunGate legacyMode=true, com lead_id: insere sem gate, SEMPRE acquired=true/gated=false (replica be3116b)", async () => {
+  const client = fakeSupabase({ conflictOnInsert: true }); // mesmo com "conflito" simulado
+  const result = await acquireFunnelRunGate(client, { leadId: LEAD_ID, funnelId: FUNNEL_ID, legacyMode: true });
+  assertEquals(result.acquired, true);
+  if (result.acquired) {
+    assertEquals(result.gated, false);
+  }
+  // Em legacyMode, tenta inserir (ignorando erro) — não retorna já_running
+  // mesmo diante de conflito, pois não há checagem, só insert-e-ignora.
+  assertEquals(client._insertCalls.length, 1);
+});
+
+Deno.test("acquireFunnelRunGate legacyMode=true, SEM lead_id: não insere nada, mas ainda acquired=true (comportamento antigo nunca bloqueava por falta de lead)", async () => {
+  const client = fakeSupabase();
+  const result = await acquireFunnelRunGate(client, { leadId: null, funnelId: FUNNEL_ID, legacyMode: true });
+  assertEquals(result.acquired, true);
+  assertEquals(client._insertCalls.length, 0);
+});
+
+Deno.test("acquireFunnelRunGate legacyMode=true com erro genérico de banco: ainda acquired=true (fail-open, replica catch/noop antigo)", async () => {
+  const client = fakeSupabase({ genericErrorOnInsert: true });
+  const result = await acquireFunnelRunGate(client, { leadId: LEAD_ID, funnelId: FUNNEL_ID, legacyMode: true });
+  assertEquals(result.acquired, true);
+});
+
+Deno.test("Rollout: flag resolvida uma vez por request logo após a resolução de instância, via isConversationIsolationEnabled", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  assertEquals(src.includes("isConversationIsolationEnabled(\n      supabase as any,\n      instance.organization_id,\n    )"), true);
+});
+
+Deno.test("Rollout: os 3 call sites de acquireFunnelRunGate passam legacyMode: !conversationIsolationEnabled", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  const occurrences = src.split("legacyMode: !conversationIsolationEnabled").length - 1;
+  assertEquals(occurrences, 3);
+});
+
+Deno.test("Rollout: a busca de conversa existente só filtra por connection_id quando a flag está ligada", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  assertEquals(
+    src.includes("if (conversationIsolationEnabled) {\n        existingByPhoneQuery = existingByPhoneQuery.eq(\"connection_id\", instance.id);"),
+    true,
+  );
+});
+
+Deno.test("Rollout: a recuperação pós-23505 na criação de conversa nova só filtra por connection_id quando a flag está ligada", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  assertEquals(
+    src.includes("if (conversationIsolationEnabled) {\n              raceQuery = raceQuery.eq(\"connection_id\", instance.id);"),
+    true,
+  );
 });
