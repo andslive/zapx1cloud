@@ -179,7 +179,7 @@ function ConnectionFunnelSelect({
                 </p>
                 {pendingValue === NONE_FUNNEL_VALUE && (
                   <p className="text-destructive font-medium">
-                    Sem funil configurado, esta conexão passará a usar o fallback legado de Funil &gt; Canais para novas conversas.
+                    Sem funil selecionado: nenhum funil será iniciado automaticamente nesta conexão.
                   </p>
                 )}
                 {setDefaultFunnelMut.isError && (

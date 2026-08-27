@@ -275,8 +275,12 @@ async function isDuplicateInboundMessage(
 //
 // Precedência: (1) funil já fixado na conversa/execução — NÃO passa por aqui,
 // os call sites só chamam isto quando vão decidir um funil NOVO; (2) funil
-// padrão configurado em evolution_instances.default_funnel_id; (3) fallback
-// legado (capture_funnels.channels->whatsapp, "Funil > Canais").
+// padrão configurado em evolution_instances.default_funnel_id. Não existe
+// mais um passo (3) de fallback organizacional — "sem funil selecionado"
+// (`default_funnel_id = null`) e "funil selecionado mas inválido/inativo/
+// excluído" resultam ambos em NENHUMA automação, nunca num catch-all
+// (capture_funnels.channels->whatsapp, "Funil > Canais" deixou de ser
+// consultado por aqui — decisão de produto aprovada).
 //
 // Deixa preparado (sem implementar) um degrau futuro de precedência por
 // origem/oferta/anúncio ANTES do padrão da conexão — ver FUTURE_AD_OFFER_RULE.
@@ -288,9 +292,21 @@ type FunnelCandidate = {
   allow_reentry?: boolean;
   status?: string;
 };
-type FunnelResolutionOrigin = "connection_assignment" | "legacy_fallback";
+// FASE — remoção do fallback organizacional implícito (decisão de produto
+// aprovada: "sem funil selecionado" deve significar literalmente nenhuma
+// automação, nunca escolher automaticamente o primeiro funil ativo/catch-all
+// da organização). `legacy_fallback` como ORIGEM ATIVA (consultar todos os
+// funis ativos da org) fica morto para os 3 call sites reais deste arquivo
+// — todos sempre passam `connectionId`. Esse valor de origem some do union
+// type porque nenhum caminho de retorno o produz mais.
+type FunnelResolutionOrigin =
+  | "connection_assignment"
+  | "no_funnel_selected"
+  | "funnel_reference_invalid"
+  | "connection_not_found"
+  | "resolution_error";
 
-async function resolveFunnelCandidates(
+export async function resolveFunnelCandidates(
   supabase: any,
   { organizationId, connectionId }: { organizationId: string; connectionId: string | null },
 ): Promise<{ candidates: FunnelCandidate[]; origin: FunnelResolutionOrigin }> {
@@ -298,38 +314,81 @@ async function resolveFunnelCandidates(
   // (ctwa_clid, campanha etc.) entraria aqui, ANTES do default da conexão.
   // Não implementado nesta fase — sem evidência/escopo aprovado.
 
-  if (connectionId) {
-    const { data: conn } = await supabase
-      .from("evolution_instances")
-      .select("default_funnel_id")
-      .eq("id", connectionId)
-      .maybeSingle();
-
-    if (conn?.default_funnel_id) {
-      const { data: funnel } = await supabase
-        .from("capture_funnels")
-        .select("id, start_block_id, channels, allow_reentry, status")
-        .eq("id", conn.default_funnel_id)
-        .eq("organization_id", organizationId)
-        .maybeSingle();
-
-      if (funnel && funnel.status === "active") {
-        return { candidates: [funnel as FunnelCandidate], origin: "connection_assignment" };
-      }
-      console.warn(
-        "[FUNNEL_RESOLUTION] connection has default_funnel_id but funnel is missing/inactive — falling back to legacy channel routing:",
-        JSON.stringify({ connectionId, defaultFunnelId: conn.default_funnel_id, found: !!funnel, status: funnel?.status }),
-      );
-    }
+  // Sem connectionId: falha fechada, nunca escolhe funil organizacional.
+  // Nenhum dos 3 call sites reais chama esta função sem connectionId hoje —
+  // mantido apenas por segurança de assinatura/uso futuro, documentado como
+  // tal (ver auditoria: Fase 2).
+  if (!connectionId) {
+    return { candidates: [], origin: "connection_not_found" };
   }
 
-  const { data: legacyCandidates } = await supabase
+  // Filtra também por organization_id (achado da revisão do diff — este
+  // resolvedor é exportado/reutilizável; sem esse filtro, um connectionId
+  // de outra organização ainda resolveria, dependendo só de quem chama
+  // passar o organizationId certo). Isolamento explícito na própria query,
+  // não só implícito no comportamento dos call sites atuais.
+  const { data: conn, error: connErr } = await supabase
+    .from("evolution_instances")
+    .select("default_funnel_id")
+    .eq("id", connectionId)
+    .eq("organization_id", organizationId)
+    .maybeSingle();
+
+  // Erro técnico de consulta NUNCA é confundido com "conexão não encontrada"
+  // ou "sem funil" — achado da revisão do diff: antes, uma falha transitória
+  // do banco silenciosamente virava um estado de configuração do usuário,
+  // escondendo indisponibilidade/erro de permissão/schema como se fosse
+  // decisão de produto.
+  if (connErr) {
+    console.error(
+      "[FUNNEL_RESOLUTION] db error resolving connection — no automation started, not treated as config state:",
+      JSON.stringify({ connectionId, message: connErr.message }),
+    );
+    return { candidates: [], origin: "resolution_error" };
+  }
+
+  if (!conn) {
+    // Conexão não encontrada (ou pertence a outra organização) — falha
+    // fechada, sem selecionar funil organizacional (requisito explícito da
+    // correção).
+    return { candidates: [], origin: "connection_not_found" };
+  }
+
+  if (conn.default_funnel_id === null) {
+    // Regra de produto: "sem funil selecionado" = nenhuma automação.
+    return { candidates: [], origin: "no_funnel_selected" };
+  }
+
+  const { data: funnel, error: funnelErr } = await supabase
     .from("capture_funnels")
     .select("id, start_block_id, channels, allow_reentry, status")
+    .eq("id", conn.default_funnel_id)
     .eq("organization_id", organizationId)
-    .eq("status", "active");
+    .maybeSingle();
 
-  return { candidates: (legacyCandidates || []) as FunnelCandidate[], origin: "legacy_fallback" };
+  if (funnelErr) {
+    console.error(
+      "[FUNNEL_RESOLUTION] db error resolving funnel — no automation started, not treated as config state:",
+      JSON.stringify({ connectionId, defaultFunnelId: conn.default_funnel_id, message: funnelErr.message }),
+    );
+    return { candidates: [], origin: "resolution_error" };
+  }
+
+  if (funnel && funnel.status === "active") {
+    return { candidates: [funnel as FunnelCandidate], origin: "connection_assignment" };
+  }
+
+  // default_funnel_id aponta para um funil inexistente/inativo/excluído.
+  // Decisão de produto aprovada: tratado igual a "sem funil" — nenhuma
+  // automação, NUNCA cai para o catch-all organizacional. Origem própria
+  // (`funnel_reference_invalid`) preserva a distinção para observabilidade
+  // (achado da auditoria: hoje isso é um estado de configuração quebrada
+  // silencioso — vale um alerta operacional separado, fora de escopo aqui).
+  console.warn(
+    "[FUNNEL_RESOLUTION] connection has default_funnel_id but funnel is missing/inactive — no automation started (legacy org-wide fallback removed):",
+    JSON.stringify({ connectionId, defaultFunnelId: conn.default_funnel_id, found: !!funnel, status: funnel?.status }),
+  );
+  return { candidates: [], origin: "funnel_reference_invalid" };
 }
 
 /**
@@ -4210,7 +4269,7 @@ Deno.serve(async (req) => {
           let funnelToRunReopen:
             | { id: string; start_block_id: string | null }
             | null = null;
-          let funnelResolutionOriginReopen: FunnelResolutionOrigin = "legacy_fallback";
+          let funnelResolutionOriginReopen: FunnelResolutionOrigin = "connection_not_found";
           try {
             const { candidates, origin } = await resolveFunnelCandidates(supabase, {
               organizationId: instance.organization_id,
@@ -4221,13 +4280,11 @@ Deno.serve(async (req) => {
             const normMsgReopen = normalizeForMatch(norm.content || "");
             for (const cand of candidates || []) {
               const wa = (cand as any).channels?.whatsapp;
-              // Config de canal ("Funil > Canais") só é exigida no fallback legado —
-              // o funil padrão da conexão já é a decisão explícita, não depende dela.
-              if (origin === "legacy_fallback") {
-                if (!wa?.enabled) continue;
-                const boundInstance = wa.evolution_instance_id;
-                if (boundInstance && boundInstance !== instance.id) continue;
-              }
+              // Gate de canal ("Funil > Canais") removido: `candidates` só vem
+              // não-vazio para origin "connection_assignment" agora — a
+              // decisão explícita da conexão nunca precisou desse filtro (ver
+              // resolveFunnelCandidates). Não há mais origem que produza um
+              // catch-all organizacional para filtrar aqui.
 
               // Detect ad-trigger keyword match for this candidate
               const kw = wa?.trigger_keywords || wa?.keywords || "";
@@ -4433,7 +4490,7 @@ Deno.serve(async (req) => {
           | { id: string; start_block_id: string | null }
           | null = null;
 
-        let funnelResolutionOriginExisting: FunnelResolutionOrigin = "legacy_fallback";
+        let funnelResolutionOriginExisting: FunnelResolutionOrigin = "connection_not_found";
         try {
           const { candidates: funnels, origin } = await resolveFunnelCandidates(supabase, {
             organizationId: instance.organization_id,
@@ -4443,11 +4500,8 @@ Deno.serve(async (req) => {
 
           for (const cand of funnels || []) {
             const wa = (cand as any).channels?.whatsapp;
-            if (origin === "legacy_fallback") {
-              if (!wa?.enabled) continue;
-              const boundInstance = wa.evolution_instance_id;
-              if (boundInstance && boundInstance !== instance.id) continue;
-            }
+            // Gate de canal removido: `candidates` só vem não-vazio para
+            // origin "connection_assignment" — ver resolveFunnelCandidates.
 
             const keywords = wa?.trigger_keywords || wa?.keywords || "";
             const keywordList = typeof keywords === "string"
@@ -5067,12 +5121,13 @@ Deno.serve(async (req) => {
           }
         }
 
-        // ---- FUNNEL TRIGGER (WhatsApp channel) ----
-        // Look for an active capture_funnel that has the WhatsApp channel enabled
-        // and matches this evolution instance (or any instance) and trigger rules.
+        // ---- FUNNEL TRIGGER (funil explicitamente selecionado na conexão) ----
+        // resolveFunnelCandidates só devolve candidato quando default_funnel_id
+        // aponta para um funil ativo desta conexão — não há mais busca por
+        // canal WhatsApp habilitado/compatível com "qualquer instância".
         let funnelToRun: { id: string; start_block_id: string | null } | null =
           null;
-        let funnelResolutionOriginNew: FunnelResolutionOrigin = "legacy_fallback";
+        let funnelResolutionOriginNew: FunnelResolutionOrigin = "connection_not_found";
         try {
           const { candidates, origin } = await resolveFunnelCandidates(supabase, {
             organizationId: instance.organization_id,
@@ -5083,11 +5138,8 @@ Deno.serve(async (req) => {
           const normMsg = normalizeForMatch(norm.content || "");
           for (const cand of candidates || []) {
             const wa = (cand as any).channels?.whatsapp;
-            if (origin === "legacy_fallback") {
-              if (!wa?.enabled) continue;
-              const boundInstance = wa.evolution_instance_id;
-              if (boundInstance && boundInstance !== instance.id) continue;
-            }
+            // Gate de canal removido: `candidates` só vem não-vazio para
+            // origin "connection_assignment" — ver resolveFunnelCandidates.
 
             const keywords = wa?.trigger_keywords || wa?.keywords || "";
             const keywordList = typeof keywords === "string"
