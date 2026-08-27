@@ -309,11 +309,9 @@ type FunnelResolutionOrigin =
 export type FunnelGateResult =
   // gated=true: linha inserida em lead_funnel_history (historyId devolvido
   // para permitir compensação — ver releaseFunnelRunGate), dedupe protegido.
-  // gated=false: sem lead_id ainda — não há chave de dedupe possível, segue
-  // o mesmo comportamento de hoje (sem proteção), só para observabilidade.
   | { acquired: true; gated: true; historyId: string }
-  | { acquired: true; gated: false }
   | { acquired: false; reason: "already_running" }
+  | { acquired: false; reason: "missing_lead_id" }
   | { acquired: false; reason: "error"; message: string };
 
 /**
@@ -328,6 +326,14 @@ export type FunnelGateResult =
  * INSERT concorrente para o mesmo (lead_id, funnel_id) falha com 23505 —
  * tratado aqui como "already_running", nunca como erro genérico.
  *
+ * Regra de produto (revisão adversarial 2026-08-27): nenhum funil automático
+ * inicia sem uma identidade de lead capaz de participar do gate. Os 3 call
+ * sites reais (reopen/existing/new) SEMPRE resolvem ou criam um lead antes
+ * de tentar disparar um funil — mensagens de grupo (`@g.us`) são descartadas
+ * bem antes de chegar aqui, então não existe caso legítimo de "conversa 1:1
+ * sem lead". `leadId` ausente aqui só pode significar falha transitória
+ * (erro ao criar o lead) ou corrida — em ambos os casos, falha fechada.
+ *
  * Contrato: o chamador NUNCA deve setar current_flow_id/current_block_id
  * nem enviar qualquer bloco antes de checar `acquired === true` aqui.
  */
@@ -336,9 +342,11 @@ export async function acquireFunnelRunGate(
   { leadId, funnelId }: { leadId: string | null | undefined; funnelId: string },
 ): Promise<FunnelGateResult> {
   if (!leadId) {
-    // Sem lead ainda vinculado: nada para dedupe contra. Não bloqueia —
-    // preserva o comportamento pré-existente para esse caso de borda.
-    return { acquired: true, gated: false };
+    console.error(
+      "[FUNNEL_GATE] missing_lead_id — funnel NOT started (fail-closed, nenhum caso legítimo comprovado):",
+      JSON.stringify({ funnel_id: funnelId }),
+    );
+    return { acquired: false, reason: "missing_lead_id" };
   }
 
   const { data, error } = await supabase
@@ -4594,11 +4602,21 @@ Deno.serve(async (req) => {
               .from("webchat_conversations")
               .update({ lead_id: lead.id, connection_id: instance.id })
               .eq("id", existing.id);
-            
+
             await supabase
               .from("leads")
               .update({ connection_id: instance.id })
               .eq("id", lead.id);
+
+            // Achado da revisão adversarial 2026-08-27: sem isto, o
+            // `convData` local seguia com lead_id nulo mesmo depois de
+            // vincularmos/criarmos o lead na linha acima — o gate de funil
+            // logo abaixo lê `convData?.lead_id`, e um valor stale aqui
+            // faria o funil iniciar SEM proteção de dedupe justamente no
+            // caso em que um lead novo acabou de ser criado.
+            if (convData) {
+              (convData as any).lead_id = lead.id;
+            }
 
             console.log(
               "[uazapi-webhook] linked missing lead_id to existing conv:",
