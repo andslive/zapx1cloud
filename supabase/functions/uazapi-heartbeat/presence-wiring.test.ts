@@ -45,3 +45,53 @@ Deno.test("processInstanceHealth aceita presencePolicies com default seguro (Map
   const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
   assertEquals(src.includes("presencePolicies: Map<string, DesiredPresence> = new Map()"), true);
 });
+
+// --- achado de segurança: guard explícito de res.ok antes da reconciliação ---
+
+Deno.test("reconciliação de presence só roda se res.ok (guard explícito contra 401/erro no GET)", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  const presenceIdx = src.indexOf("decidePresenceReconciliation({");
+  const before = src.slice(Math.max(0, presenceIdx - 500), presenceIdx);
+  assertEquals(before.includes("if (res.ok) {"), true);
+});
+
+Deno.test("401/erro real da UazAPI (sem .status/.instance) nunca produz decisão de post — prova via o shape real do erro", async () => {
+  const { decidePresenceReconciliation } = await import("../_shared/uazapi-presence-policy.ts");
+  // Corpo real de erro confirmado em produção nesta sessão: {"code":401,"message":"Invalid token.","data":{}}
+  const realErrorBody: any = { code: 401, message: "Invalid token.", data: {} };
+  const decision = decidePresenceReconciliation({
+    provider: "uazapi",
+    archivedAt: null,
+    organizationId: "org-1",
+    hasToken: true,
+    desiredPresenceByOrg: new Map([["org-1", "available"]]),
+    sessionConnected: realErrorBody?.status?.connected,
+    loggedIn: realErrorBody?.status?.loggedIn,
+    currentPresence: realErrorBody?.instance?.current_presence,
+  });
+  assertEquals(decision.action, "skip");
+});
+
+// --- achado de segurança: os 3 logs brutos antigos não sobrevivem ---
+
+Deno.test("nenhum dos 3 logs antigos ([UAZAPI_RAW_STATUS], [UAZAPI_RAW_STATUS_GHOST], [PROFILE_SYNC_RAW]) imprime objeto bruto (JSON.stringify(data) / JSON.stringify(statusData) cru)", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  assertEquals(src.includes("console.log(`[UAZAPI_RAW_STATUS_GHOST] instance=${inst.name}`, JSON.stringify(statusData))"), false);
+  assertEquals(src.includes("console.log(`[UAZAPI_RAW_STATUS] instance=${inst.name}`, JSON.stringify(data))"), false);
+  assertEquals(src.includes("console.log(`[PROFILE_SYNC_RAW] instance=${inst.name}`, JSON.stringify(data))"), false);
+});
+
+Deno.test("os 3 logs corrigidos usam buildSafeStatusSummary/buildSafeProfileSyncSummary (allowlist), nunca o objeto bruto", async () => {
+  const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
+  const ghostIdx = src.indexOf('"[UAZAPI_RAW_STATUS_GHOST]"');
+  const ghostCall = src.slice(ghostIdx, ghostIdx + 200);
+  assertEquals(ghostCall.includes("buildSafeStatusSummary(statusData"), true);
+
+  const rawStatusIdx = src.indexOf('"[UAZAPI_RAW_STATUS]"');
+  const rawStatusCall = src.slice(rawStatusIdx, rawStatusIdx + 300);
+  assertEquals(rawStatusCall.includes("buildSafeStatusSummary(data"), true);
+
+  const profileIdx = src.indexOf('"[PROFILE_SYNC_RAW]"');
+  const profileCall = src.slice(profileIdx, profileIdx + 200);
+  assertEquals(profileCall.includes("buildSafeProfileSyncSummary(data"), true);
+});

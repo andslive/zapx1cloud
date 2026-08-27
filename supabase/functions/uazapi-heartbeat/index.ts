@@ -6,6 +6,10 @@ import {
   reconcileInstancePresence,
   type DesiredPresence,
 } from "../_shared/uazapi-presence-policy.ts";
+import {
+  buildSafeStatusSummary,
+  buildSafeProfileSyncSummary,
+} from "../_shared/uazapi-safe-log.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -45,8 +49,19 @@ async function checkGhostConnection(supabase: any, inst: any, statusData: any, p
     // Normalize state to handle object responses (ghost detected fix)
     let realState: any = "UNKNOWN";
     
-    // [UAZAPI_RAW_STATUS_GHOST]
-    console.log(`[UAZAPI_RAW_STATUS_GHOST] instance=${inst.name}`, JSON.stringify(statusData));
+    // [UAZAPI_RAW_STATUS_GHOST] — achado de segurança corrigido: o corpo
+    // bruto de GET /instance/status inclui o token em texto puro; logamos
+    // só um resumo permitido (nunca o objeto inteiro).
+    console.log(
+      "[UAZAPI_RAW_STATUS_GHOST]",
+      JSON.stringify(buildSafeStatusSummary(statusData, {
+        instanceId: inst.id,
+        instanceName: inst.name,
+        organizationId: inst.organization_id,
+        provider: inst.provider,
+        operation: "ghost_check",
+      })),
+    );
 
     if (statusData.status && typeof statusData.status === 'object' && statusData.status.connected !== undefined) {
         realState = statusData.status.connected ? "CONNECTED" : "DISCONNECTED";
@@ -435,8 +450,20 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
 
         const data = await res.json().catch(() => ({}));
         
-        // [UAZAPI_RAW_STATUS] CRITICAL LOG
-        console.log(`[UAZAPI_RAW_STATUS] instance=${inst.name}`, JSON.stringify(data));
+        // [UAZAPI_RAW_STATUS] — achado de segurança corrigido: o corpo
+        // bruto de GET /instance/status inclui o token em texto puro;
+        // logamos só um resumo permitido (nunca o objeto inteiro).
+        console.log(
+          "[UAZAPI_RAW_STATUS]",
+          JSON.stringify(buildSafeStatusSummary(data, {
+            instanceId: inst.id,
+            instanceName: inst.name,
+            organizationId: inst.organization_id,
+            provider: inst.provider,
+            operation: "health_check",
+            httpStatus: res.status,
+          })),
+        );
         
         // Extract real state string from various possible UazAPI response shapes
         let realState: any = "UNKNOWN";
@@ -468,34 +495,41 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
         // — usa exclusivamente o GET /instance/status já feito acima, sem
         // consulta nova. Decisão pura, testável isoladamente; execução
         // fail-open (nunca desconecta, nunca bloqueia o restante do
-        // heartbeat, nunca loga token). Achado a corrigir separadamente,
-        // fora do escopo desta frente: os console.log de [UAZAPI_RAW_STATUS]
-        // e [UAZAPI_RAW_STATUS_GHOST] logo acima já imprimem `data`/`statusData`
-        // inteiros, que incluem o token em texto puro — não alterado aqui.
-        try {
-          const presenceDecision = decidePresenceReconciliation({
-            provider: inst.provider,
-            archivedAt: inst.archived_at,
-            organizationId: inst.organization_id,
-            hasToken: !!inst.instance_token,
-            desiredPresenceByOrg: presencePolicies,
-            sessionConnected: (data as any)?.status?.connected,
-            loggedIn: (data as any)?.status?.loggedIn,
-            currentPresence: (data as any)?.instance?.current_presence,
-          });
-          if (presenceDecision.action === "post") {
-            await reconcileInstancePresence(
-              String(platformSettings?.uazapi_url || "").replace(/\/$/, ""),
-              inst.instance_token,
-              presenceDecision.desiredPresence,
-              { id: inst.id, name: inst.name },
+        // heartbeat, nunca loga token).
+        //
+        // Guard explícito de `res.ok`: em 401/erro, `data` é o corpo de
+        // erro da UazAPI (ex.: {"code":401,"message":"Invalid token."}),
+        // sem `.status`/`.instance` — ou seja, `sessionConnected`/`loggedIn`/
+        // `currentPresence` já ficariam undefined e o gate normal da função
+        // pura já bloquearia o POST. Mesmo assim, tornamos a garantia
+        // EXPLÍCITA aqui (não incidental) para nunca depender só do shape
+        // do corpo de erro permanecer estável.
+        if (res.ok) {
+          try {
+            const presenceDecision = decidePresenceReconciliation({
+              provider: inst.provider,
+              archivedAt: inst.archived_at,
+              organizationId: inst.organization_id,
+              hasToken: !!inst.instance_token,
+              desiredPresenceByOrg: presencePolicies,
+              sessionConnected: (data as any)?.status?.connected,
+              loggedIn: (data as any)?.status?.loggedIn,
+              currentPresence: (data as any)?.instance?.current_presence,
+            });
+            if (presenceDecision.action === "post") {
+              await reconcileInstancePresence(
+                String(platformSettings?.uazapi_url || "").replace(/\/$/, ""),
+                inst.instance_token,
+                presenceDecision.desiredPresence,
+                { id: inst.id, name: inst.name },
+              );
+            }
+          } catch (presenceErr: any) {
+            console.error(
+              "[UAZAPI_PRESENCE_RECONCILE]",
+              JSON.stringify({ instance_id: inst.id, name: inst.name, result: "unexpected_exception", message: presenceErr?.message || String(presenceErr) }),
             );
           }
-        } catch (presenceErr: any) {
-          console.error(
-            "[UAZAPI_PRESENCE_RECONCILE]",
-            JSON.stringify({ instance_id: inst.id, name: inst.name, result: "unexpected_exception", message: presenceErr?.message || String(presenceErr) }),
-          );
         }
 
         // Logic for alerting and status sync
@@ -505,7 +539,14 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
         // [PROFILE_SYNC_START]
         let metadataUpdates: any = {};
         if (isConnected) {
-            console.log(`[PROFILE_SYNC_RAW] instance=${inst.name}`, JSON.stringify(data));
+            // [PROFILE_SYNC_RAW] — achado de segurança corrigido: o corpo
+            // bruto de GET /instance/status inclui o token em texto puro;
+            // logamos só presença/ausência de campos de perfil e telefone
+            // mascarado, nunca os valores brutos (nome, avatar, telefone).
+            console.log(
+              "[PROFILE_SYNC_RAW]",
+              JSON.stringify(buildSafeProfileSyncSummary(data, { instanceId: inst.id, instanceName: inst.name })),
+            );
             const instanceInfo = data.instance || {};
             
             const raw_whatsapp_name = 
