@@ -1,5 +1,11 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
+import {
+  decidePresenceReconciliation,
+  loadEnabledPresencePolicies,
+  reconcileInstancePresence,
+  type DesiredPresence,
+} from "../_shared/uazapi-presence-policy.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -414,7 +420,7 @@ async function processWebhookHealth(supabase: any, inst: any, platformSettings: 
     }
 }
 
-async function processInstanceHealth(supabase: any, inst: any, platformSettings: any, source: string = 'cron') {
+async function processInstanceHealth(supabase: any, inst: any, platformSettings: any, source: string = 'cron', presencePolicies: Map<string, DesiredPresence> = new Map()) {
 
     const uazapiUrl = String(platformSettings?.uazapi_url || "").replace(/\/$/, "");
     const token = inst.instance_token || platformSettings?.uazapi_admin_token;
@@ -457,6 +463,40 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
         console.log(`[UAZAPI_PARSED_STATUS] instance=${inst.name} final_status=${stateStr}`);
 
         const isConnected = res.ok && (stateStr === "CONNECTED" || stateStr === "OPEN" || stateStr === "ONLINE");
+
+        // Reconciliação de presence (available/unavailable) por organização
+        // — usa exclusivamente o GET /instance/status já feito acima, sem
+        // consulta nova. Decisão pura, testável isoladamente; execução
+        // fail-open (nunca desconecta, nunca bloqueia o restante do
+        // heartbeat, nunca loga token). Achado a corrigir separadamente,
+        // fora do escopo desta frente: os console.log de [UAZAPI_RAW_STATUS]
+        // e [UAZAPI_RAW_STATUS_GHOST] logo acima já imprimem `data`/`statusData`
+        // inteiros, que incluem o token em texto puro — não alterado aqui.
+        try {
+          const presenceDecision = decidePresenceReconciliation({
+            provider: inst.provider,
+            archivedAt: inst.archived_at,
+            organizationId: inst.organization_id,
+            hasToken: !!inst.instance_token,
+            desiredPresenceByOrg: presencePolicies,
+            sessionConnected: (data as any)?.status?.connected,
+            loggedIn: (data as any)?.status?.loggedIn,
+            currentPresence: (data as any)?.instance?.current_presence,
+          });
+          if (presenceDecision.action === "post") {
+            await reconcileInstancePresence(
+              String(platformSettings?.uazapi_url || "").replace(/\/$/, ""),
+              inst.instance_token,
+              presenceDecision.desiredPresence,
+              { id: inst.id, name: inst.name },
+            );
+          }
+        } catch (presenceErr: any) {
+          console.error(
+            "[UAZAPI_PRESENCE_RECONCILE]",
+            JSON.stringify({ instance_id: inst.id, name: inst.name, result: "unexpected_exception", message: presenceErr?.message || String(presenceErr) }),
+          );
+        }
 
         // Logic for alerting and status sync
         const oldRealState = inst.last_real_whatsapp_state;
@@ -708,7 +748,15 @@ Deno.serve(async (req) => {
 
     if (instances && instances.length > 0) {
         console.log(`[uazapi-heartbeat] processing ${instances.length} instances for sync...`);
-        await Promise.all(instances.map(inst => processInstanceHealth(supabase, inst, platformSettings, source)));
+        // Uma única consulta de políticas de presence por execução do
+        // heartbeat — nunca por instância (custo constante independente da
+        // quantidade de conexões).
+        // `as any`: mesma instanciação genérica excessivamente profunda de
+        // @supabase/supabase-js já contornada em outros pontos desta base
+        // (duas instanciações distintas resolvidas via esm.sh) — não é
+        // mudança de comportamento.
+        const presencePolicies = await loadEnabledPresencePolicies(supabase as any);
+        await Promise.all(instances.map(inst => processInstanceHealth(supabase, inst, platformSettings, source, presencePolicies)));
     }
 
     // 3. ACK Verification
