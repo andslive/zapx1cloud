@@ -3696,18 +3696,19 @@ Deno.serve(async (req) => {
     // -- precisa da instância já autenticada para escopar as escritas.
 
     // [ÚNICA RESOLUÇÃO DE INSTÂNCIA/ORGANIZAÇÃO POR REQUEST]
-    // Roda DEPOIS do retorno antecipado de ACK (que já retornou acima e
-    // nunca chega aqui) — ACK genuinely não passa por esta resolução, sem
-    // gastar uma consulta à toa no tipo de evento mais frequente. Substitui
-    // os lookups fragmentados por nome/instance_id que existiam aqui
-    // (health tracking) e mais abaixo (bloco de mensagem) — antes eram DUAS
+    // ACK agora passa por esta mesma resolução (movido para depois dela —
+    // ver `const instance = resolution.instance` e o bloco de ACK logo
+    // abaixo, item B2) — não é mais um caminho de exceção. Substitui os
+    // lookups fragmentados por nome/instance_id que existiam aqui (health
+    // tracking) e mais abaixo (bloco de mensagem) — antes eram DUAS
     // consultas independentes, cada uma podendo resolver para instâncias
     // diferentes. Token obrigatório, sem fallback (item B1) — falha
     // fechada em token ausente/desconhecido/em conflito, provider não
     // suportado, instância arquivada sem parceira, ou organização
-    // divergente. ACK continua sem isolamento por instância/organização
-    // (guard só por message_id) — corrigido no item B2 deste hotfix, ainda
-    // não aplicado neste commit.
+    // divergente. O isolamento por instância/organização do ACK
+    // (processed_messages/whatsapp_message_retries por instance_id+
+    // organization_id, webchat_messages por conversation_id escopado) já
+    // está aplicado — item B2 deste hotfix, incluído neste commit.
     //
     // `norm` é sempre não nulo aqui — o caso `!norm && !__is_resume` já
     // retornou 200 mais acima (movido para antes desta resolução, item
