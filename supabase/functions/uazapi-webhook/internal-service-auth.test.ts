@@ -122,31 +122,73 @@ Deno.test("execute_recovery e execute_silent_recovery são rejeitados incondicio
   // (não os comentários explicativos ao redor, que legitimamente citam
   // execute_recovery/execute_silent_recovery por nome).
   const responseBodyIdx = src.indexOf("JSON.stringify({ ok: false, error: \"unsupported_action\" })", rejectIdx);
-  assertEquals(responseBodyIdx > 0 && responseBodyIdx < rejectIdx + 700, true);
+  assertEquals(responseBodyIdx > 0 && responseBodyIdx < rejectIdx + 1100, true);
   const responseBody = src.slice(responseBodyIdx, responseBodyIdx + 60);
   assertEquals(responseBody.toLowerCase().includes("recovery"), false, "o corpo da resposta não deve mencionar execute_recovery/recibo, só o código genérico");
-  const rejectBlock = src.slice(rejectIdx, rejectIdx + 700);
+  const rejectBlock = src.slice(rejectIdx, rejectIdx + 1100);
   assertEquals(rejectBlock.includes('"unsupported_action"'), true);
   assertEquals(rejectBlock.includes("status: 400"), true);
 });
 
-Deno.test("action interna desconhecida (nem resume_funnel, nem debug-insert-tracking, nem vazia) é rejeitada com 400", async () => {
+Deno.test("action interna desconhecida (qualquer valor não vazio diferente de resume_funnel, incluindo debug-insert-tracking) é rejeitada com 400", async () => {
   const src = await readIndexSource();
   const rejectIdx = src.indexOf("Allowlist estrita");
-  const block = src.slice(rejectIdx, rejectIdx + 500);
-  assertEquals(block.includes('action !== "resume_funnel" && action !== "debug-insert-tracking"'), true);
+  const block = src.slice(rejectIdx, rejectIdx + 1100);
+  // A allowlist agora só verifica resume_funnel -- nenhuma outra exceção
+  // (nem debug-insert-tracking) sobrevive.
+  assertEquals(block.includes('action !== "resume_funnel"'), true);
+  assertEquals(block.includes('"debug-insert-tracking"'), false, "debug-insert-tracking não pode mais ter tratamento especial na allowlist");
 });
 
-Deno.test("debug-insert-tracking continua fora do gate (não exige Authorization) -- fora do escopo desta correção, comportamento preservado", async () => {
+// ── Correção: remoção física de debug-insert-tracking (achado da auditoria
+// — sem chamador legítimo, alcançável sem autenticação, escrevia em
+// lead_tracking sem organization_id, e o trigger tr_propagate_lead_attribution
+// (ativo em produção) propaga `source` para `leads.source` cross-tenant a
+// partir de qualquer lead_id existente -- mesmo achado independente já
+// corrigido em origin/main, commit 1d2ec5a, Fase 19O). ──────────────────
+
+Deno.test("debug-insert-tracking, como qualquer action não reconhecida, recebe 400 -- não existe mais tratamento algum para essa string", async () => {
   const src = await readIndexSource();
-  const allowlistIdx = src.indexOf("Allowlist estrita");
-  const allowlistBlock = src.slice(allowlistIdx, allowlistIdx + 500);
-  assertEquals(allowlistBlock.includes('"debug-insert-tracking"'), true);
-  // O handler de debug-insert-tracking em si continua sem nenhuma
-  // referência a evaluateResumeFunnelInternalAuth.
-  const handlerIdx = src.indexOf('if (action === "debug-insert-tracking") {');
-  const handlerBlock = src.slice(handlerIdx, handlerIdx + 300);
-  assertEquals(handlerBlock.includes("evaluateResumeFunnelInternalAuth"), false);
+  const rejectIdx = src.indexOf("Allowlist estrita");
+  // A allowlist rejeita qualquer action !== resume_funnel incondicionalmente
+  // -- debug-insert-tracking cai nesse caminho igual a qualquer outra string
+  // não reconhecida, sem branch dedicado.
+  const block = src.slice(rejectIdx, rejectIdx + 1100);
+  assertEquals(block.includes('action !== "resume_funnel"'), true);
+  assertEquals(/action\s*!==\s*"resume_funnel"\s*&&\s*action\s*!==\s*"debug-insert-tracking"/.test(block), false);
+});
+
+Deno.test("nenhum SELECT count(*) global (sem filtro) em lead_tracking sobrevive, e a rota não autenticada que escrevia sem organization_id foi removida -- os INSERTs legítimos (atribuição de mensagem inbound) permanecem intactos", async () => {
+  const src = await readIndexSource();
+  // Os 2 INSERTs legítimos em lead_tracking (atribuição de mensagem inbound,
+  // já escopados por lead/organização pelo restante do handler) continuam
+  // existindo -- não fazem parte do escopo desta remoção.
+  const legitInsertOccurrences = (src.match(/supabase\.from\("lead_tracking"\)\.insert\(tracking\)/g) || []).length;
+  assertEquals(legitInsertOccurrences, 2, "os 2 INSERTs legítimos pré-existentes de lead_tracking devem permanecer intocados");
+  // O COUNT global (sem organization_id) e os identificadores exclusivos do
+  // helper removido não sobrevivem em nenhum lugar do arquivo.
+  assertEquals(src.includes("count: 'exact', head: true"), false);
+  assertEquals(src.includes("lead_tracking_id"), false);
+  assertEquals(src.includes("count_after"), false);
+});
+
+Deno.test("a função debugInsertTracking, a string 'debug-insert-tracking' executável e os dois branches não existem mais no source", async () => {
+  const src = await readIndexSource();
+  assertEquals(src.includes("debugInsertTracking"), false, "nem a definição nem nenhuma chamada da função sobrevivem");
+  // A única ocorrência remanescente da string é o comentário explicativo da
+  // remoção, no bloco de rejeição -- não um literal usado em comparação
+  // executável (`action === "debug-insert-tracking"`).
+  assertEquals(src.includes('action === "debug-insert-tracking"'), false);
+  const literalOccurrences = (src.match(/debug-insert-tracking/g) || []).length;
+  assertEquals(literalOccurrences, 1, "só deve sobrar a menção no comentário explicando a remoção -- zero uso executável");
+});
+
+Deno.test("a segunda ocorrência morta (releitura de url.searchParams dentro do fluxo de mensagem) também foi removida -- não sobrevive um segundo `new URL(req.url)` redundante no meio do handler", async () => {
+  const src = await readIndexSource();
+  // Só a leitura original de `url`/`queryAction`, no topo do handler,
+  // permanece.
+  const urlConstructorOccurrences = (src.match(/new URL\(req\.url\)/g) || []).length;
+  assertEquals(urlConstructorOccurrences, 1, "deve sobrar exatamente 1 `new URL(req.url)` -- a do topo do handler; a releitura redundante dentro do fluxo de mensagem foi removida junto com o branch morto");
 });
 
 Deno.test("tráfego external_uazapi sem action continua no fluxo normal -- o gate nunca executa quando action é vazia/undefined", async () => {
