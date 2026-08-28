@@ -3691,166 +3691,9 @@ Deno.serve(async (req) => {
       );
     }
 
-    // 3. PROCESSAR EVENTOS DE ACK
-    // FASE 28: fora do gate rawEvent === "messages" — receipts UazAPI
-    // (Delivered/Read + MessageIDs[]) chegam com outros nomes de evento.
-    if (norm && (norm as any).kind === "ack") {
-      const ackEvent = norm as any;
-
-      // PROBE TEMPORÁRIA (hotfix/uazapi-ack-token-presence-probe-20260828,
-      // v2 — corrigida após revisão: a v1 usava uma IIFE assíncrona nunca
-      // aguardada, sem garantia de conclusão antes do runtime encerrar o
-      // request; `EdgeRuntime.waitUntil` existe e já é usado neste projeto
-      // — ver webchat-bot/index.ts:4009 — mas nenhum teste local pode
-      // provar que ele garante conclusão pós-resposta (é comportamento de
-      // plataforma, não observável em `deno test`). Decisão: `await`
-      // explícito. Custo esperado: 1 UPDATE indexado por chave primária
-      // (`id`), tipicamente poucos milissegundos — o caminho de ACK já faz
-      // várias chamadas Supabase `await`adas por `ackId` no loop abaixo;
-      // esta é só mais uma, uma única vez por request, antes do loop, não
-      // por ackId. Confiabilidade da amostra > latência zero.
-      //
-      // Responde uma única pergunta de dado: eventos de ACK reais carregam
-      // `payload.token` na raiz? Hoje isso é indeterminável (nenhum
-      // caminho existente registra isso para ACK) — decide se a exigência
-      // de token pode ser estendida ao caminho de ACK sem quebrar tráfego
-      // real. Nunca grava token, fragmento, hash, payload bruto,
-      // message_id, telefone/JID, nome de instância ou headers.
-      //
-      // `ack_type`: PROVA da classificação, por leitura do normalizador —
-      // duas rotas alimentam `ackEvent.ack` e a probe não sabe qual delas
-      // produziu este evento (`norm` não carrega essa origem):
-      //   (a) rota por nome de evento (linha ~1603): `ack=3` só de
-      //       `status==="delivered"`; `ack=4` só de `status==="read"` —
-      //       aqui `ack=4` É "Read" sem ambiguidade.
-      //   (b) rota Fase 28 por formato (linha ~1629): `ack=3` de
-      //       `receiptType==="delivered"||""`; `ack=4` de
-      //       `receiptType==="read"||"readself"||"played"` — aqui `ack=4`
-      //       é uma FUSÃO de três origens distintas, já feita pelo
-      //       normalizador antes desta probe existir.
-      // Logo: `ack===3` ("Delivered") é confiável nas duas rotas — mantido
-      // como categoria própria. `ack===4` NÃO é confiável como "Read"
-      // sozinho (pode ser Read, ReadSelf ou Played, dependendo da rota) —
-      // rotulado honestamente como "ReadOrPlayed", nunca "Read". Não
-      // inventa "Played" como categoria separada porque o normalizador já
-      // a torna indistinguível de Read/ReadSelf nesta amostra. A medida
-      // principal continua sendo `ack_token_presence`, não `ack_type`.
-      //
-      // Update usa SEMPRE `.eq("id", logRecordId)` — a própria linha já
-      // criada para este evento, nunca um filtro amplo. Fail-open: try/
-      // catch próprio, nunca lança para fora, nunca altera o status HTTP
-      // final nem as 4 escritas de negócio abaixo — só um console.warn se
-      // falhar. Removível sem efeito colateral — só grava em
-      // `webhook_logs.parsed_fields`, coluna não lida por nenhum outro
-      // código deste arquivo.
-      if (logRecordId) {
-        try {
-          const rawToken = (payload as Record<string, unknown> | null | undefined)?.token;
-          const ackTokenPresence: "present" | "missing" | "empty" | "invalid_type" =
-            payload === null || typeof payload !== "object" || !("token" in (payload as object))
-              ? "missing"
-              : typeof rawToken !== "string"
-              ? "invalid_type"
-              : rawToken.length === 0
-              ? "empty"
-              : "present";
-          const ackType: "Delivered" | "ReadOrPlayed" | "Other" =
-            ackEvent.ack === 3 ? "Delivered" : ackEvent.ack === 4 ? "ReadOrPlayed" : "Other";
-          const { error: probeErr } = await supabase.from("webhook_logs").update({
-            parsed_fields: {
-              ack_token_probe: {
-                schema_version: 2,
-                ack_token_presence: ackTokenPresence,
-                ack_type: ackType,
-              },
-            },
-          }).eq("id", logRecordId);
-          if (probeErr) {
-            console.warn("[uazapi-webhook] ack-token-presence-probe failed (non-blocking):", probeErr.message);
-          }
-        } catch (probeThrow) {
-          // Fail-open: qualquer falha (rede, RLS, coluna, exceção do
-          // builder) nunca pode afetar o processamento real do ACK — só
-          // um warn; segue para o loop de ackIds abaixo normalmente.
-          console.warn("[uazapi-webhook] ack-token-presence-probe threw (non-blocking):", (probeThrow as any)?.message || probeThrow);
-        }
-      }
-
-      const ackIds: string[] = (
-        Array.isArray(ackEvent.messageIds) && ackEvent.messageIds.length > 0
-          ? ackEvent.messageIds
-          : [ackEvent.messageId]
-      )
-        .map((id: unknown) => normalizePureMessageId(id))
-        .filter(Boolean);
-
-      console.log(
-        `[uazapi-webhook] processing ack ${ackEvent.ack} for ${ackIds.length} message(s):`,
-        ackIds.join(","),
-      );
-
-      for (const ackId of ackIds) {
-        // Tolerante: falha em um ID não pode travar os demais nem o webhook.
-        try {
-          // Atualizar status na tabela processed_messages
-          await supabase.from("processed_messages")
-            .update({
-              ack: ackEvent.ack,
-              ack_at: new Date().toISOString(),
-            })
-            .eq("message_id", ackId);
-
-          // Remover do controle de retentativas se entregue ou lido
-          if (ackEvent.ack >= 3) {
-            const { error: delErr } = await supabase.from("whatsapp_message_retries")
-              .delete()
-              .eq("message_id", ackId);
-            if (delErr) {
-              console.warn(`[uazapi-webhook] retry delete failed for ${ackId}:`, delErr.message);
-            }
-
-            // COMPAT TEMPORÁRIA (FASE 28): linhas antigas gravadas como
-            // "jid:id". Remover este LIKE após a fila legada drenar.
-            // Hardening: só roda o LIKE com id de charset seguro — "%" no
-            // padrão faria o LIKE casar (e apagar) linhas de outras
-            // mensagens. Id fora do padrão fica só com o DELETE por
-            // igualdade acima. "_" é permitido mas escapado (curinga LIKE).
-            if (/^[A-Za-z0-9=_-]+$/.test(ackId)) {
-              const { error: legacyDelErr } = await supabase.from("whatsapp_message_retries")
-                .delete()
-                .like("message_id", `%:${ackId.replace(/_/g, "\\_")}`);
-              if (legacyDelErr) {
-                console.warn(`[uazapi-webhook] legacy retry delete failed for ${ackId}:`, legacyDelErr.message);
-              }
-            } else {
-              console.warn(`[uazapi-webhook] legacy LIKE skipped for unsafe ackId: ${JSON.stringify(ackId).slice(0, 80)}`);
-            }
-
-            // Atualizar status na webchat_messages para refletir no UI.
-            // FASE 28.1: só a coluna status — delivered_at/read_at não
-            // existem na tabela e faziam o UPDATE inteiro falhar em silêncio.
-            const { error: uiErr } = await supabase.from("webchat_messages")
-              .update({
-                status: ackEvent.ack === 4 ? "read" : "delivered",
-              })
-              .or(`metadata->>evolution_message_id.eq."${ackId}",metadata->>external_id.eq."${ackId}"`);
-            if (uiErr) {
-              console.warn(`[uazapi-webhook] webchat status update failed for ${ackId}:`, uiErr.message);
-            }
-          }
-        } catch (ackErr) {
-          console.warn(
-            `[uazapi-webhook] ack handling failed for ${ackId}:`,
-            (ackErr as any)?.message || ackErr,
-          );
-        }
-      }
-
-      return new Response(
-        JSON.stringify({ ok: true, task: "ack_processed", count: ackIds.length }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
-      );
-    }
+    // [B2 — item B do hotfix] ACK movido para depois da resolução de
+    // instância (ver abaixo, logo após const instance = resolution.instance)
+    // -- precisa da instância já autenticada para escopar as escritas.
 
     // [ÚNICA RESOLUÇÃO DE INSTÂNCIA/ORGANIZAÇÃO POR REQUEST]
     // Roda DEPOIS do retorno antecipado de ACK (que já retornou acima e
@@ -3972,6 +3815,140 @@ Deno.serve(async (req) => {
     }
 
     const instance = resolution.instance;
+
+    // 3. PROCESSAR EVENTOS DE ACK (item B2 do hotfix — movido para depois
+    // da resolução de instância: precisa de `instance` já autenticada para
+    // escopar todas as escritas. ACK exige o mesmo token obrigatório de
+    // qualquer outro evento externo UazAPI agora — nenhuma exceção mais
+    // (validado por telemetria real de produção antes desta correção ser
+    // escrita: probe temporária hotfix/uazapi-ack-token-presence-probe
+    // -20260828, ~2950 amostras maduras, 100% com token presente — a probe
+    // e sua escrita extra em webhook_logs.parsed_fields.ack_token_probe não
+    // fazem parte do código final, removidas por completo nesta correção;
+    // a branch/commit 133d22f, onde a probe está deployada como v28,
+    // permanece preservada separadamente para rollback/rastreabilidade).
+    // FASE 28: fora do gate rawEvent === "messages" — receipts UazAPI
+    // (Delivered/Read + MessageIDs[]) chegam com outros nomes de evento.
+    if ((norm as any).kind === "ack") {
+      const ackEvent = norm as any;
+
+      const ackIds: string[] = (
+        Array.isArray(ackEvent.messageIds) && ackEvent.messageIds.length > 0
+          ? ackEvent.messageIds
+          : [ackEvent.messageId]
+      )
+        .map((id: unknown) => normalizePureMessageId(id))
+        .filter(Boolean);
+
+      console.log(
+        `[uazapi-webhook] processing ack ${ackEvent.ack} for ${ackIds.length} message(s), instance ${instance.id}:`,
+        ackIds.join(","),
+      );
+
+      // Resolve, uma única vez por request (não por ackId), as conversas
+      // que pertencem à instância autenticada — usadas para escopar o
+      // UPDATE em webchat_messages abaixo. `connection_id` é a coluna
+      // ativamente escrita hoje (confirmado por auditoria de produção:
+      // 44.052 linhas, connection_id superset de evolution_instance_id,
+      // zero divergência entre as duas onde ambas existem) —
+      // `evolution_instance_id` incluído por segurança (linhas antigas que
+      // só têm essa coluna preenchida), deduplicado via Set.
+      let scopedConversationIds: string[] = [];
+      {
+        const [byConnection, byEvolutionInstance] = await Promise.all([
+          supabase.from("webchat_conversations").select("id").eq("connection_id", instance.id),
+          supabase.from("webchat_conversations").select("id").eq("evolution_instance_id", instance.id),
+        ]);
+        if (byConnection.error || byEvolutionInstance.error) {
+          console.warn(
+            "[uazapi-webhook] ack conversation scope lookup failed (webchat_messages update will be skipped this request):",
+            byConnection.error?.message || byEvolutionInstance.error?.message,
+          );
+        }
+        scopedConversationIds = Array.from(new Set([
+          ...((byConnection.data || []).map((r: any) => r.id)),
+          ...((byEvolutionInstance.data || []).map((r: any) => r.id)),
+        ]));
+      }
+
+      for (const ackId of ackIds) {
+        // Tolerante: falha em um ID não pode travar os demais nem o webhook.
+        try {
+          // Atualizar status na tabela processed_messages — escopado pela
+          // instância autenticada, nunca um filtro global por message_id
+          // (achado da revisão: token de uma instância nunca pode alterar
+          // uma mensagem de outra instância/organização).
+          await supabase.from("processed_messages")
+            .update({
+              ack: ackEvent.ack,
+              ack_at: new Date().toISOString(),
+            })
+            .eq("message_id", ackId)
+            .eq("instance_id", instance.id);
+
+          // Remover do controle de retentativas se entregue ou lido
+          if (ackEvent.ack >= 3) {
+            const { error: delErr } = await supabase.from("whatsapp_message_retries")
+              .delete()
+              .eq("message_id", ackId)
+              .eq("instance_id", instance.id)
+              .eq("organization_id", instance.organization_id);
+            if (delErr) {
+              console.warn(`[uazapi-webhook] retry delete failed for ${ackId}:`, delErr.message);
+            }
+
+            // COMPAT TEMPORÁRIA (FASE 28): linhas antigas gravadas como
+            // "jid:id". Remover este LIKE após a fila legada drenar.
+            // Hardening: só roda o LIKE com id de charset seguro — "%" no
+            // padrão faria o LIKE casar (e apagar) linhas de outras
+            // mensagens. Id fora do padrão fica só com o DELETE por
+            // igualdade acima. "_" é permitido mas escapado (curinga LIKE).
+            // Escopado pela mesma instância/organização do delete acima.
+            if (/^[A-Za-z0-9=_-]+$/.test(ackId)) {
+              const { error: legacyDelErr } = await supabase.from("whatsapp_message_retries")
+                .delete()
+                .like("message_id", `%:${ackId.replace(/_/g, "\\_")}`)
+                .eq("instance_id", instance.id)
+                .eq("organization_id", instance.organization_id);
+              if (legacyDelErr) {
+                console.warn(`[uazapi-webhook] legacy retry delete failed for ${ackId}:`, legacyDelErr.message);
+              }
+            } else {
+              console.warn(`[uazapi-webhook] legacy LIKE skipped for unsafe ackId: ${JSON.stringify(ackId).slice(0, 80)}`);
+            }
+
+            // Atualizar status na webchat_messages para refletir no UI —
+            // escopado às conversas da instância autenticada
+            // (scopedConversationIds), nunca um `.or()` global por
+            // message_id sozinho. Nunca roda `.in()` vazio: sem nenhuma
+            // conversa vinculada a esta instância, pula o UPDATE.
+            // FASE 28.1: só a coluna status — delivered_at/read_at não
+            // existem na tabela e faziam o UPDATE inteiro falhar em silêncio.
+            if (scopedConversationIds.length > 0) {
+              const { error: uiErr } = await supabase.from("webchat_messages")
+                .update({
+                  status: ackEvent.ack === 4 ? "read" : "delivered",
+                })
+                .in("conversation_id", scopedConversationIds)
+                .or(`metadata->>evolution_message_id.eq."${ackId}",metadata->>external_id.eq."${ackId}"`);
+              if (uiErr) {
+                console.warn(`[uazapi-webhook] webchat status update failed for ${ackId}:`, uiErr.message);
+              }
+            }
+          }
+        } catch (ackErr) {
+          console.warn(
+            `[uazapi-webhook] ack handling failed for ${ackId}:`,
+            (ackErr as any)?.message || ackErr,
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({ ok: true, task: "ack_processed", count: ackIds.length }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
 
     // Rollout gradual (migration 20260827145000, conversation_isolation_feature_flags):
     // enquanto desligada para a organização, o comportamento é idêntico ao
