@@ -3619,6 +3619,66 @@ Deno.serve(async (req) => {
     // (Delivered/Read + MessageIDs[]) chegam com outros nomes de evento.
     if (norm && (norm as any).kind === "ack") {
       const ackEvent = norm as any;
+
+      // PROBE TEMPORÁRIA (hotfix/uazapi-ack-token-presence-probe-20260828) —
+      // instrumentação não-bloqueante, fail-open, para responder uma única
+      // pergunta de dado: eventos de ACK reais carregam `payload.token` na
+      // raiz? Hoje isso é indeterminável (nenhum caminho existente registra
+      // isso para ACK) — decide se a exigência de token pode ser estendida
+      // ao caminho de ACK sem quebrar tráfego real. Nunca grava token,
+      // fragmento, hash, payload bruto, message_id, telefone/JID, nome de
+      // instância ou headers — só a classificação de presença e o tipo já
+      // computado por `ackEvent.ack` (nunca lê `payload` de novo aqui).
+      // `ack_type` distingue Delivered/Read via `ackEvent.ack` (3/4); note
+      // que "Played" já colapsa em `ack === 4` na normalização (linha
+      // ~1629) — a string original (`receiptType`) não sobrevive até aqui,
+      // e esta probe não lê `payload` bruto para recuperá-la, então
+      // Played/Read são indistinguíveis nesta amostragem (limitação
+      // documentada, não um bug da probe). Removível sem qualquer efeito
+      // colateral — só grava em `webhook_logs.parsed_fields`, uma coluna
+      // não lida por nenhum outro código deste arquivo.
+      if (logRecordId) {
+        try {
+          const rawToken = (payload as Record<string, unknown> | null | undefined)?.token;
+          const ackTokenPresence: "present" | "missing" | "empty" | "invalid_type" =
+            payload === null || typeof payload !== "object" || !("token" in (payload as object))
+              ? "missing"
+              : typeof rawToken !== "string"
+              ? "invalid_type"
+              : rawToken.length === 0
+              ? "empty"
+              : "present";
+          const ackType: "Delivered" | "Read" | "Other" =
+            ackEvent.ack === 3 ? "Delivered" : ackEvent.ack === 4 ? "Read" : "Other";
+          // IIFE assíncrona, nunca aguardada (sem `await` no call site) —
+          // zero atraso adicionado à resposta do ACK. Falha (rede, RLS,
+          // coluna, exceção síncrona do builder) é só um warn; nunca
+          // propaga, nunca afeta o loop de ackIds abaixo.
+          (async () => {
+            try {
+              const { error } = await supabase.from("webhook_logs").update({
+                parsed_fields: {
+                  ack_token_probe: {
+                    schema_version: 1,
+                    ack_token_presence: ackTokenPresence,
+                    ack_type: ackType,
+                  },
+                },
+              }).eq("id", logRecordId);
+              if (error) {
+                console.warn("[uazapi-webhook] ack-token-presence-probe failed (non-blocking):", error.message);
+              }
+            } catch (probeErr: any) {
+              console.warn("[uazapi-webhook] ack-token-presence-probe threw (non-blocking):", probeErr?.message || probeErr);
+            }
+          })();
+        } catch (probeSyncErr) {
+          // Falha síncrona (ex.: montar o objeto acima) também nunca pode
+          // afetar o processamento real do ACK.
+          console.warn("[uazapi-webhook] ack-token-presence-probe setup failed (non-blocking):", (probeSyncErr as any)?.message || probeSyncErr);
+        }
+      }
+
       const ackIds: string[] = (
         Array.isArray(ackEvent.messageIds) && ackEvent.messageIds.length > 0
           ? ackEvent.messageIds
