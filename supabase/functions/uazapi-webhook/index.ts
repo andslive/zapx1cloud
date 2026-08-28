@@ -912,47 +912,6 @@ function extractInstance(payload: any): string {
 }
 
 /**
- * Mesma lista de candidatos de `extractInstance()`, mas SEM normalizar
- * (sem lowercase, sem remover espaço) — usada exclusivamente pelo fallback
- * legado por nome exato em `resolveInstanceForEvent`. Nunca usar o valor
- * normalizado de `extractInstance()` para comparar contra `evolution_instances.name`,
- * que é armazenado como o operador digitou (pode ter espaço/maiúsculas).
- */
-export function extractRawInstanceIdentifier(payload: any): string {
-  const candidates = [
-    payload?.instance,
-    payload?.instanceName,
-    payload?.Instance,
-    payload?.instance_name,
-    payload?.instanceId,
-    payload?.instance_id,
-    payload?.session,
-    payload?.SessionID,
-    payload?.session_id,
-    typeof payload?.instance === "object"
-      ? (payload?.instance?.instanceName || payload?.instance?.name ||
-        payload?.instance?.id)
-      : null,
-    payload?.data?.instance,
-    payload?.data?.Instance,
-    payload?.data?.instanceName,
-    payload?.data?.instance_name,
-    payload?.data?.instanceId,
-    payload?.data?.instance_id,
-    payload?.data?.session,
-    typeof payload?.data?.instance === "object"
-      ? (payload?.data?.instance?.name || payload?.data?.instance?.instanceName)
-      : null,
-    payload?.sender?.instance,
-  ];
-  for (const c of candidates) {
-    const s = extractString(c);
-    if (s) return s;
-  }
-  return "";
-}
-
-/**
  * Extrai o token de instância do payload da UazAPI — confirmado por captura
  * real (SSE) como campo raiz `token`. Deliberadamente restrito a esse único
  * campo (não tenta "variantes adivinhadas") para não confundir token de
@@ -961,8 +920,6 @@ export function extractRawInstanceIdentifier(payload: any): string {
 export function extractInstanceToken(payload: any): string {
   return extractString(payload?.token);
 }
-
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // NOTA (desvio deliberado da revisão do plano): a revisão sugeriu selecionar
 // colunas explícitas, sem `instance_token`, para reduzir exposição acidental.
@@ -978,137 +935,130 @@ const INSTANCE_RESOLUTION_COLUMNS = "*";
 
 type InstanceResolutionReason =
   | "resolved_by_token"
-  | "resolved_by_legacy_identifier"
-  | "missing_instance"
+  | "resolved_by_resume_context"
+  | "missing_token"
   | "unknown_token"
   | "token_conflict"
-  | "unknown_instance"
-  | "ambiguous_instance"
+  | "unsupported_provider"
   | "inactive_instance"
   | "organization_mismatch"
   | "error";
 
 type InstanceResolutionResult =
-  | { instance: Record<string, any>; reason: "resolved_by_token" | "resolved_by_legacy_identifier" }
-  | { instance: null; reason: Exclude<InstanceResolutionReason, "resolved_by_token" | "resolved_by_legacy_identifier"> };
+  | { instance: Record<string, any>; reason: "resolved_by_token" | "resolved_by_resume_context" }
+  | { instance: null; reason: Exclude<InstanceResolutionReason, "resolved_by_token" | "resolved_by_resume_context"> };
+
+/**
+ * Só `provider=uazapi` (null/'' tratados como legado-uazapi, nunca outro
+ * provider por omissão) pode ser resolvido por `resolveInstanceForEvent` —
+ * nunca uma instância Meta/HookCloud, mesmo que o token bata por acidente
+ * (não deveria, tokens não são compartilhados entre providers, mas a
+ * checagem é explícita em vez de depender dessa garantia implícita).
+ */
+function isUazapiProviderInstance(candidate: Record<string, any> | null | undefined): boolean {
+  if (!candidate) return false;
+  const provider = candidate.provider;
+  if (provider === null || provider === undefined || provider === "") return true;
+  return provider === "uazapi";
+}
 
 /**
  * ÚNICO ponto de resolução de instância/organização para eventos de webhook
- * da UazAPI (exceto ACK, que nunca precisou de instância resolvida e
- * continua fora deste caminho). Ordem de resolução:
+ * da UazAPI (exceto ACK, que agora reusa a instância já resolvida aqui —
+ * ver item B do hotfix — em vez de ficar fora deste caminho).
  *
- *   1. Token exato (`payload.token` → `evolution_instances.instance_token`).
- *      Token presente mas desconhecido ou em conflito NUNCA cai para nome —
- *      falha fechada.
- *   2. Só quando o token está ausente no payload: fallback legado por
- *      identificador bruto (não normalizado) — `instance_id`, `id` (se
- *      formato UUID) ou `name`, cada um via `.eq()` isolado (nunca `.or()`
- *      com string interpolada). Ambíguo (>1) ou desconhecido (0) falha
- *      fechada, nunca escolhe arbitrariamente.
+ * Dois domínios completamente separados:
  *
- * Em ambos os casos: instância inativa/arquivada tenta primeiro o
- * redirecionamento pré-existente para "uma instância ativa parceira com o
- * mesmo telefone" — comportamento preservado deliberadamente (fora de
- * escopo alterar nesta correção), mas agora **escopado pela mesma
- * organização** (achado crítico da revisão final: a versão original desta
- * correção não tinha esse filtro e podia atravessar organizações). Sem
- * parceira única na mesma organização, falha fechada (`inactive_instance`).
- * E se `payload.organization_id` vier preenchido e divergir da organização
- * da instância resolvida, falha fechada (`organization_mismatch`) — isso é
- * checado depois de uma resolução já bem-sucedida, nunca usado para
- * escolher entre candidatos.
+ *   1. `payload.__is_resume === true` (ação interna `resume_funnel`, já
+ *      autenticada por Bearer service-role no gate do topo do handler —
+ *      item A): confia em `payload.instance`, que o próprio handler setou a
+ *      partir de `conv.evolution_instance_id` — uma coluna do NOSSO banco,
+ *      nunca do corpo da requisição externa. Resolve por `id`, sem token,
+ *      sem checagem de provider/archived_at (a conversa já pertence a essa
+ *      instância por definição, não há ambiguidade a resolver). Instância
+ *      não encontrada aqui é sempre `error` (fail-closed) — nunca deveria
+ *      acontecer, dado que `conv.evolution_instance_id` é uma FK.
+ *   2. Tráfego externo genuíno: token obrigatório e não vazio
+ *      (`payload.token` → `evolution_instances.instance_token`) — SEM
+ *      NENHUM fallback por nome/instance_id/metadata (removido fisicamente
+ *      desta correção, junto com `extractRawInstanceIdentifier`). Token
+ *      ausente, desconhecido ou em conflito falha fechada, sempre com
+ *      recusa determinística (200, nunca mutação de negócio). Resolve só
+ *      `provider=uazapi` — qualquer outro provider (Meta Cloud, HookCloud)
+ *      falha fechada (`unsupported_provider`), mesmo com token exato.
+ *      Instância arquivada (`archived_at IS NOT NULL`, não mais
+ *      `is_active`) tenta redirecionar para uma parceira `archived_at IS
+ *      NULL` do MESMO telefone, MESMA organização e MESMO provider (uazapi)
+ *      antes de desistir — sem parceira única, falha fechada
+ *      (`inactive_instance`). `payload.organization_id`, quando presente e
+ *      divergente da organização resolvida, falha fechada
+ *      (`organization_mismatch`) — checado depois da resolução, nunca usado
+ *      para escolher entre candidatos.
+ *
+ * Erro técnico de consulta (`reason: "error"`) é sempre distinto de recusa
+ * determinística — o chamador traduz `error` para 503 (nunca 200, para não
+ * fazer a UazAPI desistir de reentregar por uma indisponibilidade
+ * momentânea do Supabase) e qualquer outra recusa para 200 (são definitivas
+ * por natureza, reenviar não mudaria o resultado). Nenhum caminho aqui faz
+ * mutação de negócio — só leitura.
  */
 export async function resolveInstanceForEvent(
   supabase: any,
   payload: any,
 ): Promise<InstanceResolutionResult> {
-  const token = extractInstanceToken(payload);
-  let candidate: Record<string, any> | null = null;
-  let reason: "resolved_by_token" | "resolved_by_legacy_identifier";
-
-  if (token) {
+  if ((payload as any)?.__is_resume) {
+    const instanceId = extractString((payload as any)?.instance);
+    if (!instanceId) return { instance: null, reason: "error" };
     const { data: rows, error } = await supabase
       .from("evolution_instances")
       .select(INSTANCE_RESOLUTION_COLUMNS)
-      .eq("instance_token", token);
-
+      .eq("id", instanceId);
     if (error) return { instance: null, reason: "error" };
-    if (!rows || rows.length === 0) return { instance: null, reason: "unknown_token" };
-    if (rows.length > 1) return { instance: null, reason: "token_conflict" };
-    candidate = rows[0];
-    reason = "resolved_by_token";
-  } else {
-    // Fallback legado — só tentado quando o payload não trouxe token. Mantém
-    // deliberadamente a compatibilidade com o comportamento pré-existente
-    // (case-insensitive em `name`, fallback por `metadata.instance_name`/
-    // `instance_uuid`) para reduzir risco de regressão em payloads que hoje
-    // dependem dessas variantes — a correção do bug real (identificador
-    // normalizado comparado contra coluna não normalizada) já está garantida
-    // por usar `raw` (sem lowercase/strip) em vez do `norm.instance`
-    // duplamente normalizado. Cada consulta usa `.eq()`/`.ilike()` isolado
-    // com valor parametrizado — nunca `.or()` com string interpolada.
-    const raw = extractRawInstanceIdentifier(payload);
-    if (!raw) return { instance: null, reason: "missing_instance" };
-
-    const byId = new Map<string, Record<string, any>>();
-    const queries = [
-      supabase.from("evolution_instances").select(INSTANCE_RESOLUTION_COLUMNS).eq("instance_id", raw),
-      supabase.from("evolution_instances").select(INSTANCE_RESOLUTION_COLUMNS).ilike("name", raw),
-      supabase.from("evolution_instances").select(INSTANCE_RESOLUTION_COLUMNS).eq("metadata->>instance_name", raw),
-      supabase.from("evolution_instances").select(INSTANCE_RESOLUTION_COLUMNS).eq("metadata->>instance_uuid", raw),
-    ];
-    if (UUID_REGEX.test(raw)) {
-      queries.push(
-        supabase.from("evolution_instances").select(INSTANCE_RESOLUTION_COLUMNS).eq("id", raw),
-      );
-    }
-    const results = await Promise.all(queries);
-    for (const r of results) {
-      if (r.error) return { instance: null, reason: "error" };
-      for (const row of r.data || []) byId.set(row.id, row);
-    }
-
-    if (byId.size === 0) return { instance: null, reason: "unknown_instance" };
-    if (byId.size > 1) return { instance: null, reason: "ambiguous_instance" };
-    candidate = [...byId.values()][0];
-    reason = "resolved_by_legacy_identifier";
+    if (!rows || rows.length !== 1) return { instance: null, reason: "error" };
+    return { instance: rows[0], reason: "resolved_by_resume_context" };
   }
 
-  if (!candidate) return { instance: null, reason: "error" };
+  const token = extractInstanceToken(payload);
+  if (!token) return { instance: null, reason: "missing_token" };
 
-  if (!candidate.is_active) {
-    // Comportamento pré-existente preservado (não é indispensável para
-    // corrigir o bug de resolução por nome, mas removê-lo seria uma mudança
-    // de comportamento fora do escopo desta correção — pedido explícito de
-    // não alterar isso nesta entrega). Se a instância resolvida está
-    // arquivada, procura uma parceira ATIVA com o mesmo telefone antes de
-    // desistir — exatamente a mesma heurística que já existia.
+  const { data: rows, error } = await supabase
+    .from("evolution_instances")
+    .select(INSTANCE_RESOLUTION_COLUMNS)
+    .eq("instance_token", token);
+
+  if (error) return { instance: null, reason: "error" };
+  if (!rows || rows.length === 0) return { instance: null, reason: "unknown_token" };
+  if (rows.length > 1) return { instance: null, reason: "token_conflict" };
+  let candidate: Record<string, any> = rows[0];
+
+  if (!isUazapiProviderInstance(candidate)) {
+    return { instance: null, reason: "unsupported_provider" };
+  }
+
+  if (candidate.archived_at) {
     const { data: activePartners, error: partnerErr } = await supabase
       .from("evolution_instances")
       .select(INSTANCE_RESOLUTION_COLUMNS)
-      .eq("is_active", true)
+      .is("archived_at", null)
       .eq("phone_number", candidate.phone_number)
-      // Achado crítico da revisão final do diff: sem esta linha, o redirect
-      // podia atravessar organizações (duas orgs com instâncias no mesmo
-      // número). A heurística original não tinha essa checagem — aqui ela é
-      // obrigatória, não opcional.
+      // Mesma organização obrigatória — sem isso, o redirect podia
+      // atravessar organizações (duas orgs com instâncias no mesmo número).
       .eq("organization_id", candidate.organization_id);
     if (partnerErr) return { instance: null, reason: "error" };
-    if (activePartners && activePartners.length === 1 && candidate.phone_number) {
-      candidate = activePartners[0];
+    const uazapiPartners = (activePartners || []).filter(isUazapiProviderInstance);
+    if (uazapiPartners.length === 1 && candidate.phone_number) {
+      candidate = uazapiPartners[0];
     } else {
       return { instance: null, reason: "inactive_instance" };
     }
   }
-
-  if (!candidate) return { instance: null, reason: "error" };
 
   const payloadOrgId = extractString(payload?.organization_id);
   if (payloadOrgId && payloadOrgId !== candidate.organization_id) {
     return { instance: null, reason: "organization_mismatch" };
   }
 
-  return { instance: candidate, reason };
+  return { instance: candidate, reason: "resolved_by_token" };
 }
 
 function normalizeQrString(value: any): string | null {
@@ -3717,6 +3667,30 @@ Deno.serve(async (req) => {
       }
     }
 
+    // [B1 — item B do hotfix] Movido para ANTES da resolução de instância
+    // (era depois, junto com health tracking/status do log) — evento
+    // ilegível não tem nada a resolver; falha fechada e some daqui sem
+    // gastar uma consulta ao banco à toa. Somente leitura: nenhuma mutação
+    // de negócio, só o log sanitizado e o retorno 200 já existentes.
+    if (!norm && !(payload as any).__is_resume) {
+      // Log sanitizado (sem token) para identificar onde a instância deveria estar.
+      try {
+        const dump = JSON.stringify(redactSecrets(payload)).slice(0, 4000);
+        console.warn("[uazapi-webhook] missing instance — payload dump:", dump);
+      } catch {
+        console.warn(
+          "[uazapi-webhook] missing instance — payload not serializable",
+        );
+      }
+      // Return 200 so UazAPI does not retry indefinitely
+      return new Response(
+        JSON.stringify({ ok: true, ignored: "missing_instance" }),
+        {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
+
     // 3. PROCESSAR EVENTOS DE ACK
     // FASE 28: fora do gate rawEvent === "messages" — receipts UazAPI
     // (Delivered/Read + MessageIDs[]) chegam com outros nomes de evento.
@@ -3885,15 +3859,17 @@ Deno.serve(async (req) => {
     // os lookups fragmentados por nome/instance_id que existiam aqui
     // (health tracking) e mais abaixo (bloco de mensagem) — antes eram DUAS
     // consultas independentes, cada uma podendo resolver para instâncias
-    // diferentes. Token primeiro; fallback legado por identificador bruto
-    // só quando o token está ausente; falha fechada em
-    // ambiguidade/desconhecido/conflito/token divergente de organização.
-    // ACK continua sem isolamento por instância/organização (guard só por
-    // message_id) — risco residual conhecido, documentado em plan.md e no
-    // relatório final, não corrigido nesta entrega.
-    const resolution = norm
-      ? await resolveInstanceForEvent(supabase, payload)
-      : ({ instance: null, reason: "missing_instance" } as const);
+    // diferentes. Token obrigatório, sem fallback (item B1) — falha
+    // fechada em token ausente/desconhecido/em conflito, provider não
+    // suportado, instância arquivada sem parceira, ou organização
+    // divergente. ACK continua sem isolamento por instância/organização
+    // (guard só por message_id) — corrigido no item B2 deste hotfix, ainda
+    // não aplicado neste commit.
+    //
+    // `norm` é sempre não nulo aqui — o caso `!norm && !__is_resume` já
+    // retornou 200 mais acima (movido para antes desta resolução, item
+    // B1), então a resolução nunca é chamada para um evento ilegível.
+    const resolution = await resolveInstanceForEvent(supabase, payload);
 
     // [WEBHOOK_HEALTH_TRACKING] Update last_webhook_event_at for the instance
     if (resolution.instance) {
@@ -3959,27 +3935,9 @@ Deno.serve(async (req) => {
     }
 
 
-    if (!norm && !(payload as any).__is_resume) {
-
-
-
-      // Log sanitizado (sem token) para identificar onde a instância deveria estar.
-      try {
-        const dump = JSON.stringify(redactSecrets(payload)).slice(0, 4000);
-        console.warn("[uazapi-webhook] missing instance — payload dump:", dump);
-      } catch {
-        console.warn(
-          "[uazapi-webhook] missing instance — payload not serializable",
-        );
-      }
-      // Return 200 so UazAPI does not retry indefinitely
-      return new Response(
-        JSON.stringify({ ok: true, ignored: "missing_instance" }),
-        {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        },
-      );
-    }
+    // (item B1: a checagem `!norm && !__is_resume` foi movida para antes da
+    // resolução de instância — ver acima, logo após o payload dump — em vez
+    // de repetida aqui.)
 
     // Resolução de instância/organização já foi feita acima (uma única vez
     // por request, em `resolution`) — inclui o redirect por telefone para
