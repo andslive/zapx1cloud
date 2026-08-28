@@ -56,29 +56,6 @@ function normalizeResponseHash(text: any): string {
     .trim();
 }
 
-/** Debug insert for testing attribution propagation. */
-async function debugInsertTracking(supabase: any, payload: any) {
-  const { lead_id, phone, source, raw_payload } = payload;
-  const tracking = {
-    lead_id,
-    phone,
-    source,
-    raw_payload,
-    created_at: new Date().toISOString()
-  };
-  
-  const { data, error } = await supabase.from("lead_tracking").insert(tracking).select().single();
-  
-  if (error) {
-    console.error("[uazapi-webhook] debug insert error:", error);
-    return { success: false, error };
-  }
-  
-  const { count } = await supabase.from("lead_tracking").select("*", { count: 'exact', head: true });
-  
-  return { success: true, lead_tracking_id: data.id, count_after: count };
-}
-
 /**
  * Redige recursivamente qualquer valor que pareça credencial (token da
  * instância, chaves de API, etc.) antes que um payload/objeto de erro seja
@@ -2888,18 +2865,24 @@ Deno.serve(async (req) => {
     const action = queryAction || payload.action;
 
     // [INTERNAL_ACTION_AUTH] Roda ANTES de qualquer leitura, lease ou
-    // mutação — inclusive antes do INSERT em webhook_logs logo abaixo.
-    // `debug-insert-tracking` (ação de teste pré-existente, fora do
-    // escopo desta correção) e o tráfego externo sem `action` (UazAPI
-    // real) nunca passam por este bloco.
-    // Allowlist estrita: só `resume_funnel` (autenticada abaixo) e
-    // `debug-insert-tracking` (ação de teste pré-existente, fora do
-    // escopo desta correção — instrução explícita de não tocar) passam.
-    // Qualquer outra action não vazia — inclusive `execute_recovery` e
-    // `execute_silent_recovery` — é rejeitada aqui, incondicionalmente.
+    // mutação — inclusive antes do INSERT em webhook_logs logo abaixo. O
+    // tráfego externo sem `action` (UazAPI real) nunca passa por este
+    // bloco. Allowlist estrita: só `resume_funnel` (autenticada abaixo)
+    // passa. Qualquer outra action não vazia é rejeitada aqui,
+    // incondicionalmente — inclusive `execute_recovery`,
+    // `execute_silent_recovery` e `debug-insert-tracking` (removida
+    // fisicamente desta correção, junto com seu helper e as 2 ocorrências
+    // do branch: achado da auditoria — sem chamador legítimo, presente ou
+    // histórico, e alcançável sem nenhuma autenticação; o helper inseria
+    // em `lead_tracking` sem `organization_id`, e o trigger
+    // `tr_propagate_lead_attribution`, ativo hoje, propaga `source` do
+    // payload do cliente para `leads.source` — escrita cross-tenant real
+    // dado qualquer `lead_id` existente, não hipotética. Mesmo achado e
+    // mesma correção já aplicada independentemente em origin/main, commit
+    // 1d2ec5a, Fase 19O).
     if (
       typeof action === "string" && action.length > 0 &&
-      action !== "resume_funnel" && action !== "debug-insert-tracking"
+      action !== "resume_funnel"
     ) {
       return new Response(
         JSON.stringify({ ok: false, error: "unsupported_action" }),
@@ -3710,14 +3693,6 @@ Deno.serve(async (req) => {
     // guards de dedup de mensagem NOVA já rodaram com o id sintético do
     // resume (que nunca colide, por ser gerado na hora).
     console.log("[uazapi-webhook] normalized:", JSON.stringify(norm));
-
-    // DEBUG ACTION: Controlled insert test
-    if (action === "debug-insert-tracking") {
-      const result = await debugInsertTracking(supabase, payload);
-      return new Response(JSON.stringify(result), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
 
     const rawEvent = payload.event || payload.type || payload.Event ||
       payload.EventType;
@@ -11731,17 +11706,6 @@ FORMATO JSON:
         } catch (_) {
           /* noop */
         }
-      }
-
-      // DEBUG ACTION: Controlled insert test
-      const url = new URL(req.url);
-      const action = url.searchParams.get("action");
-      if (action === "debug-insert-tracking") {
-        const payload = await req.json();
-        const result = await debugInsertTracking(supabase, payload);
-        return new Response(JSON.stringify(result), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
       }
 
       return new Response(JSON.stringify({ ok: true }), {
