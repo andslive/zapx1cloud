@@ -2778,6 +2778,95 @@ async function sendFacebookConversion(
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// AUTENTICAÇÃO INTERNA DE `resume_funnel` (hotfix/uazapi-ack-auth-isolation
+// -20260828, item A). Achado da auditoria: nenhuma das 3 actions internas
+// (`resume_funnel`, `execute_recovery`, `execute_silent_recovery`) tinha
+// qualquer verificação de credencial — `verify_jwt:false` nesta function
+// (necessário para o tráfego real da UazAPI, que não carrega JWT Supabase)
+// deixava `resume_funnel` alcançável por qualquer requisição HTTP não
+// autenticada, bastando um `conversationId` (não secreto — trafega em
+// logs/URLs do painel) de QUALQUER organização, para forçar o bot a
+// enviar uma mensagem real a um lead real fora de ordem.
+// `execute_recovery`/`execute_silent_recovery` não têm nenhum chamador
+// real: 0 linhas em `receipt_recovery_requests` nos últimos 30 dias
+// (consulta agregada, sem PII) — só existiam para o incidente histórico
+// de crédito OpenAI (2026-07-26/27), já terminal. Removidas da superfície
+// aceita (o código dos dois handlers permanece abaixo, agora
+// definitivamente inalcançável — não deletado nesta correção para não
+// tocar lógica de recibos fora do escopo autorizado desta entrega).
+//
+// Os 3 chamadores reais de `resume_funnel` (`funnel-resume-cron`,
+// `funnel-job-runner`, `webchat-inbox`) já enviam
+// `Authorization: Bearer <SUPABASE_SERVICE_ROLE_KEY>` hoje — confirmado
+// lendo o código-fonte de cada um: nenhum dos três teve a região que monta
+// esse header modificada em nenhum commit, em nenhuma branch, desde o
+// commit inicial deste repositório. Nenhuma mudança é necessária nesses 3
+// arquivos. `apikey` sozinho nunca autentica — só
+// `Authorization: Bearer <token exato>` conta.
+export function extractBearerTokenForInternalAuth(
+  authorizationHeader: string | null | undefined,
+): string | null {
+  if (typeof authorizationHeader !== "string") return null;
+  const match = /^Bearer ([^\s]+)$/.exec(authorizationHeader);
+  if (!match) return null;
+  const token = match[1];
+  return token.length > 0 ? token : null;
+}
+
+function timingSafeEqualStringForInternalAuth(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const aBytes = enc.encode(a);
+  const bBytes = enc.encode(b);
+  if (aBytes.length !== bBytes.length) {
+    // Ainda percorre `b` inteiro comparando contra `a` (módulo do tamanho
+    // de `a`) para não vazar o tamanho de forma óbvia via contagem de
+    // iterações — proteção best-effort, não uma prova formal de
+    // constant-time em JS/V8. Mesmo padrão de `resolveInstanceForEvent`
+    // (nenhum mecanismo novo introduzido).
+    let dummy = 0;
+    for (let i = 0; i < bBytes.length; i++) {
+      dummy |= bBytes[i] ^ (aBytes[i % Math.max(aBytes.length, 1)] || 0);
+    }
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < aBytes.length; i++) diff |= aBytes[i] ^ bBytes[i];
+  return diff === 0;
+}
+
+export type ResumeFunnelInternalAuthResult = "match" | "missing" | "invalid";
+
+/**
+ * Prova, em tempo constante, que o chamador possui exatamente o
+ * `SUPABASE_SERVICE_ROLE_KEY` via header `Authorization: Bearer <token>`.
+ * Nunca loga o header nem o valor comparado. Ambiente sem o secret
+ * configurado falha fechada (`"invalid"`, nunca autentica por omissão).
+ */
+export function evaluateResumeFunnelInternalAuth(
+  authorizationHeader: string | null | undefined,
+  expectedServiceRoleKey: string | null | undefined,
+): ResumeFunnelInternalAuthResult {
+  try {
+    if (
+      typeof expectedServiceRoleKey !== "string" ||
+      expectedServiceRoleKey.length === 0
+    ) {
+      return "invalid";
+    }
+    const bearer = extractBearerTokenForInternalAuth(authorizationHeader);
+    if (bearer === null) return "missing";
+    return timingSafeEqualStringForInternalAuth(expectedServiceRoleKey, bearer)
+      ? "match"
+      : "invalid";
+  } catch {
+    // Nunca deixa um erro inesperado (ex.: header exótico) autenticar por
+    // omissão nem derrubar o handler — falha fechada.
+    return "invalid";
+  }
+}
+// ─────────────────────────────────────────────────────────────────────
+
 // `Deno.serve` só roda quando este arquivo é o módulo principal (mesmo
 // padrão já usado em uazapi-send/index.ts) — permite importar as funções
 // exportadas (resolveInstanceForEvent, redactSecrets, etc.) em testes
@@ -2797,6 +2886,45 @@ Deno.serve(async (req) => {
     const queryAction = url.searchParams.get("action");
     const payload = await req.json().catch(() => ({}));
     const action = queryAction || payload.action;
+
+    // [INTERNAL_ACTION_AUTH] Roda ANTES de qualquer leitura, lease ou
+    // mutação — inclusive antes do INSERT em webhook_logs logo abaixo.
+    // `debug-insert-tracking` (ação de teste pré-existente, fora do
+    // escopo desta correção) e o tráfego externo sem `action` (UazAPI
+    // real) nunca passam por este bloco.
+    // Allowlist estrita: só `resume_funnel` (autenticada abaixo) e
+    // `debug-insert-tracking` (ação de teste pré-existente, fora do
+    // escopo desta correção — instrução explícita de não tocar) passam.
+    // Qualquer outra action não vazia — inclusive `execute_recovery` e
+    // `execute_silent_recovery` — é rejeitada aqui, incondicionalmente.
+    if (
+      typeof action === "string" && action.length > 0 &&
+      action !== "resume_funnel" && action !== "debug-insert-tracking"
+    ) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "unsupported_action" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+    if (action === "resume_funnel") {
+      const internalAuthResult = evaluateResumeFunnelInternalAuth(
+        req.headers.get("Authorization"),
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY"),
+      );
+      if (internalAuthResult !== "match") {
+        // Nunca loga o header, o segredo, o tamanho ou qualquer fragmento
+        // — só a classificação (missing/invalid), suficiente para
+        // diagnóstico sem expor nada sensível.
+        console.warn(
+          "[uazapi-webhook] resume_funnel internal auth rejected:",
+          internalAuthResult,
+        );
+        return new Response(
+          JSON.stringify({ ok: false, error: "unauthorized" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+    }
 
     let healthId: string | null = null;
     let norm: Normalized | null = null;
