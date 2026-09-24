@@ -55,7 +55,11 @@ export const MANUAL_CHARGE_PAGE_SIZE = 20;
 export interface ManualChargeFilters {
   search: string;
   kind: 'all' | 'debt_reminder' | 'voluntary_contribution_reminder';
-  /** 'all' | 'review' (status interno eligible COM motivo de bloqueio) | status exato */
+  /**
+   * 'all' | 'review' (Em revisão) | 'receipt' (Comprovante em análise) | status exato.
+   * Em revisão = status interno eligible, ou hold_receipt_review SEM alegação de pagamento, sempre COM motivo de bloqueio.
+   * Comprovante em análise = hold_receipt_review COM alegação de pagamento no registro.
+   */
   status: string;
   page: number;
 }
@@ -90,9 +94,17 @@ export function useManualChargePage(filters: ManualChargeFilters) {
       const client = supabase as unknown as TableClient;
       let q = client.from('manual_charge_dispatches_panel').select<ManualChargeDispatchRow[]>(PANEL_COLUMNS, { count: 'exact' });
       if (filters.kind !== 'all') q = q.eq('charge_kind', filters.kind);
-      if (filters.status === 'review') q = q.eq('status', 'eligible').not('review_reason', 'is', null);
-      else if (filters.status !== 'all') q = q.eq('status', filters.status);
+      if (filters.status === 'review') {
+        // Em revisão: eligible, ou hold_receipt_review sem alegação de pagamento; sempre com motivo de bloqueio.
+        q = q.not('review_reason', 'is', null)
+          .or('status.eq.eligible,and(status.eq.hold_receipt_review,or(is_payment_claimed.is.null,is_payment_claimed.eq.false))');
+      } else if (filters.status === 'receipt') {
+        q = q.eq('status', 'hold_receipt_review').eq('is_payment_claimed', 'true');
+      } else if (filters.status !== 'all') {
+        q = q.eq('status', filters.status);
+      }
       const term = sanitizeSearch(filters.search);
+      // Dois parâmetros `or` na mesma consulta são combinados com AND pelo PostgREST (verificado); postgrest-js não tem `.and()`.
       if (term) q = q.or(`lead_name.ilike.*${term}*,phone_normalized.ilike.*${term}*,campaign_key.ilike.*${term}*`);
       const from = (filters.page - 1) * MANUAL_CHARGE_PAGE_SIZE;
       const { data, error, count } = await q

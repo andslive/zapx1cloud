@@ -91,9 +91,15 @@ function fmtDateTime(value: string | null) {
   }
 }
 
-// Linha "em revisão": status interno elegível, mas com motivo de bloqueio (nunca apresentado como liberado).
+// "Em revisão": status interno elegível com motivo de bloqueio (nunca apresentado como liberado) ou retenção por
+// comprovante SEM alegação de pagamento no registro. A Fase A marca hold_receipt_review quando QUALQUER auditoria de comprovante
+// do lead está sem identificação, sem vínculo com o compromisso: só com alegação de pagamento há evidência correspondente.
+function receiptOnlySignal(r: ManualChargeDispatchRow) {
+  return r.status === 'hold_receipt_review' && r.is_payment_claimed !== true;
+}
+
 function isInReview(r: ManualChargeDispatchRow) {
-  return r.status === 'eligible' && r.review_reason !== null;
+  return r.review_reason !== null && (r.status === 'eligible' || receiptOnlySignal(r));
 }
 
 function promiseInfo(r: ManualChargeDispatchRow): { main: string; sub?: string } {
@@ -154,7 +160,7 @@ export function ManualChargeTable({
             <SelectContent>
               <SelectItem value="all">Todas as situações</SelectItem>
               <SelectItem value="review">Em revisão</SelectItem>
-              <SelectItem value="hold_receipt_review">Comprovante em análise</SelectItem>
+              <SelectItem value="receipt">Comprovante em análise</SelectItem>
               <SelectItem value="hold_human">Atendimento humano</SelectItem>
               <SelectItem value="hold_suppression_review">Recusa em revisão</SelectItem>
               <SelectItem value="needs_review_payment_claim">Pagamento em verificação</SelectItem>
@@ -224,6 +230,11 @@ export function ManualChargeTable({
                     </TableCell>
                     <TableCell>
                       <Badge variant="outline" className={statusMeta.className}>{statusMeta.label}</Badge>
+                      {receiptOnlySignal(r) && (
+                        <div className="text-xs text-muted-foreground mt-1 max-w-[240px]">
+                          Sinal interno: comprovante pendente em auditoria anterior, sem vínculo com o compromisso
+                        </div>
+                      )}
                       {r.review_reason && (
                         <div className="text-xs text-muted-foreground mt-1 max-w-[240px]">
                           Bloqueio: {REVIEW_LABELS[r.review_reason] ?? r.review_reason}
