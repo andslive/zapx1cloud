@@ -17,6 +17,7 @@ const f = {
   TeamManager: () => import('@/components/admin/TeamManager').then(m => ({ default: m.TeamManager })),
   FinancialDashboard: () => import('@/components/admin/FinancialDashboard').then(m => ({ default: m.FinancialDashboard })),
   CalendarManager: () => import('@/components/admin/CalendarManager').then(m => ({ default: m.CalendarManager })),
+  ManualChargeManager: () => import('@/components/admin/manual-charge/ManualChargeManager').then(m => ({ default: m.ManualChargeManager })),
   IntegrationsManager: () => import('@/components/admin/integrations/IntegrationsManager').then(m => ({ default: m.IntegrationsManager })),
   NotificationManager: () => import('@/components/admin/NotificationManager').then(m => ({ default: m.NotificationManager })),
   ProductListPage: () => import('@/components/admin/products/ProductListPage').then(m => ({ default: m.ProductListPage })),
@@ -47,6 +48,7 @@ const AdminDashboard = lazyWithRetry(f.AdminDashboard);
 const TeamManager = lazyWithRetry(f.TeamManager);
 const FinancialDashboard = lazyWithRetry(f.FinancialDashboard);
 const CalendarManager = lazyWithRetry(f.CalendarManager);
+const ManualChargeManager = lazyWithRetry(f.ManualChargeManager);
 const IntegrationsManager = lazyWithRetry(f.IntegrationsManager);
 const NotificationManager = lazyWithRetry(f.NotificationManager);
 const ProductListPage = lazyWithRetry(f.ProductListPage);
@@ -80,6 +82,7 @@ const sectionFactories: Record<string, () => Promise<unknown>> = {
   leads: f.LeadsManager,
   pipeline: f.KanbanBoard,
   calendar: f.CalendarManager,
+  'manual-charge': f.ManualChargeManager,
   inbox: f.InboxManager,
   agents: f.AgentsManager,
   capture: f.CaptureManager,
@@ -188,6 +191,7 @@ export default function Admin() {
       case 'leads': return <LeadsManager />;
       case 'pipeline': return <KanbanBoard />;
       case 'calendar': return <CalendarManager />;
+      case 'manual-charge': return <ManualChargeManager />;
       case 'inbox': return <InboxManager />;
       case 'agents': return <AgentsManager />;
       case 'capture': return <CaptureManager />;
@@ -220,7 +224,7 @@ export default function Admin() {
     <>
       {Array.from(visitedRef.current).map((sectionId) => {
         const isActive = sectionId === activeSection;
-        const isCRMSection = ['leads', 'pipeline', 'inbox', 'calendar', 'reports', 'financial', 'team', 'products', 'webhooks', 'custom-fields', 'tags', 'schedules'].includes(sectionId);
+        const isCRMSection = ['leads', 'pipeline', 'inbox', 'calendar', 'manual-charge', 'reports', 'financial', 'team', 'products', 'webhooks', 'custom-fields', 'tags', 'schedules'].includes(sectionId);
 
         return (
           <div
