@@ -1,24 +1,29 @@
-import { useMemo } from 'react';
-import { useManualChargeDispatches } from '@/hooks/useManualChargeDispatches';
-import { ManualChargeTable } from './ManualChargeTable';
+import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import {
+  type ManualChargeFilters, useManualChargePage, useManualChargeSummary,
+} from '@/hooks/useManualChargeDispatches';
+import { ManualChargeTable } from './ManualChargeTable';
 import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
 
 // Página "Cobrança" -- reusa o layout Card/Table dos demais painéis do dashboard, sem CSS novo.
 // Nesta entrega é uma tela de REVISÃO: nada aqui envia mensagem, e nenhum registro está liberado.
 export function ManualChargeManager() {
-  const { data, isLoading, isError, error } = useManualChargeDispatches();
   const queryClient = useQueryClient();
-  const rows = useMemo(() => data ?? [], [data]);
+  const [filters, setFilters] = useState<ManualChargeFilters>({ search: '', kind: 'all', status: 'all', page: 1 });
+  const [searchInput, setSearchInput] = useState('');
 
-  const summary = useMemo(() => ({
-    total: rows.length,
-    review: rows.filter((r) => r.status === 'eligible' && r.review_reason !== null).length,
-    voluntary: rows.filter((r) => r.charge_kind === 'voluntary_contribution_reminder').length,
-    debt: rows.filter((r) => r.charge_kind === 'debt_reminder').length,
-    ambiguous: rows.filter((r) => r.scheduling_status === 'blocked_ambiguous_order').length,
-    unblocked: rows.filter((r) => r.review_reason === null).length,
-  }), [rows]);
+  // Busca com atraso: uma consulta por pausa de digitação, não por tecla.
+  useEffect(() => {
+    const t = setTimeout(() => setFilters((f) => (f.search === searchInput ? f : { ...f, search: searchInput, page: 1 })), 350);
+    return () => clearTimeout(t);
+  }, [searchInput]);
+
+  const page = useManualChargePage(filters);
+  const summary = useManualChargeSummary();
+  const s = summary.data;
+  const tile = (value: number | undefined) => (value === undefined ? '—' : value);
 
   return (
     <div className="space-y-4">
@@ -32,22 +37,44 @@ export function ManualChargeManager() {
             </span>
           </p>
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
-            <div><div className="text-2xl font-semibold">{summary.total}</div><div className="text-xs text-muted-foreground">registros</div></div>
-            <div><div className="text-2xl font-semibold">{summary.debt}</div><div className="text-xs text-muted-foreground">dívidas (prováveis)</div></div>
-            <div><div className="text-2xl font-semibold">{summary.voluntary}</div><div className="text-xs text-muted-foreground">contribuições voluntárias</div></div>
-            <div><div className="text-2xl font-semibold">{summary.ambiguous}</div><div className="text-xs text-muted-foreground">com datas divergentes</div></div>
-            <div><div className="text-2xl font-semibold">{summary.unblocked}</div><div className="text-xs text-muted-foreground">liberados para envio</div></div>
+            <div><div className="text-2xl font-semibold">{tile(s?.total)}</div><div className="text-xs text-muted-foreground">registros</div></div>
+            <div><div className="text-2xl font-semibold">{tile(s?.debt)}</div><div className="text-xs text-muted-foreground">dívidas (prováveis)</div></div>
+            <div><div className="text-2xl font-semibold">{tile(s?.voluntary)}</div><div className="text-xs text-muted-foreground">contribuições voluntárias</div></div>
+            <div><div className="text-2xl font-semibold">{tile(s?.ambiguous)}</div><div className="text-xs text-muted-foreground">com datas divergentes</div></div>
+            <div><div className="text-2xl font-semibold">{tile(s?.unblocked)}</div><div className="text-xs text-muted-foreground">liberados para envio</div></div>
           </div>
+          {summary.isError && (
+            <p className="text-xs text-destructive">Totais indisponíveis no momento.</p>
+          )}
         </CardContent>
       </Card>
-      {isError && (
-        <Card><CardContent className="py-4 text-sm text-destructive">Não foi possível carregar a cobrança: {error instanceof Error ? error.message : 'erro desconhecido'}.</CardContent></Card>
+
+      {page.isError && !page.data ? (
+        <Card>
+          <CardContent className="py-6 space-y-3" role="alert">
+            <p className="text-sm font-medium">Dados indisponíveis</p>
+            <p className="text-sm text-muted-foreground">
+              Não foi possível carregar a cobrança agora ({page.error instanceof Error ? page.error.message : 'erro desconhecido'}).
+              Isto não significa que não haja registros.
+            </p>
+            <Button variant="outline" size="sm" onClick={() => { void page.refetch(); void summary.refetch(); }} disabled={page.isFetching}>
+              {page.isFetching ? 'Tentando…' : 'Tentar novamente'}
+            </Button>
+          </CardContent>
+        </Card>
+      ) : (
+        <ManualChargeTable
+          rows={page.data?.rows ?? []}
+          total={page.data?.total ?? 0}
+          isLoading={page.isLoading}
+          isFetching={page.isFetching && !page.isLoading}
+          filters={filters}
+          searchInput={searchInput}
+          onSearchInput={setSearchInput}
+          onFiltersChange={(patch) => setFilters((f) => ({ ...f, ...patch }))}
+          onManualTriggered={() => queryClient.invalidateQueries({ queryKey: ['manual-charge-dispatches-panel'] })}
+        />
       )}
-      <ManualChargeTable
-        rows={rows}
-        isLoading={isLoading}
-        onManualTriggered={() => queryClient.invalidateQueries({ queryKey: ['manual-charge-dispatches-panel'] })}
-      />
     </div>
   );
 }

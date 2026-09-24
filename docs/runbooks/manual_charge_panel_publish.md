@@ -36,6 +36,11 @@ Sem migration, sem Edge Function, sem variável de ambiente nova, sem mudança e
   vendedor, sem organização e anônimo veem 0; filtro cruzado retorna 0; RPC de carga negada (403); PATCH em dispatches negado (42501); nenhum dispatch virou `sent`.
 - Capturas: desktop, celular e organização B (anexadas à revisão).
 
+## Correção de desempenho (24/09, após o 1º preview)
+O preview mostrou `canceling statement due to statement timeout`. Causa demonstrada, correção e medições: `docs/runbooks/manual_charge_panel_performance.md`.
+Resumo: a view calculava `payment_confirmed` com um `EXISTS` em `purchase_audit` (sem índice) por dispatch; o painel agora pede colunas explícitas, pagina e filtra no servidor,
+mostra totais do conjunto filtrado e um estado "Dados indisponíveis + Tentar novamente". Sem migration, sem RLS alterada, sem timeout maior.
+
 ## Pré-condições a confirmar antes de publicar
 1. **Deploy atual da Vercel = `origin/main` @ `68f4c68`?** Não consegui verificar (sem acesso à Vercel). Se estiver em outro commit, a base desta entrega muda.
 2. As migrations e a etapa C já estão em produção (a view `manual_charge_dispatches_panel` existe, com grants para `authenticated`): confirmado pelo administrador.

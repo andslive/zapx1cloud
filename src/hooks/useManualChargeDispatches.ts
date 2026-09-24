@@ -1,11 +1,14 @@
 import { useQuery } from '@tanstack/react-query';
 import { supabase } from '@/integrations/supabase/client';
 
-// manual_charge_dispatches_panel ainda não está nos tipos gerados do
-// Supabase (view nova, migration não aplicada em produção). Tipa a forma
-// real esperada via uma interface declarada + `unknown` no cast do
-// client, nunca `any` (ver ManualChargeTriggerButton.tsx para o mesmo
-// padrão).
+// manual_charge_dispatches_panel / manual_charge_dispatches ainda não estão nos tipos gerados do Supabase.
+// Tipa a forma real esperada via interfaces declaradas + `unknown` no cast do client, nunca `any`.
+//
+// DESEMPENHO (causa do "canceling statement due to statement timeout"): a view calcula `payment_confirmed`
+// com um EXISTS correlacionado em purchase_audit (sem índice em lead_id). Para leads NÃO pagos, cada dispatch
+// varre a tabela inteira. Por isso: (1) colunas EXPLÍCITAS, sem payment_confirmed (coluna não pedida não é
+// calculada); (2) paginação no servidor; (3) totais por contagem no servidor sobre o conjunto filtrado.
+
 export interface ManualChargeDispatchRow {
   dispatch_id: string;
   organization_id: string;
@@ -15,10 +18,6 @@ export interface ManualChargeDispatchRow {
   campaign_key: string;
   charge_kind: 'debt_reminder' | 'voluntary_contribution_reminder';
   status: string;
-  disposition_reason: string | null;
-  claim_token: string | null;
-  claimed_by: string | null;
-  claimed_at: string | null;
   sent_at: string | null;
   agreed_date: string | null;
   planned_send_at: string | null;
@@ -31,37 +30,111 @@ export interface ManualChargeDispatchRow {
   lead_locale_source: string | null;
   lead_preferred_timezone: string | null;
   lead_timezone_source: string | null;
-  lead_timezone_confidence: number | null;
   effective_promised_date: string | null;
-  promised_date_occurred_at_source: string | null;
   promised_date_precision: string | null;
   has_pending_ambiguous_signal: boolean | null;
   is_refused: boolean | null;
   refused_reason: string | null;
   is_payment_claimed: boolean | null;
   payment_claim_status: string | null;
-  payment_confirmed: boolean;
-  attribution_status: string;
   reopen_count: number;
   review_reason: string | null;
   created_at: string;
-  updated_at: string;
 }
 
-type PanelViewClient = {
-  from: (table: 'manual_charge_dispatches_panel') => {
-    select: (columns: '*') => Promise<{ data: ManualChargeDispatchRow[] | null; error: { message: string } | null }>;
-  };
-};
+const PANEL_COLUMNS = [
+  'dispatch_id', 'organization_id', 'lead_id', 'lead_name', 'phone_normalized', 'campaign_key', 'charge_kind', 'status',
+  'sent_at', 'agreed_date', 'planned_send_at', 'scheduling_status', 'connection_id', 'connection_name', 'connection_status',
+  'connection_provider', 'lead_preferred_locale', 'lead_locale_source', 'lead_preferred_timezone', 'lead_timezone_source',
+  'effective_promised_date', 'promised_date_precision', 'has_pending_ambiguous_signal', 'is_refused', 'refused_reason',
+  'is_payment_claimed', 'payment_claim_status', 'reopen_count', 'review_reason', 'created_at',
+].join(',');
 
-export function useManualChargeDispatches() {
+export const MANUAL_CHARGE_PAGE_SIZE = 20;
+
+export interface ManualChargeFilters {
+  search: string;
+  kind: 'all' | 'debt_reminder' | 'voluntary_contribution_reminder';
+  /** 'all' | 'review' (status interno eligible COM motivo de bloqueio) | status exato */
+  status: string;
+  page: number;
+}
+
+interface QueryResult<T> { data: T | null; error: { message: string } | null; count: number | null }
+interface Builder<T> extends PromiseLike<QueryResult<T>> {
+  eq(column: string, value: string): Builder<T>;
+  is(column: string, value: null): Builder<T>;
+  not(column: string, operator: string, value: null): Builder<T>;
+  or(filters: string): Builder<T>;
+  order(column: string, opts: { ascending: boolean }): Builder<T>;
+  range(from: number, to: number): Builder<T>;
+}
+interface TableClient {
+  from(table: 'manual_charge_dispatches_panel' | 'manual_charge_dispatches'): {
+    select<T>(columns: string, opts?: { count: 'exact'; head?: boolean }): Builder<T>;
+  };
+}
+
+// Termo de busca: remove os caracteres que têm significado na sintaxe de filtros do PostgREST.
+export function sanitizeSearch(term: string): string {
+  return term.replace(/[,()*%\\"']/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+}
+
+export interface ManualChargePage { rows: ManualChargeDispatchRow[]; total: number }
+
+export function useManualChargePage(filters: ManualChargeFilters) {
   return useQuery({
-    queryKey: ['manual-charge-dispatches-panel'],
-    queryFn: async () => {
-      const client = supabase as unknown as PanelViewClient;
-      const { data, error } = await client.from('manual_charge_dispatches_panel').select('*');
+    queryKey: ['manual-charge-dispatches-panel', 'page', filters],
+    placeholderData: (prev) => prev,
+    queryFn: async (): Promise<ManualChargePage> => {
+      const client = supabase as unknown as TableClient;
+      let q = client.from('manual_charge_dispatches_panel').select<ManualChargeDispatchRow[]>(PANEL_COLUMNS, { count: 'exact' });
+      if (filters.kind !== 'all') q = q.eq('charge_kind', filters.kind);
+      if (filters.status === 'review') q = q.eq('status', 'eligible').not('review_reason', 'is', null);
+      else if (filters.status !== 'all') q = q.eq('status', filters.status);
+      const term = sanitizeSearch(filters.search);
+      if (term) q = q.or(`lead_name.ilike.*${term}*,phone_normalized.ilike.*${term}*,campaign_key.ilike.*${term}*`);
+      const from = (filters.page - 1) * MANUAL_CHARGE_PAGE_SIZE;
+      const { data, error, count } = await q
+        .order('created_at', { ascending: false })
+        .order('dispatch_id', { ascending: true })
+        .range(from, from + MANUAL_CHARGE_PAGE_SIZE - 1);
       if (error) throw new Error(error.message);
-      return data ?? [];
+      return { rows: data ?? [], total: count ?? 0 };
+    },
+  });
+}
+
+export interface ManualChargeSummary {
+  total: number;
+  debt: number;
+  voluntary: number;
+  ambiguous: number;
+  unblocked: number;
+}
+
+// Totais da organização (não dependem dos filtros da tabela). total/tipo/ambíguo vêm da tabela base (barato);
+// "liberados" precisa do motivo de revisão, calculado pela view só para o filtro pedido.
+export function useManualChargeSummary() {
+  return useQuery({
+    queryKey: ['manual-charge-dispatches-panel', 'summary'],
+    queryFn: async (): Promise<ManualChargeSummary> => {
+      const client = supabase as unknown as TableClient;
+      const head = { count: 'exact' as const, head: true };
+      const n = async (b: Builder<unknown>) => {
+        const { error, count } = await b;
+        if (error) throw new Error(error.message);
+        return count ?? 0;
+      };
+      const base = () => client.from('manual_charge_dispatches').select<unknown>('id', head);
+      const [total, debt, voluntary, ambiguous, unblocked] = await Promise.all([
+        n(base()),
+        n(base().eq('charge_kind', 'debt_reminder')),
+        n(base().eq('charge_kind', 'voluntary_contribution_reminder')),
+        n(base().eq('scheduling_status', 'blocked_ambiguous_order')),
+        n(client.from('manual_charge_dispatches_panel').select<unknown>('dispatch_id', head).is('review_reason', null)),
+      ]);
+      return { total, debt, voluntary, ambiguous, unblocked };
     },
   });
 }

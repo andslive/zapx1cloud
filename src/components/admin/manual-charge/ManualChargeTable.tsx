@@ -1,4 +1,3 @@
-import { useMemo, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -11,7 +10,7 @@ import {
 import { Search } from 'lucide-react';
 import { format } from 'date-fns';
 import { ptBR } from 'date-fns/locale';
-import type { ManualChargeDispatchRow } from '@/hooks/useManualChargeDispatches';
+import { MANUAL_CHARGE_PAGE_SIZE, type ManualChargeDispatchRow, type ManualChargeFilters } from '@/hooks/useManualChargeDispatches';
 import { ManualChargeTriggerButton } from './ManualChargeTriggerButton';
 
 // Nesta entrega o disparo manual NÃO está liberado para ninguém, mesmo que a linha, no futuro, deixe de estar em revisão.
@@ -113,47 +112,36 @@ function promiseInfo(r: ManualChargeDispatchRow): { main: string; sub?: string }
 
 interface Props {
   rows: ManualChargeDispatchRow[];
+  /** Total do conjunto FILTRADO (contagem no servidor), não o tamanho da página. */
+  total: number;
   isLoading?: boolean;
+  isFetching?: boolean;
+  filters: ManualChargeFilters;
+  searchInput: string;
+  onSearchInput: (value: string) => void;
+  onFiltersChange: (patch: Partial<ManualChargeFilters>) => void;
   onManualTriggered?: () => void;
 }
 
-const PAGE_SIZE = 20;
-
-export function ManualChargeTable({ rows, isLoading, onManualTriggered }: Props) {
-  const [search, setSearch] = useState('');
-  const [status, setStatus] = useState('all');
-  const [kind, setKind] = useState('all');
-  const [page, setPage] = useState(1);
-
-  const filtered = useMemo(() => {
-    return rows.filter((r) => {
-      if (status === 'review' ? !isInReview(r) : status !== 'all' && r.status !== status) return false;
-      if (kind !== 'all' && r.charge_kind !== kind) return false;
-      if (search) {
-        const s = search.toLowerCase();
-        const haystack = `${r.lead_name ?? ''} ${r.phone_normalized ?? ''} ${r.campaign_key}`.toLowerCase();
-        if (!haystack.includes(s)) return false;
-      }
-      return true;
-    });
-  }, [rows, search, status, kind]);
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const paged = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+export function ManualChargeTable({
+  rows, total, isLoading, isFetching, filters, searchInput, onSearchInput, onFiltersChange, onManualTriggered,
+}: Props) {
+  const totalPages = Math.max(1, Math.ceil(total / MANUAL_CHARGE_PAGE_SIZE));
+  const hasFilters = filters.kind !== 'all' || filters.status !== 'all' || searchInput.trim() !== '';
 
   return (
     <Card>
       <CardHeader>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle className="text-base">Cobrança</CardTitle>
-          <span className="text-xs text-muted-foreground">{filtered.length} de {rows.length} registros</span>
+          <span className="text-xs text-muted-foreground">{isFetching ? 'Atualizando… ' : ''}{total} {hasFilters ? 'registros no filtro' : 'registros'}</span>
         </div>
         <div className="flex flex-wrap gap-2 pt-2">
           <div className="relative flex-1 min-w-[200px]">
             <Search className="h-4 w-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-            <Input value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} placeholder="Buscar lead, telefone, campanha…" className="pl-9" />
+            <Input value={searchInput} onChange={(e) => onSearchInput(e.target.value)} placeholder="Buscar lead, telefone, campanha…" className="pl-9" />
           </div>
-          <Select value={kind} onValueChange={(v) => { setKind(v); setPage(1); }}>
+          <Select value={filters.kind} onValueChange={(v) => onFiltersChange({ kind: v as ManualChargeFilters['kind'], page: 1 })}>
             <SelectTrigger className="w-[220px]"><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">Todos os tipos</SelectItem>
@@ -161,7 +149,7 @@ export function ManualChargeTable({ rows, isLoading, onManualTriggered }: Props)
               <SelectItem value="voluntary_contribution_reminder">Contribuição voluntária</SelectItem>
             </SelectContent>
           </Select>
-          <Select value={status} onValueChange={(v) => { setStatus(v); setPage(1); }}>
+          <Select value={filters.status} onValueChange={(v) => onFiltersChange({ status: v, page: 1 })}>
             <SelectTrigger className="w-[220px]"><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">Todas as situações</SelectItem>
@@ -195,14 +183,16 @@ export function ManualChargeTable({ rows, isLoading, onManualTriggered }: Props)
               {isLoading && (
                 <TableRow><TableCell colSpan={8} className="text-center text-muted-foreground py-6">Carregando…</TableCell></TableRow>
               )}
-              {!isLoading && paged.length === 0 && (
+              {!isLoading && rows.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={8} className="text-center text-muted-foreground py-6">
-                    Nenhuma cobrança encontrada. Esta área é visível apenas para administradores e gerentes da organização.
+                    {hasFilters
+                      ? 'Nenhum registro para os filtros selecionados.'
+                      : 'Nenhuma cobrança encontrada. Esta área é visível apenas para administradores e gerentes da organização.'}
                   </TableCell>
                 </TableRow>
               )}
-              {paged.map((r) => {
+              {rows.map((r) => {
                 const inReview = isInReview(r);
                 const statusMeta = inReview
                   ? IN_REVIEW
@@ -268,9 +258,7 @@ export function ManualChargeTable({ rows, isLoading, onManualTriggered }: Props)
                       </div>
                     </TableCell>
                     <TableCell>
-                      {r.payment_confirmed ? (
-                        <Badge variant="outline" className="bg-emerald-500/10 text-emerald-600 border-emerald-500/20">Confirmado</Badge>
-                      ) : r.is_payment_claimed ? (
+                      {r.is_payment_claimed ? (
                         <Badge variant="outline" className="bg-amber-500/10 text-amber-600 border-amber-500/20">Alegado ({PAYMENT_CLAIM_LABELS[r.payment_claim_status ?? ''] ?? 'em conferência'})</Badge>
                       ) : (
                         <span className="text-xs text-muted-foreground">—</span>
@@ -299,21 +287,17 @@ export function ManualChargeTable({ rows, isLoading, onManualTriggered }: Props)
             <PaginationContent>
               <PaginationItem>
                 <PaginationPrevious
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
-                  className={page === 1 ? 'pointer-events-none opacity-50' : 'cursor-pointer'}
+                  onClick={() => onFiltersChange({ page: Math.max(1, filters.page - 1) })}
+                  className={filters.page === 1 ? 'pointer-events-none opacity-50' : 'cursor-pointer'}
                 />
               </PaginationItem>
-              {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => (
-                <PaginationItem key={p}>
-                  <PaginationLink isActive={p === page} onClick={() => setPage(p)} className="cursor-pointer">
-                    {p}
-                  </PaginationLink>
-                </PaginationItem>
-              ))}
+              <PaginationItem>
+                <PaginationLink isActive className="w-auto px-3">Página {filters.page} de {totalPages}</PaginationLink>
+              </PaginationItem>
               <PaginationItem>
                 <PaginationNext
-                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                  className={page === totalPages ? 'pointer-events-none opacity-50' : 'cursor-pointer'}
+                  onClick={() => onFiltersChange({ page: Math.min(totalPages, filters.page + 1) })}
+                  className={filters.page === totalPages ? 'pointer-events-none opacity-50' : 'cursor-pointer'}
                 />
               </PaginationItem>
             </PaginationContent>
