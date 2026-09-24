@@ -25,6 +25,7 @@ import {
   SlidersHorizontal,
   Briefcase,
   Banknote,
+  ReceiptText,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
@@ -51,6 +52,7 @@ export const fixedItems: AdminMenuItem[] = [
   { id: 'pipeline', label: 'Pipeline', icon: LayoutGrid },
   { id: 'leads', label: 'Leads', icon: Target },
   { id: 'calendar', label: 'Agenda', icon: CalendarDays },
+  { id: 'manual-charge', label: 'Cobrança', icon: ReceiptText },
   { id: 'connections', label: 'Conexões', icon: Plug, plusAction: 'new' },
   { id: 'integrations', label: 'Integrações', icon: Settings },
 ];
