@@ -12,6 +12,7 @@ export type WhatsAppErrorCode =
   | "FEATURE_DISABLED" // feature flag da Meta Cloud API desligada (global ou por organização)
   | "ORG_MISMATCH" // connection_id não pertence à organization_id informada — nunca revela a organização real
   | "CONNECTION_NOT_FOUND"
+  | "CONNECTION_ARCHIVED" // FASE 20I — conexão com `archived_at IS NOT NULL`: retirada da operação, nunca resolve para envio/dispatch
   | "MISSING_CREDENTIALS"
   | "TEMPLATE_NOT_SUPPORTED" // ex.: UazAPI não tem conceito de template aprovado pela Meta
   | "OUTSIDE_WINDOW_NO_TEMPLATE" // Cloud API: fora da janela de 24h e nenhum template foi passado
