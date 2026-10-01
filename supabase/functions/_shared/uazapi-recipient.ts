@@ -53,3 +53,64 @@ export function resolveUazapiRecipient(
 export function resolveWebhookSendTarget(remoteJid: unknown, phone: string): string {
   return isLidJid(remoteJid) ? (remoteJid as string).trim() : phone;
 }
+
+// ---------------------------------------------------------------------------
+// Evidência do LID para caminhos que NÃO têm o evento do provedor à mão
+// (retomada por cron/timeout/manual): o destino é reconstruído do que foi
+// GUARDADO. O identificador guardado de um contato só-LID são os dígitos do LID
+// — indistinguíveis de um telefone. A única prova de que são um LID é o
+// `chatid` `<lid>@lid` que o provedor entregou no inbound, que registramos em
+// `webchat_conversations.metadata.wa_lid` (convenção já usada pelo webhook).
+//
+// Regra: só se reconstrói `<lid>@lid` quando metadata.wa_lid EXISTE e é IGUAL ao
+// identificador guardado. Nunca por comprimento, formato ou semelhança.
+// ---------------------------------------------------------------------------
+
+/** Destino para reconstruir a partir do que está guardado (retomada). */
+export function resolveStoredRemoteJid(storedIdentifier: unknown, metadata: unknown): string {
+  const stored = typeof storedIdentifier === "string" ? storedIdentifier : String(storedIdentifier ?? "");
+  const wa = metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>).wa_lid : undefined;
+  if (typeof wa === "string" && /^\d{5,}$/.test(wa) && wa === stored) return `${wa}@lid`;
+  return stored;
+}
+
+// Cliente mínimo (compatível com supabase-js) para permitir fake nos testes.
+interface MetadataClient {
+  from(table: string): {
+    select(cols: string): { eq(col: string, val: string): { maybeSingle(): PromiseLike<{ data: { metadata?: unknown } | null; error: unknown }> } };
+    update(values: Record<string, unknown>): { eq(col: string, val: string): PromiseLike<{ error: unknown }> };
+  };
+}
+
+export type LidEvidenceResult = "persisted" | "already" | "skipped" | "error";
+
+/**
+ * Registra em metadata.wa_lid o LID que o provedor entregou, SOMENTE se:
+ *  - o remoteJid do evento é `<lid>@lid` (o provedor identificou o contato só por LID), e
+ *  - os dígitos desse LID são exatamente o identificador guardado na conversa.
+ * Melhor esforço: nunca lança e nunca altera o fluxo do webhook.
+ */
+export async function persistLidEvidence(
+  // deno-lint-ignore no-explicit-any
+  supabase: MetadataClient | any, // `any`: o cliente real do supabase-js estoura a inferência de tipos (TS2589)
+  conversationId: string | null | undefined,
+  remoteJid: unknown,
+  storedIdentifier: unknown,
+  log: (...a: unknown[]) => void = console.warn,
+): Promise<LidEvidenceResult> {
+  try {
+    if (!conversationId || !isLidJid(remoteJid)) return "skipped";
+    const lid = (remoteJid as string).trim().split("@")[0].split(":")[0];
+    if (lid !== String(storedIdentifier ?? "")) return "skipped"; // evidência não corresponde ao identificador guardado
+    const { data, error } = await supabase.from("webchat_conversations").select("metadata").eq("id", conversationId).maybeSingle();
+    if (error) return "error";
+    const meta = (data?.metadata && typeof data.metadata === "object" ? data.metadata : {}) as Record<string, unknown>;
+    if (meta.wa_lid === lid) return "already";
+    const { error: upErr } = await supabase.from("webchat_conversations").update({ metadata: { ...meta, wa_lid: lid } }).eq("id", conversationId);
+    if (upErr) return "error";
+    return "persisted";
+  } catch (_e) {
+    try { log("[uazapi-webhook] persistLidEvidence failed (non-fatal)"); } catch (_e2) { /* ok */ }
+    return "error";
+  }
+}

@@ -1,7 +1,7 @@
 // deno test --allow-import uazapi-recipient.test.ts
 // Funções puras. Identificadores SINTÉTICOS, no formato real observado
 // (`<15 dígitos>@lid` com sender_pn vazio).
-import { isLidJid, resolveUazapiRecipient, resolveWebhookSendTarget } from "./uazapi-recipient.ts";
+import { isLidJid, persistLidEvidence, resolveStoredRemoteJid, resolveUazapiRecipient, resolveWebhookSendTarget } from "./uazapi-recipient.ts";
 import { normalizePhoneBR } from "./phone.ts";
 import { assert, assertEquals, assertFalse } from "https://deno.land/std@0.208.0/assert/mod.ts";
 
@@ -65,4 +65,75 @@ Deno.test("resolveWebhookSendTarget: LID => o próprio @lid; telefone resolvido 
   assertEquals(resolveWebhookSendTarget("5511999999999@s.whatsapp.net", "5511999999999"), "5511999999999");
   assertEquals(resolveWebhookSendTarget("", "5511999999999"), "5511999999999");
   assertEquals(resolveWebhookSendTarget(undefined, "5511999999999"), "5511999999999");
+});
+
+// ---------------- evidência do LID (retomada por cron/timeout) ----------------
+
+Deno.test("resolveStoredRemoteJid: só reconstrói @lid com evidência IGUAL ao identificador guardado", () => {
+  assertEquals(resolveStoredRemoteJid("900000000000001", { wa_lid: "900000000000001" }), "900000000000001@lid");
+});
+
+Deno.test("resolveStoredRemoteJid: SEM evidência não infere @lid — nem por comprimento nem por formato", () => {
+  for (const stored of ["900000000000001", "90000000000002", "123456789012345678", "5511999990001"]) {
+    for (const meta of [undefined, null, {}, { outro: "x" }, "texto", 7, []]) {
+      assertEquals(resolveStoredRemoteJid(stored, meta), stored, `inferiu @lid para ${stored} / ${JSON.stringify(meta)}`);
+    }
+  }
+});
+
+Deno.test("resolveStoredRemoteJid: evidência de OUTRO identificador, ou malformada, é ignorada", () => {
+  assertEquals(resolveStoredRemoteJid("5511999990001", { wa_lid: "900000000000001" }), "5511999990001"); // telefone com alias LID
+  assertEquals(resolveStoredRemoteJid("900000000000001", { wa_lid: "900000000000002" }), "900000000000001");
+  assertEquals(resolveStoredRemoteJid("900000000000001", { wa_lid: "900000000000001@lid" }), "900000000000001"); // formato inesperado
+  assertEquals(resolveStoredRemoteJid("900000000000001", { wa_lid: 900000000000001 }), "900000000000001");
+  assertEquals(resolveStoredRemoteJid("900", { wa_lid: "900" }), "900"); // curto demais para ser LID
+});
+
+// cliente falso do metadata de conversas
+function metaClient(rows: Record<string, { metadata: unknown }>, opts: { selErr?: boolean; upErr?: boolean; throws?: boolean } = {}) {
+  const calls: { update?: Record<string, unknown>; id?: string }[] = [];
+  return {
+    calls,
+    from(_t: string) {
+      if (opts.throws) throw new Error("db down");
+      return {
+        select(_c: string) {
+          return { eq(_col: string, id: string) { return { maybeSingle() { return Promise.resolve(opts.selErr ? { data: null, error: { m: "x" } } : { data: rows[id] ?? null, error: null }); } }; } };
+        },
+        update(values: Record<string, unknown>) {
+          return { eq(_col: string, id: string) { calls.push({ update: values, id }); if (!opts.upErr) rows[id] = { metadata: values.metadata }; return Promise.resolve({ error: opts.upErr ? { m: "x" } : null }); } };
+        },
+      };
+    },
+  };
+}
+
+Deno.test("persistLidEvidence: grava wa_lid preservando o metadata existente; repetição é idempotente", async () => {
+  const rows: Record<string, { metadata: unknown }> = { c1: { metadata: { outro: "mantido" } } };
+  const c = metaClient(rows);
+  assertEquals(await persistLidEvidence(c, "c1", LID15, "900000000000001"), "persisted");
+  assertEquals(rows.c1.metadata, { outro: "mantido", wa_lid: "900000000000001" });
+  assertEquals(await persistLidEvidence(c, "c1", LID15, "900000000000001"), "already");
+  assertEquals(c.calls.length, 1); // não regravou
+});
+
+Deno.test("persistLidEvidence: só grava quando o evento é @lid E os dígitos são o identificador guardado", async () => {
+  for (const [jid, stored] of [
+    ["5511999990001@s.whatsapp.net", "5511999990001"], // evento de telefone
+    [LID15, "5511999990001"], // LID do evento != identificador guardado (conversa de telefone)
+    [LID15, "900000000000002"],
+    ["", "900000000000001"],
+    [undefined, "900000000000001"],
+  ] as const) {
+    const c = metaClient({ c1: { metadata: {} } });
+    assertEquals(await persistLidEvidence(c, "c1", jid, stored), "skipped");
+    assertEquals(c.calls.length, 0);
+  }
+  assertEquals(await persistLidEvidence(metaClient({}), null, LID15, "900000000000001"), "skipped");
+});
+
+Deno.test("persistLidEvidence: erros do banco e exceções nunca lançam", async () => {
+  assertEquals(await persistLidEvidence(metaClient({ c1: { metadata: {} } }, { selErr: true }), "c1", LID15, "900000000000001"), "error");
+  assertEquals(await persistLidEvidence(metaClient({ c1: { metadata: {} } }, { upErr: true }), "c1", LID15, "900000000000001"), "error");
+  assertEquals(await persistLidEvidence(metaClient({}, { throws: true }), "c1", LID15, "900000000000001", () => {}), "error");
 });
