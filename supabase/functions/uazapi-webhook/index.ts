@@ -6,6 +6,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { encodeBase64 } from "https://deno.land/std@0.207.0/encoding/base64.ts";
 import { normalizePhoneBR, phoneVariantsBR } from "../_shared/phone.ts";
+import { resolveWebhookSendTarget } from "../_shared/uazapi-recipient.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { waitKeyOf } from "../_shared/funnel-resume.ts";
 import { claimWait, releaseTimeoutWithoutPath } from "../_shared/wait-claim.ts";
@@ -4489,6 +4490,10 @@ Deno.serve(async (req) => {
       }
 
       const phone = remotePhone;
+      // Destino de ENVIO: contato identificado só por LID (sem telefone do
+      // provedor) é roteado pelo próprio `<lid>@lid`; o `phone` acima (parte
+      // numérica do LID) NUNCA deve ser usado como número de telefone.
+      const sendTo = resolveWebhookSendTarget(remoteJid, phone);
       const phoneCandidates = remotePhoneCandidates;
       const phoneCanonical = remotePhoneCanonical;
       if (!phone) {
@@ -10959,7 +10964,7 @@ FORMATO JSON:
                 organization_id: instance.organization_id,
                 instance_id: instance.id,
                 type: chunk.type,
-                to: phone,
+                to: sendTo,
                 payload: {
                   ...chunk.payload,
                   quotedMsgId: chunk.reply_to_message
@@ -11629,7 +11634,7 @@ FORMATO JSON:
                     organization_id: instance.organization_id,
                     instance_id: instance.id,
                     type: "text",
-                    to: phone,
+                    to: sendTo,
                     payload: { text },
                   });
                   const sendBody = await sendRes.text();

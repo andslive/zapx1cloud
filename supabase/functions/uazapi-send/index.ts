@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneBR } from "../_shared/phone.ts";
+import { resolveUazapiRecipient } from "../_shared/uazapi-recipient.ts";
 import { dispatchMetaCloudSend, type MetaCloudSendType } from "../_shared/meta-cloud-dispatch.ts";
 
 const corsHeaders = {
@@ -85,7 +86,7 @@ async function uazFetch(url: string, token: string, path: string, body: any, met
 
 
 async function humanLikeSendPipeline(supabase: any, url: string, token: string, jid: string, instance: any) {
-    const phone = jid.split('@')[0];
+    const phone = jid.endsWith('@lid') ? jid : jid.split('@')[0];
     console.log(`[uazapi-send] [PIPELINE] starting for ${jid} on instance ${instance.name}`);
     
     const statusRes = await fetch(`${url}/instance/status`, { headers: { "token": token } });
@@ -279,9 +280,11 @@ export async function handleUazapiSendRequest(req: Request): Promise<Response> {
       }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    const rawPhone = to.replace(/\D/g, "");
-    const phone = normalizePhoneBR(rawPhone) || rawPhone;
-    const jid = to.includes("@") ? to : `${phone}@s.whatsapp.net`;
+    // Destino: `<lid>@lid` é mantido como @lid (nunca vira telefone); qualquer
+    // outro formato segue a lógica anterior (ver _shared/uazapi-recipient.ts).
+    const recipient = resolveUazapiRecipient(to, normalizePhoneBR);
+    const phone = recipient.number;
+    const jid = recipient.jid;
 
     if (!payload.skip_warmup && type !== "presence" && type !== "markRead") {
         try { await humanLikeSendPipeline(supabase, url, apiKey, jid, instance); } catch (e) { console.error(`[uazapi-send] Pipeline failed: ${e.message}`); }
