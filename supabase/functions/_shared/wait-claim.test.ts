@@ -1,6 +1,6 @@
 // deno test --allow-import wait-claim.test.ts
 // Reivindicação atômica da espera, com interleaving FORÇADO (determinístico).
-import { CLAIM_TTL_MS, claimWait, releaseTimeoutWithoutPath } from "./wait-claim.ts";
+import { CLAIM_TTL_MS, claimLossIsFinal, claimWait, releaseTimeoutWithoutPath } from "./wait-claim.ts";
 import { waitKeyOf } from "./funnel-resume.ts";
 import { assert, assertEquals, assertFalse } from "https://deno.land/std@0.208.0/assert/mod.ts";
 
@@ -145,4 +145,14 @@ Deno.test("claimWait: 'extra' é gravado na MESMA escrita atômica, e só se a r
   row2.flow_variables.__waiting_input.claimed_at = new Date(NOW - 1000).toISOString();
   assertEquals((await claimWait(client(row2), { conversationId: "c1", expectedBlockId: "b2", by: "timeout", nowMs: NOW, extra })).won, false);
   assertEquals(row2.last_message_at, "2026-10-01T08:00:00Z");
+});
+
+Deno.test("claimLossIsFinal: timeout recua em qualquer perda; a RESPOSTA do lead só recua com prova (já reivindicada/espera mudou), nunca por erro de infraestrutura", () => {
+  const reasons = ["stale", "already_claimed", "conflict", "error", "not_found"] as const;
+  for (const reason of reasons) assertEquals(claimLossIsFinal("timeout", { won: false, reason }), true, `timeout/${reason}`);
+  assertEquals(claimLossIsFinal("answer", { won: false, reason: "already_claimed" }), true);
+  assertEquals(claimLossIsFinal("answer", { won: false, reason: "stale" }), true);
+  for (const reason of ["conflict", "error", "not_found"] as const) assertEquals(claimLossIsFinal("answer", { won: false, reason }), false, `answer/${reason}`);
+  assertEquals(claimLossIsFinal("answer", { won: true }), false);
+  assertEquals(claimLossIsFinal("timeout", { won: true }), false);
 });
