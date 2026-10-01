@@ -7,6 +7,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { encodeBase64 } from "https://deno.land/std@0.207.0/encoding/base64.ts";
 import { normalizePhoneBR, phoneVariantsBR } from "../_shared/phone.ts";
 import { startTyping } from "../_shared/presence.ts";
+import { waitKeyOf } from "../_shared/funnel-resume.ts";
+import { claimWait, releaseTimeoutWithoutPath } from "../_shared/wait-claim.ts";
 import { resolveAIProvider } from "../_shared/ai-credentials.ts";
 import { isConversationIsolationEnabled } from "../_shared/conversation-isolation-flags.ts";
 import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
@@ -3527,6 +3529,18 @@ Deno.serve(async (req) => {
 
       if (!conv) return new Response("Conv not found", { status: 404 });
 
+      // O cron envia a espera para a qual agendou este timeout. Se a conversa já
+      // seguiu (resposta do lead, outro bloco, outra execução), a chave não bate e
+      // este timeout antigo é descartado SEM tocar em nada. Chamadas sem
+      // `expected_wait` (retomada manual/legada) mantêm o comportamento anterior.
+      const _expectedWaitKey = (payload as any).expected_wait?.wait_key;
+      if (typeof _expectedWaitKey === "string" && waitKeyOf(conv as any) !== _expectedWaitKey) {
+        console.log("[uazapi-webhook] resume_funnel stale_resume (espera mudou desde o agendamento)", conversationId);
+        return new Response(JSON.stringify({ ok: true, skipped: "stale_resume" }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       // FASE 2.1 — mesmo lease compartilhado usado por execute_recovery.
       // Se uma recuperação detém o lease desta conversa agora, este
       // resume (cron ou manual) recua sem tocar em nada — o cron tentará
@@ -5033,7 +5047,8 @@ Deno.serve(async (req) => {
         const updatePayload: any = {
           connection_id: instance.id,
           evolution_instance_id: instance.id,
-          last_message_at: new Date().toISOString(),
+          // a retomada (cron/timeout) é um pseudo-evento: não é atividade do lead
+          ...((payload as any).__is_resume ? {} : { last_message_at: new Date().toISOString() }),
         };
 
 
@@ -7381,6 +7396,28 @@ Mensagem do lead:
                 );
               }
 
+              // Reivindica ATOMICAMENTE a espera antes de avançar (e de qualquer
+              // envio): se um timeout já a reivindicou, esta resposta não avança a
+              // mesma espera uma segunda vez.
+              if (!(payload as any).__recovery_context && waitingInput?.question_sent_at) {
+                const _aclaim = await claimWait(supabase, {
+                  conversationId: conversationId as string,
+                  expectedBlockId: waitingInput?.block_id || (conv as any).current_block_id,
+                  by: "answer",
+                  nowMs: Date.now(),
+                });
+                if (!_aclaim.won) {
+                  if (lockAcquired) {
+                    await releaseConversationLock(supabase, conversationId as string);
+                  }
+                  console.log("[uazapi-webhook] question_answer_claim_lost:", _aclaim.reason);
+                  return new Response(
+                    JSON.stringify({ ok: true, skipped: "wait_already_claimed", reason: _aclaim.reason }),
+                    { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+                  );
+                }
+              }
+
               // Mark as answered and record metadata
               flowVariables["__waiting_input"] = {
                 ...(waitingInput || {}),
@@ -7557,16 +7594,32 @@ Mensagem do lead:
               // EXTRA CHECK: Verify if there are any inbound messages after question_sent_at
               const { data: recentMessages } = await supabase
                 .from("webchat_messages")
-                .select("id, content")
+                .select("id, content, created_at")
                 .eq("conversation_id", conversationId)
                 .eq("direction", "inbound")
                 .gt(
                   "created_at",
                   waitingInput?.question_sent_at || new Date(0).toISOString(),
                 )
+                .order("created_at", { ascending: false })
                 .limit(1);
 
               if (recentMessages && recentMessages.length > 0) {
+                // A mensagem do lead é gravada logo na chegada; a execução que a
+                // consome (agrupamento, classificação) ainda pode estar em andamento.
+                // Limpar a espera agora descartaria a RESPOSTA do lead. Só limpamos
+                // se a mensagem for antiga o bastante para essa execução já ter
+                // terminado; se for recente, o timeout recua sem tocar em nada.
+                const _inboundAgeMs = Date.now() - Date.parse(String((recentMessages[0] as any).created_at ?? ""));
+                if (Number.isFinite(_inboundAgeMs) && _inboundAgeMs < 60_000) {
+                  if (lockAcquired) {
+                    await releaseConversationLock(supabase, conversationId as string);
+                  }
+                  return new Response(
+                    JSON.stringify({ ok: true, skipped: "inbound_in_flight" }),
+                    { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+                  );
+                }
                 console.log(
                   "[uazapi-webhook] timeout_aborted: recent inbound message detected",
                   recentMessages[0].id,
@@ -7628,19 +7681,57 @@ Mensagem do lead:
                     data: currentBlock?.data,
                   },
                 );
-                // If no timeout path, we STOP here to avoid sending "success" content by mistake
+                // Sem caminho de timeout: NADA a executar. Nunca enviar conteúdo de
+                // "sucesso" por engano; também não deixar o timer vencido para sempre
+                // (isso fazia a conversa ser reescolhida a cada ciclo). Libera o timer,
+                // sem enviar nada, sem avançar bloco e sem tocar em last_message_at; a
+                // espera segue aberta para uma resposta futura do lead.
+                const _rel = await releaseTimeoutWithoutPath(supabase, {
+                  conversationId: conversationId as string,
+                  expectedBlockId: (conv as any).current_block_id,
+                  expectedWaitKey: (payload as any).expected_wait?.wait_key ?? null,
+                  nowMs: Date.now(),
+                });
                 if (lockAcquired) {
                   await releaseConversationLock(supabase, conversationId);
                 }
-                return new Response(
-                  JSON.stringify({ ok: true, error: "timeout_no_path" }),
-                  {
-                    headers: {
-                      ...corsHeaders,
-                      "Content-Type": "application/json",
-                    },
-                  },
-                );
+                const _relBody = _rel === "released"
+                  ? { ok: true, skipped: "timeout_no_path_released" }
+                  : _rel === "stale"
+                  ? { ok: true, skipped: "stale_resume" }
+                  : _rel === "already_claimed" || _rel === "conflict"
+                  ? { ok: true, skipped: "wait_already_claimed" }
+                  : { ok: true, error: "timeout_release_failed" };
+                return new Response(JSON.stringify(_relBody), {
+                  headers: { ...corsHeaders, "Content-Type": "application/json" },
+                });
+              }
+
+              // Reivindica ATOMICAMENTE esta espera ANTES de qualquer envio: se a
+              // resposta do lead (ou outra retomada) já a reivindicou, ou se a espera
+              // já mudou, este timeout recua sem enviar nada (nada de avanço duplo).
+              const _tclaim = await claimWait(supabase, {
+                conversationId: conversationId as string,
+                expectedBlockId: (conv as any).current_block_id,
+                expectedWaitKey: (payload as any).expected_wait?.wait_key ?? null,
+                by: "timeout",
+                nowMs: Date.now(),
+                // o timeout vai AVANÇAR (e enviar): a conversa sobe na caixa de entrada como antes
+                extra: { last_message_at: new Date().toISOString() },
+              });
+              if (!_tclaim.won) {
+                if (lockAcquired) {
+                  await releaseConversationLock(supabase, conversationId as string);
+                }
+                console.log("[uazapi-webhook] question_timeout_claim_lost:", _tclaim.reason);
+                const _cb = _tclaim.reason === "stale"
+                  ? { ok: true, skipped: "stale_resume" }
+                  : _tclaim.reason === "already_claimed" || _tclaim.reason === "conflict"
+                  ? { ok: true, skipped: "wait_already_claimed" }
+                  : { ok: true, error: "timeout_claim_failed" };
+                return new Response(JSON.stringify(_cb), {
+                  headers: { ...corsHeaders, "Content-Type": "application/json" },
+                });
               }
 
               // Clear waiting state

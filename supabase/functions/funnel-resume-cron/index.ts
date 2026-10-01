@@ -1,9 +1,27 @@
+// Retomada de funis cujo "Aguarda resposta" venceu (timeout).
+//
+// Seleção, elegibilidade, tentativas e modo de ativação vivem em
+// _shared/funnel-resume.ts (puro, testado com relógio controlado). Este arquivo
+// só liga essa lógica ao banco e ao webhook.
+//
+// MODO SEGURO POR PADRÃO: sem FUNNEL_RESUME_MODE/FUNNEL_RESUME_ALLOWLIST este cron
+// não processa nada. Ver docs no topo de _shared/funnel-resume.ts.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  type CycleDeps,
+  type PageArgs,
+  parseResumeConfig,
+  type ResumeCandidate,
+  runResumeCycle,
+} from "../_shared/funnel-resume.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
+
+const COLUMNS =
+  "id, organization_id, connection_id, evolution_instance_id, bot_locked_until, current_flow_id, current_block_id, flow_variables, metadata, updated_at";
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
@@ -12,98 +30,88 @@ Deno.serve(async (req) => {
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, serviceKey);
+    const cfg = parseResumeConfig((k) => Deno.env.get(k));
 
-    // BALANCED PER-CHIP DRAIN
-    // Pull a wider window of expired locks (oldest first), then cap per chip
-    // (connection_id / evolution_instance_id) so a single chip never receives
-    // a burst of resumes while others stay idle.
-    const FETCH_WINDOW = 60; // oldest candidates to inspect per run
-    const MAX_PER_CHIP = 2;  // cap of resumes per chip per execution
-    const HARD_CAP = 20;     // global safety cap per execution
-    const REQUEST_DELAY_MS = 120;
-
-    const { data: expiredConvs, error: fetchError } = await supabase
-      .from("webchat_conversations")
-      .select("id, organization_id, connection_id, evolution_instance_id, bot_locked_until")
-      .eq("status", "bot_active")
-      .lte("bot_locked_until", new Date().toISOString())
-      .not("current_block_id", "is", null)
-      .order("bot_locked_until", { ascending: true })
-      .limit(FETCH_WINDOW);
-
-    if (fetchError) throw fetchError;
-
-    if (!expiredConvs || expiredConvs.length === 0) {
-      return new Response(JSON.stringify({ processed: 0, backlog_window: 0 }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // Bucket by chip and pick up to MAX_PER_CHIP oldest from each
-    const perChip: Record<string, typeof expiredConvs> = {};
-    for (const c of expiredConvs) {
-      const chip = (c as any).connection_id || (c as any).evolution_instance_id || "__none__";
-      if (!perChip[chip]) perChip[chip] = [] as any;
-      if (perChip[chip].length < MAX_PER_CHIP) perChip[chip].push(c);
-    }
-    const selected: typeof expiredConvs = [];
-    for (const chip of Object.keys(perChip)) {
-      for (const c of perChip[chip]) {
-        if (selected.length >= HARD_CAP) break;
-        selected.push(c);
-      }
-      if (selected.length >= HARD_CAP) break;
-    }
-
-    console.log(
-      `[funnel-resume-cron] window=${expiredConvs.length} chips=${Object.keys(perChip).length} selected=${selected.length}`,
-    );
-    let processed = 0;
-    const perChipProcessed: Record<string, number> = {};
-
-    for (const conv of selected) {
-      try {
-        const chip = (conv as any).connection_id || (conv as any).evolution_instance_id || "__none__";
-        const response = await fetch(`${supabaseUrl}/functions/v1/uazapi-webhook`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${serviceKey}`,
-            "apikey": serviceKey,
-          },
-          body: JSON.stringify({
-            action: "resume_funnel",
-            conversationId: conv.id,
-          }),
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text().catch(() => "Unknown error");
-          console.warn(`[funnel-resume-cron] Failed to resume conv ${conv.id}: ${response.status} ${errorText}`);
-        } else {
-          processed++;
-          perChipProcessed[chip] = (perChipProcessed[chip] || 0) + 1;
+    const deps: CycleDeps = {
+      now: () => Date.now(),
+      fetchPage: async ({ after, limit, minLock, ids }: PageArgs): Promise<ResumeCandidate[]> => {
+        let q = supabase
+          .from("webchat_conversations")
+          .select(COLUMNS)
+          .eq("status", "bot_active")
+          .lte("bot_locked_until", new Date().toISOString())
+          .not("current_block_id", "is", null)
+          .order("bot_locked_until", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(limit);
+        if (ids) q = q.in("id", ids);
+        if (minLock) q = q.gte("bot_locked_until", minLock);
+        if (after) q = q.or(`bot_locked_until.gt.${after.lock},and(bot_locked_until.eq.${after.lock},id.gt.${after.id})`);
+        const { data, error } = await q;
+        if (error) throw error;
+        return (data ?? []) as ResumeCandidate[];
+      },
+      callResume: async (c, expected) => {
+        try {
+          const response = await fetch(`${supabaseUrl}/functions/v1/uazapi-webhook`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${serviceKey}`,
+              "apikey": serviceKey,
+            },
+            body: JSON.stringify({ action: "resume_funnel", conversationId: c.id, expected_wait: expected }),
+          });
+          const body = await response.json().catch(() => null);
+          return { status: response.status, body };
+        } catch (_e) {
+          return { status: null, body: null };
         }
+      },
+      readLatest: async (id) => {
+        const { data } = await supabase.from("webchat_conversations").select("metadata, updated_at").eq("id", id).maybeSingle();
+        return data ? { metadata: data.metadata ?? null, updated_at: data.updated_at ?? null } : null;
+      },
+      writeState: async (id, metadata, expectedUpdatedAt) => {
+        const { data, error } = await supabase
+          .from("webchat_conversations")
+          .update({ metadata })
+          .eq("id", id)
+          .eq("updated_at", expectedUpdatedAt)
+          .select("id");
+        return !error && Array.isArray(data) && data.length > 0;
+      },
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      // diagnóstico estruturado, sem dados pessoais (só ids de conversa e motivos)
+      log: (msg, extra) => console.warn(`[funnel-resume-cron] ${msg}`, JSON.stringify(extra ?? {})),
+    };
 
-        await new Promise(resolve => setTimeout(resolve, REQUEST_DELAY_MS));
-      } catch (err) {
-        console.error(`[funnel-resume-cron] Error resuming conv ${conv.id}:`, err);
-      }
-    }
+    const s = await runResumeCycle(deps, cfg);
+    console.log("[funnel-resume-cron] ciclo", JSON.stringify({ mode: s.mode, scanned: s.scanned, eligible: s.eligible, selected: s.selected, outcomes: s.outcomes, skipped: s.skipped, note: s.note }));
 
+    const attempted = s.outcomes.advanced + s.outcomes.released + s.outcomes.busy + s.outcomes.failed;
     return new Response(
       JSON.stringify({
-        processed,
-        selected: selected.length,
-        backlog_window: expiredConvs.length,
-        chips: Object.keys(perChip).length,
-        per_chip_processed: perChipProcessed,
+        // chaves antigas mantidas para quem monitora a resposta do cron
+        processed: attempted,
+        selected: s.selected,
+        backlog_window: s.scanned,
+        // novas
+        mode: s.mode,
+        dry_run: s.dry_run,
+        scan_truncated: s.scan_truncated,
+        eligible: s.eligible,
+        outcomes: s.outcomes,
+        skipped: s.skipped,
+        failures: s.failures.slice(0, 20),
+        selected_ids: s.selected_ids,
+        note: s.note,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("[funnel-resume-cron] global error:", err);
-    return new Response(JSON.stringify({ error: err.message }), {
+    return new Response(JSON.stringify({ error: (err as Error)?.message ?? String(err) }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
