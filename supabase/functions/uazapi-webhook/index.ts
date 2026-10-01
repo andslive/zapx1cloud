@@ -13,7 +13,7 @@ import {
 } from "../_shared/uazapi-recipient.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { waitKeyOf } from "../_shared/funnel-resume.ts";
-import { claimWait, releaseTimeoutWithoutPath } from "../_shared/wait-claim.ts";
+import { claimLossIsFinal, claimWait, releaseTimeoutWithoutPath } from "../_shared/wait-claim.ts";
 import { resolveAIProvider } from "../_shared/ai-credentials.ts";
 import { isConversationIsolationEnabled } from "../_shared/conversation-isolation-flags.ts";
 import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
@@ -7426,7 +7426,11 @@ Mensagem do lead:
                   by: "answer",
                   nowMs: Date.now(),
                 });
-                if (!_aclaim.won) {
+                if (!_aclaim.won && !claimLossIsFinal("answer", _aclaim)) {
+                  // falha de infraestrutura: NÃO descarta a resposta do lead (comportamento anterior)
+                  console.warn("[uazapi-webhook] question_answer_claim_unavailable (segue sem a proteção):", _aclaim.reason);
+                }
+                if (!_aclaim.won && claimLossIsFinal("answer", _aclaim)) {
                   if (lockAcquired) {
                     await releaseConversationLock(supabase, conversationId as string);
                   }

@@ -114,3 +114,17 @@ export async function releaseTimeoutWithoutPath(
   }
   return "conflict";
 }
+
+/**
+ * A perda da reivindicação é DEFINITIVA (a execução deve recuar)?
+ *  - timeout: sempre. Se falhou por qualquer motivo, o cron tenta de novo no ciclo seguinte.
+ *  - resposta do lead: só quando OUTRA execução comprovadamente já reivindicou a espera
+ *    ("already_claimed") ou a espera mudou ("stale"). Em erro de infraestrutura
+ *    ("error", "not_found", "conflict") a resposta NÃO se repete, então mantém o
+ *    comportamento anterior (segue sem a proteção) em vez de descartar a mensagem do lead.
+ */
+export function claimLossIsFinal(by: ClaimBy, r: ClaimResult): boolean {
+  if (r.won) return false;
+  if (by === "timeout") return true;
+  return r.reason === "already_claimed" || r.reason === "stale";
+}
