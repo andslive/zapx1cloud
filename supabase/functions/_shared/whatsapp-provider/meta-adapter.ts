@@ -32,6 +32,11 @@ import {
   type MetaCloudRequestContext,
 } from "../meta-cloud-client.ts";
 import type { SupabaseLike } from "./resolve.ts";
+import {
+  logMetaCloudConnectionResolved,
+  parseMetaCloudOnboardingSource,
+  UnknownMetaCloudOnboardingSourceError,
+} from "./meta-onboarding-source.ts";
 
 export interface MetaCloudAdapterDeps extends MetaCloudClientDeps {
   accessTokenProvider?: MetaAccessTokenProvider;
@@ -41,6 +46,12 @@ interface MetaCloudInstanceRow {
   phone_number_id: string;
   waba_id: string;
   onboarding_state: string;
+  // FASE 10A — origem do onboarding (não é o transporte, que continua
+  // sendo evolution_instances.provider). Bruto aqui (string | null); ver
+  // parseMetaCloudOnboardingSource() para o valor validado/tipado.
+  // Depende da migration 20260819000000_meta_cloud_onboarding_source.sql —
+  // ver ordem operacional obrigatória em meta-onboarding-source.ts.
+  onboarding_source: string | null;
 }
 
 async function loadMetaCloudConnectionRow(
@@ -49,7 +60,7 @@ async function loadMetaCloudConnectionRow(
 ): Promise<MetaCloudInstanceRow> {
   const { data, error } = await (supabase as any)
     .from("evolution_instances_meta_cloud")
-    .select("phone_number_id, waba_id, onboarding_state")
+    .select("phone_number_id, waba_id, onboarding_state, onboarding_source")
     .eq("evolution_instance_id", conn.connectionId)
     .maybeSingle();
 
@@ -72,7 +83,36 @@ async function loadMetaCloudConnectionRow(
       `Conexão ${conn.connectionId} (Meta Cloud) não está ativa (onboarding_state=${data.onboarding_state})`,
     );
   }
-  return data as MetaCloudInstanceRow;
+
+  const row = data as MetaCloudInstanceRow;
+  let onboardingSource;
+  try {
+    onboardingSource = parseMetaCloudOnboardingSource(row.onboarding_source);
+  } catch (err) {
+    if (err instanceof UnknownMetaCloudOnboardingSourceError) {
+      // Falha fechada: um onboarding_source desconhecido é tratado como
+      // configuração inválida — nunca convertido silenciosamente, nunca
+      // interpretado como um provider (muito menos como fallback UazAPI).
+      throw createWhatsAppProviderError(
+        "PROVIDER_NOT_CONFIGURED",
+        `Conexão ${conn.connectionId} (Meta Cloud) tem onboarding_source inválido: ${err.message}`,
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+
+  // Mesmo MetaAdapter independentemente de onboardingSource ser
+  // 'hookcloud', 'direct_meta' ou null — este valor nunca influencia qual
+  // adapter é usado, só é propagado para o log seguro abaixo.
+  logMetaCloudConnectionResolved({
+    provider: "meta_cloud",
+    onboardingSource,
+    connectionId: conn.connectionId,
+    organizationId: conn.organizationId,
+  });
+
+  return row;
 }
 
 async function buildRequestContext(

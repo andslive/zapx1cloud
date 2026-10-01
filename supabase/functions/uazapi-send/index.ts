@@ -201,9 +201,14 @@ export async function handleUazapiSendRequest(req: Request): Promise<Response> {
 
     let instance: any;
     if (instance_id) {
-      const { data } = await supabase.from("evolution_instances").select("*").eq("id", instance_id).eq("organization_id", organization_id).single();
+      // FASE 20H — este é o chokepoint real de envio do CRM (ver
+      // comentário abaixo); uma conexão arquivada (`archived_at IS NOT
+      // NULL`) nunca pode ser resolvida aqui, mesmo com `instance_id`
+      // explícito — cai no mesmo ramo `INSTANCE_NOT_FOUND` sanitizado
+      // abaixo, nunca envia por ela.
+      const { data } = await supabase.from("evolution_instances").select("*").eq("id", instance_id).eq("organization_id", organization_id).is("archived_at", null).maybeSingle();
       instance = data;
-    } 
+    }
 
     if (!instance) {
       return new Response(JSON.stringify({ 
@@ -345,11 +350,6 @@ export async function handleUazapiSendRequest(req: Request): Promise<Response> {
             instance: instance.name,
             type: payload.ptt !== false ? "ptt" : "audio",
             file: payload.audio || payload.url,
-            // audio/ogg; codecs=opus é o mimetype que o WhatsApp espera para
-            // renderizar como nota de voz gravada (bolha de áudio), não como
-            // arquivo anexado. Sem isso, a UazAPI pode aceitar o envio (200 OK)
-            // sem que o áudio apareça como ptt no cliente.
-            mimetype: payload.mimetype || "audio/ogg; codecs=opus",
             delay: sendDelay,
           });
 
@@ -357,9 +357,11 @@ export async function handleUazapiSendRequest(req: Request): Promise<Response> {
             res = await uazFetch(url, apiKey, "/send/media", {
               number: uazNumber,
               instance: instance.name,
+
+              instance: instance.name,
               type: payload.ptt !== false ? "ptt" : "audio",
               file: payload.audio || payload.url,
-              mimetype: payload.mimetype || "audio/ogg; codecs=opus",
+              mimetype: payload.mimetype || "audio/ogg",
               delay: sendDelay,
             });
           }
