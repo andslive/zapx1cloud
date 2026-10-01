@@ -6,7 +6,11 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { encodeBase64 } from "https://deno.land/std@0.207.0/encoding/base64.ts";
 import { normalizePhoneBR, phoneVariantsBR } from "../_shared/phone.ts";
-import { resolveWebhookSendTarget } from "../_shared/uazapi-recipient.ts";
+import {
+  persistLidEvidence,
+  resolveStoredRemoteJid,
+  resolveWebhookSendTarget,
+} from "../_shared/uazapi-recipient.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { waitKeyOf } from "../_shared/funnel-resume.ts";
 import { claimWait, releaseTimeoutWithoutPath } from "../_shared/wait-claim.ts";
@@ -3523,7 +3527,7 @@ Deno.serve(async (req) => {
       let { data: conv } = await supabase
         .from("webchat_conversations")
         .select(
-          "visitor_phone_normalized, evolution_instance_id, organization_id, visitor_name, current_flow_id, current_block_id, status, flow_source, flow_completed, flow_variables, lead_id",
+          "visitor_phone_normalized, evolution_instance_id, organization_id, visitor_name, current_flow_id, current_block_id, status, flow_source, flow_completed, flow_variables, lead_id, metadata",
         )
         .eq("id", conversationId)
         .single();
@@ -3641,7 +3645,13 @@ Deno.serve(async (req) => {
       (payload as any).__is_resume = true;
       (payload as any).__conv_override = conv;
       (payload as any).instance = (conv as any).evolution_instance_id;
-      (payload as any).remoteJid = (conv as any).visitor_phone_normalized;
+      // Destino da retomada: dígitos guardados, EXCETO quando a conversa tem a
+      // evidência de que o identificador é um LID (metadata.wa_lid == identificador
+      // guardado, gravado a partir do chatid `<lid>@lid` do provedor).
+      (payload as any).remoteJid = resolveStoredRemoteJid(
+        (conv as any).visitor_phone_normalized,
+        (conv as any).metadata,
+      );
     }
 
     norm = normalizePayload(payload);
@@ -6269,6 +6279,11 @@ Deno.serve(async (req) => {
               conversation_id: conversationId,
             }),
           );
+
+          // Evidência do LID (ver _shared/uazapi-recipient.ts): grava o `chatid`
+          // `<lid>@lid` do provedor na conversa, para caminhos que reconstroem o
+          // destino do que está guardado (retomada por cron/timeout). Melhor esforço.
+          await persistLidEvidence(supabase, conversationId, remoteJid, phone);
 
           // Broadcast realtime → o painel (SellerInbox) escuta `conversation:{id}`
           // e adiciona a mensagem na cache instantaneamente. Sem isso, a janela
