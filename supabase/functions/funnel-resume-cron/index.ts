@@ -125,6 +125,8 @@ Deno.serve(async (req) => {
         // novas
         mode: s.mode,
         dry_run: s.dry_run,
+        not_before: cfg.mode === "since" && cfg.notBeforeMs !== null ? new Date(cfg.notBeforeMs).toISOString() : null,
+        allowlist_size: cfg.allowlist.size,
         scan_truncated: s.scan_truncated,
         started: s.started,
         late_ms: s.late_ms,

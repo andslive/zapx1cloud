@@ -6918,6 +6918,9 @@ Deno.serve(async (req) => {
           let releaseToOrchestrator = false;
           let closeConversation = false;
           let pendingDelayMs = 0;
+          // Espera CRIADA NESTA execução (bloco, duração configurada e instante de entrada). Só ela pode ter o
+          // prazo re-ancorado após o envio; esperas pré-existentes (mensagem solta, reentrada) nunca são estendidas.
+          let waitCreatedHere: { blockId: string; timeoutMs: number; entryMs: number } | null = null;
           let advancedByInteraction = false;
           let updatedBotLockedUntil = conv?.bot_locked_until || null;
           let receiptRecognizedThisLoop = false;
@@ -8592,6 +8595,9 @@ Mensagem do lead:
                 const nowTs = Date.now();
                 const lockUntil = new Date(nowTs + ms).toISOString();
                 updatedBotLockedUntil = lockUntil;
+                if (!b.data?.wait_indefinitely && Number.isFinite(ms) && ms > 0) {
+                  waitCreatedHere = { blockId: b.id, timeoutMs: ms, entryMs: nowTs };
+                }
 
                 const success_next_block_id = b.data?.true_next_block_id ||
                   b.data?.success_next_block_id || b.next_block_id || null;
@@ -9232,6 +9238,7 @@ Mensagem do lead:
                     lockUntil = new Date(Date.now() + ms).toISOString();
                     timeoutAtIso = lockUntil;
                     updatedBotLockedUntil = lockUntil;
+                    waitCreatedHere = { blockId: b.id, timeoutMs: ms, entryMs: Date.now() };
                   } else {
                     updatedBotLockedUntil = null; // legado: não trava o bot
                   }
@@ -11114,21 +11121,24 @@ FORMATO JSON:
           ) {
             const _nowMs = Date.now();
             const now = new Date(_nowMs).toISOString();
-            // O prazo (timeout_at / bot_locked_until) foi calculado na ENTRADA do bloco, ANTES do
-            // envio das mensagens deste mesmo passo; com blocos de 5 s de atraso, uma espera de 2 min
-            // chegava a vencer 26-51 s depois de a pergunta ser entregue (e podia vencer ENQUANTO a
-            // rajada ainda era enviada). Re-ancora o prazo no momento da entrega: a espera configurada
-            // passa a contar daqui. Só desloca para frente (nunca encurta) e limita o deslocamento a 30 min.
+            // O prazo (timeout_at / bot_locked_until) foi calculado na ENTRADA do bloco, ANTES do envio das
+            // mensagens deste mesmo passo; uma espera podia vencer antes do tempo configurado depois da
+            // pergunta enviada (ex.: 2 min configurados venciam 26-51 s após o envio). Re-ancora no instante
+            // em que o envio foi ACEITO pela UazAPI (resposta HTTP do uazapi-send; não é entrega confirmada
+            // no WhatsApp): novo prazo = agora + A DURAÇÃO CONFIGURADA NO BLOCO (qualquer unidade/valor).
+            // Não se aplica a: timeout desativado, espera indefinida, esperas que não foram criadas nesta
+            // execução. O limite MAX_SEND_SHIFT_MS NÃO limita a duração da espera: limita só quanto tempo
+            // pode ter passado entre a entrada no bloco e o fim do envio (acima disso algo anormal ocorreu
+            // e o prazo gravado é mantido).
+            const MAX_SEND_SHIFT_MS = 30 * 60_000;
             const _wi = flowVariables["__waiting_input"];
-            const _q0 = Date.parse(String(_wi.question_sent_at ?? ""));
-            const _t0 = Date.parse(String(_wi.timeout_at ?? ""));
             let _reanchoredLock: string | null = null;
-            if (Number.isFinite(_q0) && Number.isFinite(_t0) && _t0 > _q0) {
-              const _shift = _nowMs - _q0;
-              if (_shift > 0 && _shift <= 30 * 60_000) {
-                _reanchoredLock = new Date(_t0 + _shift).toISOString();
+            if (waitCreatedHere && _wi.block_id === waitCreatedHere.blockId && _wi.timeout_at) {
+              const _shift = _nowMs - waitCreatedHere.entryMs;
+              if (_shift > 0 && _shift <= MAX_SEND_SHIFT_MS) {
+                _reanchoredLock = new Date(_nowMs + waitCreatedHere.timeoutMs).toISOString();
                 _wi.timeout_at = _reanchoredLock;
-                console.log("[uazapi-webhook] question_deadline_reanchored:", { shift_ms: _shift, timeout_at: _reanchoredLock });
+                console.log("[uazapi-webhook] question_deadline_reanchored:", { shift_ms: _shift, timeout_ms: waitCreatedHere.timeoutMs, timeout_at: _reanchoredLock });
               }
             }
             flowVariables["__waiting_input"].question_sent_at = now;

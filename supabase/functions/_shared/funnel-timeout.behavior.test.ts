@@ -100,6 +100,8 @@ interface World {
   cron: () => Promise<{ status: number; body: Record<string, unknown> }>;
   db: () => Record<string, Record<string, unknown>[]>;
   conv: (id: string) => Record<string, unknown>;
+  /** edita o banco simulado (ex.: o dono do funil muda a duração de um bloco com leads aguardando) */
+  edit: (fn: (d: Record<string, any[]>) => void) => void;
   close: () => Promise<void>;
 }
 
@@ -154,6 +156,7 @@ async function world(o: { webhook: "base" | "patched"; seed: Record<string, unkn
     cron: () => call(`http://127.0.0.1:${cPort}/`, {}),
     db,
     conv: (cid) => (db().webchat_conversations as Record<string, unknown>[]).find((c) => c.id === cid)!,
+    edit: (fn) => { const d = db(); fn(d); Deno.writeTextFileSync(dbFile, JSON.stringify(d)); },
     close: async () => {
       for (const p of procs) { try { p.kill("SIGTERM"); } catch (_e) { /* ok */ } await p.status; }
       await sink.shutdown();
@@ -545,6 +548,100 @@ t("CHAMADA LENTA no mesmo chip: o cron para de esperar, as outras do chip avanç
     assert(fastAt.every((t_) => t_ < slowAt[0]), "as rápidas do MESMO chip não esperaram pela lenta");
     assertEquals(r.body.call_timeouts, 1);
     assertEquals(r.body.detached_calls, 1);
+  } finally { await w.close(); }
+});
+
+// =====================================================================
+// 5c) Duração CONFIGURADA por bloco: qualquer valor/unidade, desativado, edição com leads aguardando
+// =====================================================================
+const funnelWith = (b2: Record<string, unknown>, type = "wait_response") => ({
+  ...ANCHOR_FUNNEL,
+  flow_blocks: ANCHOR_FUNNEL.flow_blocks.map((b) => b.id === "b2" ? { ...b, type, data: { ...b.data, ...b2 } } : b),
+});
+const wdata = (value: number, unit: string, extra: Record<string, unknown> = {}) =>
+  ({ timeout_enabled: true, timeout_unit: unit, timeout_value: value, wait_indefinitely: false, timeout_next_block_id: "b3", ...extra });
+
+for (const [value, unit, ms] of [[8, "seconds", 8_000], [2, "minutes", 120_000], [90, "minutes", 5_400_000], [3, "hours", 10_800_000], [1, "days", 86_400_000]] as [number, string, number][]) {
+  t(`DURAÇÃO CONFIGURADA ${value} ${unit}: o prazo após o envio é EXATAMENTE a duração do bloco (${ms} ms), sem padrão fixo`, async () => {
+    const phone = `55119999${String(ms).slice(-5).padStart(5, "3")}`;
+    const w = await world({ webhook: "patched", seed: { evolution_instances: instances, capture_funnels: [funnelWith(wdata(value, unit))] } });
+    try {
+      await w.post(inboundNew(phone));
+      const win = await waitWindow(w, phone);
+      assertEquals(win.ta - win.qs, ms); // qs = instante do aceite do envio; ta = qs + duração configurada
+      assertEquals(win.lock, win.ta); // o timer do cron acompanha
+    } finally { await w.close(); }
+  });
+}
+
+t("TIMEOUT DESATIVADO (combinação real do editor: enabled=false + indefinida): nada é agendado para avançar; o cron não toca na conversa", async () => {
+  const phone = "5511999944444";
+  const w = await world({ webhook: "patched", seed: { evolution_instances: instances, capture_funnels: [funnelWith({ timeout_enabled: false, wait_indefinitely: true, timeout_unit: "hours", timeout_value: 3, timeout_next_block_id: null })] }, cronEnv: CRON_ALL });
+  try {
+    await w.post(inboundNew(phone));
+    const win = await waitWindow(w, phone);
+    const days = (win.ta - win.qs) / 86_400_000;
+    assert(days > 364.9 && days <= 365, `prazo "indefinido" = ${days.toFixed(4)} dias (não re-ancorado)`);
+    const n = w.sends.length;
+    const r = await w.cron();
+    await settle(800);
+    assertEquals(w.sends.length, n); // nenhum avanço automático
+    assertEquals((w.db().webchat_conversations as Record<string, any>[]).find((c) => c.visitor_phone === phone)!.current_block_id, "b2");
+    assertEquals(r.body.selected, 0);
+  } finally { await w.close(); }
+});
+
+t("ai_receipt: timeout DESATIVADO não grava prazo nem trava o bot; ATIVADO por 3 h mantém exatamente 3 h (sem os 2 s da correção do matching)", async () => {
+  const off = await world({ webhook: "patched", seed: { evolution_instances: instances, capture_funnels: [funnelWith({ timeout_enabled: false, content: "Envíe el comprobante" }, "ai_receipt")] } });
+  const on = await world({ webhook: "patched", seed: { evolution_instances: instances, capture_funnels: [funnelWith(wdata(3, "hours", { content: "Envíe el comprobante" }), "ai_receipt")] } });
+  try {
+    await off.post(inboundNew("5511999955555"));
+    await on.post(inboundNew("5511999966666"));
+    const read = async (w: World, phone: string) => {
+      for (let i = 0; i < 60; i++) {
+        const c = (w.db().webchat_conversations as Record<string, any>[] | undefined)?.find((x) => x.visitor_phone === phone);
+        if (c?.current_block_id === "b2" && c.flow_variables?.__waiting_input && w.sends.length >= 2) { await settle(900); return (w.db().webchat_conversations as Record<string, any>[]).find((x) => x.visitor_phone === phone)!; }
+        await settle(300);
+      }
+      throw new Error("sem espera ai_receipt");
+    };
+    const a = await read(off, "5511999955555");
+    assertEquals(a.flow_variables.__waiting_input.timeout_at, null);
+    assertEquals(a.bot_locked_until, null);
+    const b = await read(on, "5511999966666");
+    const wi = b.flow_variables.__waiting_input;
+    assertEquals(Date.parse(wi.timeout_at) - Date.parse(wi.question_sent_at), 10_800_000);
+    assertEquals(Date.parse(b.bot_locked_until), Date.parse(wi.timeout_at));
+  } finally { await off.close(); await on.close(); }
+});
+
+t("EDIÇÃO do bloco com leads aguardando: o prazo JÁ GRAVADO é mantido (não recalcula) — alongar não atrasa quem já vai vencer", async () => {
+  const phone = "5511999977777";
+  const w = await world({ webhook: "patched", seed: { evolution_instances: instances, capture_funnels: [funnelWith(wdata(8, "seconds"))] }, cronEnv: CRON_ALL });
+  try {
+    await w.post(inboundNew(phone));
+    const win = await waitWindow(w, phone);
+    w.edit((d) => { d.capture_funnels[0].flow_blocks.find((b: any) => b.id === "b2").data.timeout_value = 3; d.capture_funnels[0].flow_blocks.find((b: any) => b.id === "b2").data.timeout_unit = "hours"; });
+    await settle(Math.max(0, win.ta - Date.now()) + 700);
+    await w.cron(); await settle(1500);
+    assert(texts(w).includes("TIMEOUT"), "venceu no prazo originalmente gravado (8 s), apesar de o bloco agora dizer 3 h");
+  } finally { await w.close(); }
+});
+
+t("EDIÇÃO do bloco: ENCURTAR também não recalcula — quem já aguarda 3 h segue com o prazo gravado", async () => {
+  const phone = "5511999988888";
+  const w = await world({ webhook: "patched", seed: { evolution_instances: instances, capture_funnels: [funnelWith(wdata(3, "hours"))] }, cronEnv: CRON_ALL });
+  try {
+    await w.post(inboundNew(phone));
+    const win = await waitWindow(w, phone);
+    w.edit((d) => { const b = d.capture_funnels[0].flow_blocks.find((x: any) => x.id === "b2"); b.data.timeout_value = 1; b.data.timeout_unit = "seconds"; });
+    await settle(1500);
+    const n = w.sends.length;
+    await w.cron(); await settle(1000);
+    assertEquals(w.sends.length, n); // não avançou
+    const c = (w.db().webchat_conversations as Record<string, any>[]).find((x) => x.visitor_phone === phone)!;
+    assertEquals(c.current_block_id, "b2");
+    assertEquals(Date.parse(c.flow_variables.__waiting_input.timeout_at), win.ta); // prazo gravado intacto
   } finally { await w.close(); }
 });
 
