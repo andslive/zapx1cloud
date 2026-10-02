@@ -53,6 +53,9 @@ const FUNNEL = {
     { id: "b2", type: "wait_response", data: { timeout_enabled: true, timeout_unit: "hours", timeout_value: 3, wait_indefinitely: false, message_buffer_enabled: false, timeout_next_block_id: "b3" }, next_block_id: "b4" },
     { id: "b3", type: "message", data: { content: "TIMEOUT", delay_ms: 0, show_typing: false }, next_block_id: null },
     { id: "b4", type: "message", data: { content: "APOS_RESPOSTA", delay_ms: 0, show_typing: false }, next_block_id: null },
+    // espera cujo timeout leva ~15 s para executar (chamada LENTA)
+    { id: "b6", type: "wait_response", data: { timeout_enabled: true, timeout_unit: "hours", timeout_value: 3, wait_indefinitely: false, message_buffer_enabled: false, timeout_next_block_id: "b7" }, next_block_id: "b4" },
+    { id: "b7", type: "message", data: { content: "TIMEOUT_LENTO", delay_ms: 15000, show_typing: false }, next_block_id: null },
     // espera SEM saída de timeout (o bloco real que travou a fila)
     { id: "b5", type: "wait_response", data: { timeout_enabled: true, timeout_unit: "hours", timeout_value: 3, wait_indefinitely: false, message_buffer_enabled: false }, next_block_id: "b4" },
   ],
@@ -60,7 +63,7 @@ const FUNNEL = {
 
 let n = 0;
 const past = (s: number) => new Date(Date.now() - s * 1000).toISOString();
-function waiting(o: { id?: string; chip?: string; block?: "b2" | "b5"; expiredMin?: number; phone?: string; meta?: Record<string, unknown> }) {
+function waiting(o: { id?: string; chip?: string; block?: "b2" | "b5" | "b6"; expiredMin?: number; phone?: string; meta?: Record<string, unknown> }) {
   const k = ++n;
   const id = o.id ?? `conv-${String(k).padStart(4, "0")}`;
   const phone = o.phone ?? `55119${String(10000000 + k)}`; // 13 dígitos (formato canônico)
@@ -76,7 +79,7 @@ function waiting(o: { id?: string; chip?: string; block?: "b2" | "b5"; expiredMi
       nome: "Fulano", telefone: phone, __consumed_input_message_ids: [], resposta: "waiting...", waiting_for_input: true,
       __waiting_input: {
         block_id: block, variable_name: "resposta", question_sent_at: qsa, question_text: "", timeout_at: past(expired), is_timeout: false,
-        success_next_block_id: "b4", timeout_next_block_id: block === "b2" ? "b3" : null, question_sent: true, answered: false,
+        success_next_block_id: "b4", timeout_next_block_id: block === "b2" ? "b3" : block === "b6" ? "b7" : null, question_sent: true, answered: false,
         answer_text: null, answered_at: null, trigger_message_id: `x:SEED${k}`,
       },
       waiting_question_sent_at: qsa,
@@ -89,7 +92,7 @@ const seedOf = (convs: ReturnType<typeof waiting>[]) => ({
 });
 
 // ---------------- "mundo": processos + banco compartilhado + captura ----------------
-interface SendBody { type: string; to: string; payload: Record<string, unknown> }
+interface SendBody { type: string; to: string; payload: Record<string, unknown>; at?: number }
 interface World {
   sends: SendBody[];
   post: (payload: unknown, headers?: Record<string, string>) => Promise<{ status: number; body: Record<string, unknown> }>;
@@ -112,7 +115,7 @@ async function world(o: { webhook: "base" | "patched"; seed: Record<string, unkn
   const sink = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (r) => {
     const p = new URL(r.url).pathname;
     const b = r.method === "POST" ? await r.json().catch(() => ({})) : {};
-    if (p.includes("/functions/v1/uazapi-send")) sends.push(b as SendBody);
+    if (p.includes("/functions/v1/uazapi-send")) sends.push({ ...(b as SendBody), at: Date.now() });
     return new Response(JSON.stringify({ success: true, message: "ok", debug: {} }), { headers: { "content-type": "application/json" } });
   });
   const sinkPort = (sink.addr as Deno.NetAddr).port;
@@ -439,6 +442,113 @@ t("TIMEOUT AUTOMÁTICO com o webhook PUBLICADO: a falha repetida de uma conversa
 });
 
 // =====================================================================
+// 5b) Significado dos 2 minutos, ciclos sobrepostos e chamada lenta
+// =====================================================================
+const ANCHOR_FUNNEL = {
+  ...FUNNEL,
+  flow_blocks: [
+    { id: "b1", type: "message", data: { content: "M1", delay_ms: 1500, show_typing: false }, next_block_id: "b1b" },
+    { id: "b1b", type: "message", data: { content: "M2", delay_ms: 1500, show_typing: false }, next_block_id: "b2" },
+    { id: "b2", type: "wait_response", data: { timeout_enabled: true, timeout_unit: "seconds", timeout_value: 8, wait_indefinitely: false, message_buffer_enabled: false, timeout_next_block_id: "b3" }, next_block_id: "b4" },
+    { id: "b3", type: "message", data: { content: "TIMEOUT", delay_ms: 0, show_typing: false }, next_block_id: null },
+    { id: "b4", type: "message", data: { content: "APOS_RESPOSTA", delay_ms: 0, show_typing: false }, next_block_id: null },
+  ],
+};
+
+async function waitWindow(w: World, phone: string): Promise<{ qs: number; ta: number; lock: number; block: string }> {
+  for (let i = 0; i < 60; i++) {
+    const c = (w.db().webchat_conversations as Record<string, any>[] | undefined)?.find((x) => x.visitor_phone === phone);
+    const wi = c?.flow_variables?.__waiting_input;
+    if (c && c.current_block_id === "b2" && wi?.question_sent_at && w.sends.length >= 2) {
+      await settle(700); // dá tempo da gravação do prazo re-ancorado
+      const c2 = (w.db().webchat_conversations as Record<string, any>[]).find((x) => x.visitor_phone === phone)!;
+      const wi2 = c2.flow_variables.__waiting_input;
+      return { qs: Date.parse(wi2.question_sent_at), ta: Date.parse(wi2.timeout_at), lock: Date.parse(c2.bot_locked_until), block: c2.current_block_id };
+    }
+    await settle(300);
+  }
+  throw new Error("a conversa não chegou à espera");
+}
+
+const inboundNew = (phone: string) => ({
+  instance: "chipA", token: "tok-A", event: "messages",
+  chat: { wa_chatid: `${phone}@s.whatsapp.net`, wa_isGroup: false },
+  message: { chatid: `${phone}@s.whatsapp.net`, sender: `${phone}@s.whatsapp.net`, sender_pn: `${phone}@s.whatsapp.net`, fromMe: false, isGroup: false, messageid: `5500000099A:3EB0N${phone.slice(-4)}`, text: "oi", messageType: "ExtendedTextMessage", senderName: "Fulano" },
+});
+
+t("SIGNIFICADO DOS 2 MIN (aqui 8 s): PUBLICADO conta o prazo desde a ENTRADA no bloco e vence antes do tempo configurado após a entrega; CORRIGIDO conta desde a entrega", async () => {
+  const phone = "5511999911111";
+  const seed = { evolution_instances: instances, capture_funnels: [ANCHOR_FUNNEL] };
+  const b = await world({ webhook: "base", seed });
+  const p = await world({ webhook: "patched", seed });
+  try {
+    await b.post(inboundNew(phone));
+    await p.post(inboundNew(phone));
+    const wb = await waitWindow(b, phone);
+    const wp = await waitWindow(p, phone);
+    const base_s = (wb.ta - wb.qs) / 1000;
+    const patched_s = (wp.ta - wp.qs) / 1000;
+    assert(base_s < 7, `publicado: espera efetiva de ${base_s.toFixed(1)} s para uma espera configurada de 8 s (encurtada pelo tempo de envio)`);
+    assert(Math.abs(patched_s - 8) < 0.05, `corrigido: espera efetiva ${patched_s.toFixed(3)} s (esperado 8,000)`);
+    assertEquals(wp.lock, wp.ta); // o timer do cron acompanha o prazo re-ancorado
+    assertEquals(wp.block, "b2");
+  } finally { await b.close(); await p.close(); }
+});
+
+t("o prazo re-ancorado não é atingido ENQUANTO a rajada ainda está sendo enviada, e a resposta do lead ainda avança normalmente", async () => {
+  const phone = "5511999922222";
+  const w = await world({ webhook: "patched", seed: { evolution_instances: instances, capture_funnels: [ANCHOR_FUNNEL] } });
+  try {
+    await w.post(inboundNew(phone));
+    const win = await waitWindow(w, phone);
+    assert(win.ta - Date.now() > 5_000, "ao fim do envio ainda restam ~8 s de espera configurada");
+    await settle(1100); // > 800 ms depois da pergunta
+    await w.post({ ...inboundNew(phone), message: { ...inboundNew(phone).message, messageid: "5500000099A:3EB0ANS1", text: "Quiero si" } });
+    await settle(1200);
+    assert(texts(w).includes("APOS_RESPOSTA"));
+    assertFalse(texts(w).includes("TIMEOUT"));
+  } finally { await w.close(); }
+});
+
+t("CICLOS DO CRON SOBREPOSTOS (3 execuções simultâneas): cada espera avança UMA única vez, sem mensagem duplicada", async () => {
+  const convs = [0, 1, 2, 3].map((i) => waiting({ id: `ov-${i}`, chip: ["A", "B", "C", "D"][i], block: "b2", expiredMin: 30 - i }));
+  const w = await world({ webhook: "patched", seed: seedOf(convs), cronEnv: CRON_ALL });
+  try {
+    const rs = await Promise.all([w.cron(), w.cron(), w.cron()]);
+    await settle(1500);
+    assert(rs.every((r) => r.status === 200));
+    assertEquals(texts(w).filter((x) => x === "TIMEOUT").length, 4); // exatamente uma por conversa
+    assertEquals(new Set(w.sends.map((x) => x.to)).size, 4);
+    for (const c of convs) assertEquals(w.conv(c.id).bot_locked_until === null || (w.conv(c.id) as { current_block_id: string }).current_block_id !== "b2", true);
+    // ciclos extras depois: nada novo
+    const n = w.sends.length;
+    await Promise.all([w.cron(), w.cron()]); await settle(900);
+    assertEquals(w.sends.length, n);
+  } finally { await w.close(); }
+});
+
+t("CHAMADA LENTA no mesmo chip: o cron para de esperar, as outras do chip avançam ANTES, a lenta conclui UMA vez e é diagnosticada", async () => {
+  const slow = waiting({ id: "slow-1", chip: "A", block: "b6", expiredMin: 40 });
+  const fast = [0, 1, 2].map((i) => waiting({ id: `fast-${i}`, chip: "A", block: "b2", expiredMin: 20 - i }));
+  const w = await world({
+    webhook: "patched", seed: seedOf([slow, ...fast]),
+    cronEnv: { FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_CALL_TIMEOUT_SECONDS: "5", FUNNEL_RESUME_SLOW_AFTER_SECONDS: "1", FUNNEL_RESUME_PER_CHIP_IN_FLIGHT: "1", FUNNEL_RESUME_CONCURRENCY: "4" },
+  });
+  try {
+    const r = await w.cron(); // só retorna quando a chamada pendente conclui (tolerância final), ~16 s
+    await settle(600);
+    const at = (t: string) => w.sends.filter((x) => x.payload?.text === t).map((x) => x.at!);
+    const slowAt = at("TIMEOUT_LENTO");
+    const fastAt = at("TIMEOUT");
+    assertEquals(slowAt.length, 1); // a lenta concluiu exatamente uma vez
+    assertEquals(fastAt.length, 3); // as 3 do mesmo chip avançaram
+    assert(fastAt.every((t_) => t_ < slowAt[0]), "as rápidas do MESMO chip não esperaram pela lenta");
+    assertEquals(r.body.call_timeouts, 1);
+    assertEquals(r.body.detached_calls, 1);
+  } finally { await w.close(); }
+});
+
+// =====================================================================
 // 6) Ativação controlada / passivo preservado
 // =====================================================================
 t("PADRÃO SEGURO: cron sem configuração não processa NADA — banco byte a byte inalterado", async () => {
@@ -469,15 +579,38 @@ t("ATIVAÇÃO CONTROLADA: com UMA conversa na allowlist só ela avança; as dema
   } finally { await w.close(); }
 });
 
-t("modo fresh: o passivo antigo (vencido há horas) nunca é lido nem processado; só timeouts recentes", async () => {
+t("modo since: o passivo anterior à ativação (inclusive o recente) nunca é lido nem processado; timeouts NOVOS são processados mesmo com mais de 10 min de atraso", async () => {
   const old = incidentSeed();
-  const recent = [waiting({ id: "recent-1", chip: "C", block: "b2", expiredMin: 5 }), waiting({ id: "recent-2", chip: "D", block: "b2", expiredMin: 20 }), waiting({ id: "stale-31", chip: "E", block: "b2", expiredMin: 31 })];
-  const w = await world({ webhook: "patched", seed: seedOf([...old.poison, ...old.normal, ...recent]), cronEnv: { FUNNEL_RESUME_MODE: "fresh", FUNNEL_RESUME_MAX_STALE_MINUTES: "30" } });
+  // ativação = 25 min atrás. recent-* vencem DEPOIS da ativação (novos); stale-* venceram ANTES (passivo)
+  const activation = new Date(Date.now() - 25 * 60_000).toISOString();
+  const recent = [
+    waiting({ id: "new-1", chip: "C", block: "b2", expiredMin: 5 }),
+    waiting({ id: "new-late-20", chip: "D", block: "b2", expiredMin: 20 }), // 20 min de atraso: NÃO pode sumir
+    waiting({ id: "old-26", chip: "E", block: "b2", expiredMin: 26 }), // venceu 1 min ANTES da ativação => passivo
+    waiting({ id: "old-31", chip: "E", block: "b2", expiredMin: 31 }),
+  ];
+  const w = await world({ webhook: "patched", seed: seedOf([...old.poison, ...old.normal, ...recent]), cronEnv: { FUNNEL_RESUME_MODE: "since", FUNNEL_RESUME_NOT_BEFORE: activation } });
   try {
-    const untouched = Object.fromEntries([...old.poison, ...old.normal, recent[2]].map((c) => [c.id, core(w.conv(c.id))]));
-    for (let i = 0; i < 3; i++) { await w.cron(); await settle(900); }
+    const untouched = Object.fromEntries([...old.poison, ...old.normal, recent[2], recent[3]].map((c) => [c.id, core(w.conv(c.id))]));
+    let last: Record<string, unknown> = {};
+    for (let i = 0; i < 3; i++) { last = (await w.cron()).body; await settle(900); }
     assertEquals(texts(w).filter((x) => x === "TIMEOUT").length, 2);
+    assertEquals(w.sends.map((x) => x.to).sort(), [recent[0].visitor_phone, recent[1].visitor_phone].sort());
     for (const [id, snap] of Object.entries(untouched)) assertEquals(core(w.conv(id)), snap, `${id} (passivo) foi alterada`);
+    assertEquals((last as { mode: string }).mode, "since");
+  } finally { await w.close(); }
+});
+
+t("timeout NOVO que acumula atraso longo NÃO desaparece: depois de 'serviço parado' é atendido e o atraso fica registrado", async () => {
+  const activation = new Date(Date.now() - 6 * 3600_000).toISOString(); // ativado há 6 h
+  const late = waiting({ id: "late-3h", chip: "C", block: "b2", expiredMin: 180 }); // venceu há 3 h, já depois da ativação
+  const w = await world({ webhook: "patched", seed: seedOf([late]), cronEnv: { FUNNEL_RESUME_MODE: "since", FUNNEL_RESUME_NOT_BEFORE: activation, FUNNEL_RESUME_LATE_ALERT_MINUTES: "10" } });
+  try {
+    const r = await w.cron();
+    await settle(1200);
+    assertEquals(texts(w), ["TIMEOUT"]);
+    assertEquals(r.body.late_alerts, 1); // diagnóstico explícito do atraso
+    assert((r.body.late_ms as { max: number }).max >= 170 * 60_000);
   } finally { await w.close(); }
 });
 
