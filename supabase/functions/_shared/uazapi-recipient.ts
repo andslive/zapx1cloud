@@ -114,3 +114,30 @@ export async function persistLidEvidence(
     return "error";
   }
 }
+
+/**
+ * O provedor pode devolver, no objeto `chat` do evento, `wa_chatid` = número do PRÓPRIO chip (observado em
+ * 02/10/2026 em contatos só-LID depois de receberem envio ao `<lid>@lid`). Nesse caso o remetente derivado do chat é o
+ * dono da conexão e a mensagem seria tratada como "eco do aparelho" e descartada. O objeto `message` do mesmo evento
+ * continua trazendo o par verdadeiro (`chatid`, `sender_lid`, `sender_pn`, `sender`).
+ *
+ * Só é chamada quando o remetente derivado == número do chip. Devolve o primeiro JID de pessoa (`@lid` ou
+ * `@s.whatsapp.net`) que NÃO seja o do chip e NÃO seja de grupo; null se não houver evidência (nada muda).
+ */
+export function recoverPeerJidWhenChatIsOwn(payload: unknown, ownDigits: string): string | null {
+  if (!ownDigits) return null;
+  const root = (payload ?? {}) as Record<string, any>;
+  const d = (root.data && typeof root.data === "object" ? root.data : root) as Record<string, any>;
+  const msg = (d.message && typeof d.message === "object" ? d.message : {}) as Record<string, any>;
+  const chat = (d.chat && typeof d.chat === "object" ? d.chat : {}) as Record<string, any>;
+  const candidates: unknown[] = [msg.chatid, msg.sender_lid, msg.sender_pn, chat.wa_chatlid, msg.sender];
+  for (const c of candidates) {
+    if (typeof c !== "string") continue;
+    const jid = c.trim();
+    if (!/^\d{5,}(?::\d+)?@(lid|s\.whatsapp\.net)$/i.test(jid)) continue;
+    if (jid.split("@")[0].split(":")[0] === ownDigits) continue;
+    return jid;
+  }
+  return null;
+}
+
