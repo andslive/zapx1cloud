@@ -11112,7 +11112,25 @@ FORMATO JSON:
             flowVariables["__waiting_input"] &&
             flowVariables["__waiting_input"].answered === false && !isResume
           ) {
-            const now = new Date().toISOString();
+            const _nowMs = Date.now();
+            const now = new Date(_nowMs).toISOString();
+            // O prazo (timeout_at / bot_locked_until) foi calculado na ENTRADA do bloco, ANTES do
+            // envio das mensagens deste mesmo passo; com blocos de 5 s de atraso, uma espera de 2 min
+            // chegava a vencer 26-51 s depois de a pergunta ser entregue (e podia vencer ENQUANTO a
+            // rajada ainda era enviada). Re-ancora o prazo no momento da entrega: a espera configurada
+            // passa a contar daqui. Só desloca para frente (nunca encurta) e limita o deslocamento a 30 min.
+            const _wi = flowVariables["__waiting_input"];
+            const _q0 = Date.parse(String(_wi.question_sent_at ?? ""));
+            const _t0 = Date.parse(String(_wi.timeout_at ?? ""));
+            let _reanchoredLock: string | null = null;
+            if (Number.isFinite(_q0) && Number.isFinite(_t0) && _t0 > _q0) {
+              const _shift = _nowMs - _q0;
+              if (_shift > 0 && _shift <= 30 * 60_000) {
+                _reanchoredLock = new Date(_t0 + _shift).toISOString();
+                _wi.timeout_at = _reanchoredLock;
+                console.log("[uazapi-webhook] question_deadline_reanchored:", { shift_ms: _shift, timeout_at: _reanchoredLock });
+              }
+            }
             flowVariables["__waiting_input"].question_sent_at = now;
             flowVariables["waiting_question_sent_at"] = now;
             console.log(
@@ -11120,11 +11138,16 @@ FORMATO JSON:
               now,
             );
 
-            // Persist the refreshed question_sent_at immediately so concurrent webhooks see it
+            // Persist the refreshed question_sent_at immediately so concurrent webhooks see it.
+            // Só grava se a conversa AINDA está neste bloco (uma resposta do lead durante o envio pode
+            // já ter avançado o funil; não sobrescrever esse avanço).
             try {
-              await supabase.from("webchat_conversations").update({
+              let _upd = supabase.from("webchat_conversations").update({
                 flow_variables: flowVariables,
+                ...(_reanchoredLock ? { bot_locked_until: _reanchoredLock } : {}),
               }).eq("id", conversationId);
+              if (nextBlockId) _upd = _upd.eq("current_block_id", nextBlockId);
+              await _upd;
               console.log(
                 "[uazapi-webhook] question_block_sent_at_persisted_successfully",
               );
