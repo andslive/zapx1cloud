@@ -1,7 +1,7 @@
 // deno test --allow-import uazapi-recipient.test.ts
 // Funções puras. Identificadores SINTÉTICOS, no formato real observado
 // (`<15 dígitos>@lid` com sender_pn vazio).
-import { isLidJid, persistLidEvidence, resolveStoredRemoteJid, resolveUazapiRecipient, resolveWebhookSendTarget } from "./uazapi-recipient.ts";
+import { isLidJid, persistLidEvidence, recoverPeerJidWhenChatIsOwn, resolveStoredRemoteJid, resolveUazapiRecipient, resolveWebhookSendTarget } from "./uazapi-recipient.ts";
 import { normalizePhoneBR } from "./phone.ts";
 import { assert, assertEquals, assertFalse } from "https://deno.land/std@0.208.0/assert/mod.ts";
 
@@ -137,3 +137,26 @@ Deno.test("persistLidEvidence: erros do banco e exceções nunca lançam", async
   assertEquals(await persistLidEvidence(metaClient({ c1: { metadata: {} } }, { upErr: true }), "c1", LID15, "900000000000001"), "error");
   assertEquals(await persistLidEvidence(metaClient({}, { throws: true }), "c1", LID15, "900000000000001", () => {}), "error");
 });
+
+// ---- chat do provedor apontando para o número do PRÓPRIO chip ----
+const OWN = "5500000000999";
+Deno.test("recoverPeerJidWhenChatIsOwn: devolve o par verdadeiro do `message` (LID) quando o chat aponta para o chip", () => {
+  const payload = { chat: { wa_chatid: `${OWN}@s.whatsapp.net`, wa_chatlid: LID15 }, message: { chatid: LID15, sender: LID15, sender_pn: null, fromMe: false } };
+  assertEquals(recoverPeerJidWhenChatIsOwn(payload, OWN), LID15);
+  // dentro de `data`
+  assertEquals(recoverPeerJidWhenChatIsOwn({ data: payload }, OWN), LID15);
+});
+
+Deno.test("recoverPeerJidWhenChatIsOwn: usa os demais campos na ordem e ignora o próprio chip e grupos", () => {
+  assertEquals(recoverPeerJidWhenChatIsOwn({ chat: { wa_chatlid: LID15 }, message: { chatid: `${OWN}@s.whatsapp.net` } }, OWN), LID15);
+  assertEquals(recoverPeerJidWhenChatIsOwn({ message: { chatid: "120363000000000000@g.us", sender_pn: "5511999990001@s.whatsapp.net" } }, OWN), "5511999990001@s.whatsapp.net");
+  assertEquals(recoverPeerJidWhenChatIsOwn({ message: { chatid: `${OWN}:7@s.whatsapp.net`, sender: `${OWN}@s.whatsapp.net` } }, OWN), null); // só o chip
+});
+
+Deno.test("recoverPeerJidWhenChatIsOwn: sem evidência ou entradas estranhas => null (nada muda)", () => {
+  for (const p of [null, undefined, {}, { message: {} }, { message: { chatid: 123 } }, { message: { chatid: "abc@lid" } }, { message: { chatid: "<script>@lid" } }]) {
+    assertEquals(recoverPeerJidWhenChatIsOwn(p, OWN), null);
+  }
+  assertEquals(recoverPeerJidWhenChatIsOwn({ message: { chatid: LID15 } }, ""), null); // sem número do chip não há como comparar
+});
+

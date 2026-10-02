@@ -68,6 +68,14 @@ const inbound = (chatid: string, id: string, text: string, pn: string | null = n
   chat: { wa_chatid: chatid, wa_chatlid: chatid.endsWith("@lid") ? chatid : "900000000000077@lid", wa_isGroup: false },
   message: { chatid, sender: chatid, sender_pn: pn, sender_lid: null, fromMe: false, isGroup: false, messageid: `5500000000999:3EB0F${id}`, text, messageType: "ExtendedTextMessage", senderName: "Fulano" },
 });
+// Estado real observado em produção (02/10/2026): no chat do provedor `wa_chatid` virou o número do PRÓPRIO chip e o
+// LID do contato ficou só em `wa_chatlid` / `message.chatid`.
+const OWN_JID = `${"5500000000999"}@s.whatsapp.net`;
+const inboundOwnChat = (id: string, text = "Quiero si", fromMe = false) => ({
+  ...base,
+  chat: { wa_chatid: OWN_JID, wa_chatlid: LID, wa_isGroup: false },
+  message: { chatid: LID, sender: fromMe ? OWN_JID : LID, sender_pn: null, sender_lid: null, fromMe, isGroup: false, messageid: `5500000000999:3EB0F${id}`, text, messageType: "ExtendedTextMessage", senderName: "Fulano" },
+});
 const inboundLid = (id: string, text = "¡Hola! Quiero más información") => inbound(LID, id, text);
 
 // conversa JÁ EXISTENTE, esperando resposta com o timeout vencido (formato gerado pelo próprio handler)
@@ -96,7 +104,8 @@ interface SendBody { type: string; to: string; organization_id: string; instance
 type Step =
   | { post: unknown }
   | { sleep: number }
-  | { resume: true; times?: number };
+  | { resume: true; times?: number }
+  | { par: Step[] }; // executa os passos ao MESMO tempo (resposta do lead x retomada)
 interface Out { sends: SendBody[]; responses: { status: number; body: unknown }[]; state: Record<string, Record<string, unknown>[]> }
 
 let seq = 0;
@@ -129,8 +138,9 @@ async function run(version: "base" | "patched", steps: Step[], seed: Record<stri
   const readState = async () => { try { return JSON.parse(await Deno.readTextFile(stateFile)); } catch (_e) { return {}; } };
   const responses: Out["responses"] = [];
   try {
-    for (const st of steps) {
-      if ("sleep" in st) { await new Promise((r) => setTimeout(r, st.sleep)); continue; }
+    const exec = async (st: Step): Promise<void> => {
+      if ("par" in st) { await Promise.all(st.par.map((x) => exec(x))); return; }
+      if ("sleep" in st) { await new Promise((r) => setTimeout(r, st.sleep)); return; }
       if ("resume" in st) {
         const state = await readState();
         const conv = (state.webchat_conversations ?? [])[0] ?? (seed.webchat_conversations as { id: string }[] | undefined)?.[0];
@@ -139,7 +149,7 @@ async function run(version: "base" | "patched", steps: Step[], seed: Record<stri
           responses.push({ status: r.status, body: await r.json().catch(() => null) });
         }
         await new Promise((r) => setTimeout(r, 600));
-        continue;
+        return;
       }
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(st.post) });
       const text = await r.text();
@@ -147,7 +157,8 @@ async function run(version: "base" | "patched", steps: Step[], seed: Record<stri
       try { body = JSON.parse(text); } catch (_e) { /* texto */ }
       responses.push({ status: r.status, body });
       await new Promise((r) => setTimeout(r, 500));
-    }
+    };
+    for (const st of steps) await exec(st);
     return { sends: [...sends], responses, state: await readState() };
   } finally {
     try { proc.kill("SIGTERM"); } catch (_e) { /* ok */ }
@@ -317,4 +328,45 @@ t("retomada SEM credencial interna é recusada (401) e não envia nada — igual
 
 Deno.test("baseline publicado (BASE_REF) disponível para a comparação", () => {
   assert(HAS_BASE, `commit ${BASE_REF} não encontrado: os testes comparativos foram IGNORADOS`);
+});
+
+// =====================================================================
+// 6) Resposta quando o chat do provedor aponta para o número do PRÓPRIO chip (regressão observada)
+// =====================================================================
+t("REPRODUÇÃO: 'si' com wa_chatid = número do chip e o LID só em chatlid/message.chatid avança o funil na MESMA conversa (publicado antes da correção: descartado)", async () => {
+  const steps: Step[] = [{ post: inboundLid("1") }, { sleep: 2000 }, { post: inboundOwnChat("2") }];
+  const p = await run("patched", steps);
+  assertEquals(texts(p), ["Hola 1", "APOS_RESPOSTA"]);
+  assertEquals(tos(p), [LID, LID]);
+  assertEquals((p.state.webchat_conversations ?? []).length, 1); // nenhuma conversa nova para o número do chip
+  const msgs = (p.state.webchat_messages ?? []).filter((m) => m.direction === "inbound");
+  assertEquals(msgs.length, 2); // a resposta foi GRAVADA como mensagem do lead
+  assertEquals((p.state.leads ?? []).length, 1);
+});
+
+t("resposta normal (chat = LID) continua idêntica; contato por TELEFONE não é afetado pela correção", async () => {
+  const phoneSteps: Step[] = [{ post: inbound(`${PHONE}@s.whatsapp.net`, "1", "oi") }, { sleep: 2000 }, { post: inbound(`${PHONE}@s.whatsapp.net`, "2", "Quiero si") }];
+  const p = await run("patched", phoneSteps);
+  assertEquals(texts(p), ["Hola 1", "APOS_RESPOSTA"]);
+  assertEquals(tos(p), [PHONE, PHONE]);
+});
+
+t("mensagem realmente do próprio aparelho SEM par identificável continua sendo descartada (self_echo), como antes", async () => {
+  const own = { ...base, chat: { wa_chatid: OWN_JID, wa_isGroup: false }, message: { chatid: OWN_JID, sender: OWN_JID, fromMe: true, isGroup: false, messageid: "5500000000999:3EB0FSELF", text: "nota", messageType: "Conversation" } };
+  const p = await run("patched", [{ post: own }]);
+  assertEquals(texts(p), []);
+  assertEquals((p.state.webchat_messages ?? []).length, 0);
+});
+
+t("SEM resposta: o timeout continua disparando UMA vez e nada é duplicado", async () => {
+  const p = await run("patched", [{ post: inboundLid("1") }, { sleep: 5400 }, { resume: true, times: 2 }]);
+  assertEquals(texts(p).filter((x) => x === "TIMEOUT").length, 1);
+});
+
+t("resposta (com chat do provedor corrompido) CONCORRENTE com o timeout: uma única transição da mesma espera", async () => {
+  const steps: Step[] = [{ post: inboundLid("1") }, { sleep: 5400 }, { par: [{ post: inboundOwnChat("2") }, { resume: true }] }];
+  const p = await run("patched", steps);
+  const first = texts(p).filter((x) => x === "TIMEOUT" || x === "APOS_RESPOSTA");
+  assertEquals(first.length, 1, `esperava UMA transição, veio: ${texts(p)}`);
+  assertEquals((p.state.webchat_conversations ?? []).length, 1);
 });

@@ -9,8 +9,7 @@ import { normalizePhoneBR, phoneVariantsBR } from "../_shared/phone.ts";
 import {
   persistLidEvidence,
   resolveStoredRemoteJid,
-  resolveWebhookSendTarget,
-} from "../_shared/uazapi-recipient.ts";
+  resolveWebhookSendTarget, recoverPeerJidWhenChatIsOwn } from "../_shared/uazapi-recipient.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { waitKeyOf } from "../_shared/funnel-resume.ts";
 import { claimLossIsFinal, claimWait, releaseTimeoutWithoutPath } from "../_shared/wait-claim.ts";
@@ -4072,7 +4071,25 @@ Deno.serve(async (req) => {
 
     // ---- MESSAGE ----
     if (norm.kind === "message") {
-      const remoteJid = String(norm.remoteJid || "");
+      let remoteJid = String(norm.remoteJid || "");
+      {
+        // Chat do provedor apontando para o número do PRÓPRIO chip (ver recoverPeerJidWhenChatIsOwn): sem isto a
+        // resposta do lead é descartada como eco do aparelho. Só age quando o remetente derivado == número do chip.
+        const ownDigits = String(instance.phone_number || "").replace(/\D/g, "");
+        const derivedDigits = remoteJid.split("@")[0].split(":")[0].replace(/\D/g, "");
+        if (ownDigits && derivedDigits === ownDigits && remoteJid.toLowerCase().endsWith("@s.whatsapp.net")) {
+          const peer = recoverPeerJidWhenChatIsOwn(payload, ownDigits);
+          if (peer) {
+            console.warn("[uazapi-webhook] chat_id_is_own_number_recovered:", JSON.stringify({
+              from_me: (norm as any).fromMe === true,
+              recovered_kind: peer.toLowerCase().endsWith("@lid") ? "lid" : "phone",
+              message_id: (norm as any).messageId || null,
+            }));
+            remoteJid = peer;
+            (norm as any).remoteJid = peer;
+          }
+        }
+      }
 
       // 1) Get or create conversation
       // We look up conversation early to check for smart pause lock
