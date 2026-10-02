@@ -370,3 +370,14 @@ t("resposta (com chat do provedor corrompido) CONCORRENTE com o timeout: uma ún
   assertEquals(first.length, 1, `esperava UMA transição, veio: ${texts(p)}`);
   assertEquals((p.state.webchat_conversations ?? []).length, 1);
 });
+
+t("GRUPO com chat do provedor corrompido: o participante NÃO vira lead nem conversa; o evento segue descartado", async () => {
+  const G = "120363000000000000@g.us";
+  const grp = { ...base, chat: { wa_chatid: OWN_JID, wa_chatlid: LID, wa_isGroup: true }, message: { chatid: G, sender: LID, sender_pn: "5511999990001@s.whatsapp.net", fromMe: false, isGroup: true, messageid: "5500000000999:3EB0FGRP", text: "oi grupo", messageType: "Conversation" } };
+  const p = await run("patched", [{ post: grp }]);
+  assertEquals(texts(p), []);
+  assertEquals((p.state.webchat_conversations ?? []).length, 0);
+  assertEquals((p.state.leads ?? []).length, 0);
+  assertEquals((p.state.webchat_messages ?? []).length, 0);
+});
+
