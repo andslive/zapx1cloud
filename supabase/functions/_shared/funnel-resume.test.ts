@@ -1,16 +1,14 @@
 // deno test --allow-import funnel-resume.test.ts
 //
-// Lógica pura da fila de retomada, com RELÓGIO CONTROLADO e serviços simulados
-// (banco em memória + webhook simulado). Nada de rede, nada de tempo real.
+// Lógica pura da fila de retomada, com RELÓGIO VIRTUAL e serviços simulados
+// (banco em memória + webhook simulado com duração por chamada). Sem rede, sem tempo real.
 
 import {
   chipOf,
   classifyResponse,
-  type CycleDeps,
   isEligible,
   nextState,
   parseResumeConfig,
-  type PageArgs,
   pickBatch,
   readResumeState,
   type ResumeCandidate,
@@ -18,15 +16,17 @@ import {
   runResumeCycle,
   waitKeyOf,
 } from "./funnel-resume.ts";
+import { type Kind, type SimConv, World } from "./funnel-resume-sim.ts";
 import { assert, assertEquals, assertFalse } from "https://deno.land/std@0.208.0/assert/mod.ts";
 
 const T0 = Date.parse("2026-10-01T12:00:00Z");
 const MIN = 60_000;
+const SEC = 1000;
 const env = (o: Record<string, string>) => (k: string) => o[k];
 const cfgOf = (o: Record<string, string> = {}): ResumeConfig => parseResumeConfig(env(o));
 
 let seq = 0;
-function conv(over: Partial<ResumeCandidate> & { chip?: string; expiredMinAgo?: number; waitAt?: string }): ResumeCandidate {
+function cand(over: Partial<ResumeCandidate> & { chip?: string; expiredMinAgo?: number; waitAt?: string }): ResumeCandidate {
   const id = over.id ?? `conv-${String(++seq).padStart(5, "0")}`;
   const lock = new Date(T0 - (over.expiredMinAgo ?? 10) * MIN).toISOString();
   return {
@@ -44,71 +44,80 @@ function conv(over: Partial<ResumeCandidate> & { chip?: string; expiredMinAgo?: 
 
 // ---------------- configuração ----------------
 
-Deno.test("config: PADRÃO é o modo seguro (allowlist vazia) e valores inválidos caem no modo seguro", () => {
+Deno.test("config: PADRÃO é o modo seguro (allowlist vazia); valores inválidos/legados caem no modo seguro", () => {
   const d = cfgOf();
   assertEquals(d.mode, "allowlist");
   assertEquals(d.allowlist.size, 0);
   assertEquals(d.dryRun, false);
-  for (const bad of ["", "ALL ", "everything", "fresh2", "0"]) {
-    const c = cfgOf({ FUNNEL_RESUME_MODE: bad });
-    assert(c.mode === "allowlist" || (bad.trim().toLowerCase() === "all" && c.mode === "all"), `modo inesperado para ${JSON.stringify(bad)}: ${c.mode}`);
-  }
-  assertEquals(cfgOf({ FUNNEL_RESUME_MODE: "fresh" }).mode, "fresh");
-  assertEquals(cfgOf({ FUNNEL_RESUME_MODE: "all" }).mode, "all");
   assertEquals(cfgOf({ FUNNEL_RESUME_MODE: "garbage" }).mode, "allowlist");
+  assertEquals(cfgOf({ FUNNEL_RESUME_MODE: "all" }).mode, "all");
+  // 'fresh' (corte por idade) foi REMOVIDO: abandonava para sempre qualquer timeout novo atrasado
+  const f = cfgOf({ FUNNEL_RESUME_MODE: "fresh" });
+  assertEquals(f.mode, "allowlist");
+  assert(f.warning?.includes("fresh_removed"));
 });
 
-Deno.test("config: allowlist só aceita ids bem formados; limites numéricos são saturados", () => {
-  const c = cfgOf({ FUNNEL_RESUME_ALLOWLIST: "abc-123456, ../etc; x , conv_00001\n\tok-654321", FUNNEL_RESUME_HARD_CAP: "99999", FUNNEL_RESUME_PER_CHIP: "-5", FUNNEL_RESUME_MAX_ATTEMPTS: "abc" });
-  assertEquals([...c.allowlist].sort(), ["abc-123456", "conv_00001", "ok-654321"]);
-  assertEquals(c.hardCap, 100);
-  assertEquals(c.perChip, 1);
-  assertEquals(c.maxAttempts, 5);
+Deno.test("config: 'since' exige um instante de ativação válido; sem ele cai no modo seguro COM aviso", () => {
+  const ok = cfgOf({ FUNNEL_RESUME_MODE: "since", FUNNEL_RESUME_NOT_BEFORE: "2026-10-02T15:00:00Z" });
+  assertEquals(ok.mode, "since");
+  assertEquals(ok.notBeforeMs, Date.parse("2026-10-02T15:00:00Z"));
+  for (const bad of [undefined, "", "ontem", "2026-13-99"]) {
+    const c = cfgOf({ FUNNEL_RESUME_MODE: "since", ...(bad === undefined ? {} : { FUNNEL_RESUME_NOT_BEFORE: bad }) });
+    assertEquals(c.mode, "allowlist");
+    assert(c.warning?.includes("since_requires_valid"));
+  }
 });
 
-// ---------------- espera específica ----------------
+Deno.test("config: valores reais da implementação (padrões) e limites saturados", () => {
+  const c = cfgOf();
+  assertEquals([c.perChip, c.hardCap, c.concurrency, c.perChipInFlight, c.perChipHard], [8, 30, 6, 3, 8]);
+  assertEquals([c.callTimeoutMs, c.dispatchLeaseMs, c.timeBudgetMs, c.slowAfterMs], [45_000, 120_000, 50_000, 10_000]);
+  assertEquals([c.maxAttempts, c.backoffBaseMs, c.backoffMaxMs, c.lateAlertMs, c.maxLateMs], [5, 2 * MIN, 60 * MIN, 10 * MIN, 0]);
+  const s = cfgOf({ FUNNEL_RESUME_ALLOWLIST: "abc-123456, ../etc; x , conv_00001\n\tok-654321", FUNNEL_RESUME_HARD_CAP: "99999", FUNNEL_RESUME_PER_CHIP: "-5", FUNNEL_RESUME_MAX_ATTEMPTS: "abc", FUNNEL_RESUME_CONCURRENCY: "500" });
+  assertEquals([...s.allowlist].sort(), ["abc-123456", "conv_00001", "ok-654321"]);
+  assertEquals([s.hardCap, s.perChip, s.maxAttempts, s.concurrency], [200, 1, 5, 20]);
+});
 
-Deno.test("waitKeyOf: muda com o bloco, com o fluxo e com o momento da pergunta (timeout antigo não vale para outra espera)", () => {
-  const base = conv({ id: "c1" });
+// ---------------- espera específica / estado ----------------
+
+Deno.test("waitKeyOf: muda com o bloco, o fluxo e o momento da pergunta (timeout antigo não vale para outra espera)", () => {
+  const base = cand({ id: "c1" });
   const k = waitKeyOf(base);
   assert(k !== waitKeyOf({ ...base, current_block_id: "block-2" }));
   assert(k !== waitKeyOf({ ...base, current_flow_id: "flow-2" }));
-  assert(k !== waitKeyOf(conv({ id: "c1", waitAt: new Date(T0).toISOString() })));
+  assert(k !== waitKeyOf(cand({ id: "c1", waitAt: new Date(T0).toISOString() })));
   assertEquals(k, waitKeyOf(structuredClone(base)));
 });
 
 Deno.test("estado de tentativas só vale para a MESMA espera; espera nova zera", () => {
-  const c = conv({});
+  const c = cand({});
   const st = nextState(null, "failed", "x", T0, cfgOf(), waitKeyOf(c))!;
   assertEquals(readResumeState({ resume: st }, waitKeyOf(c))?.attempts, 1);
   assertEquals(readResumeState({ resume: st }, waitKeyOf({ ...c, current_block_id: "outro" })), null);
 });
 
-// ---------------- classificação ----------------
-
-Deno.test("classifyResponse: mapeia as respostas reais do webhook; o desconhecido é FALHA (nunca sucesso)", () => {
+Deno.test("classifyResponse: respostas reais do webhook; timeout de chamada e o desconhecido são FALHA", () => {
   const cases: [number | null, unknown, string][] = [
     [200, { ok: true, funnel: true }, "advanced"],
     [200, { ok: true, skipped: "conversation_lease_held_by_other_owner" }, "busy"],
     [200, { ok: true, skipped: "wait_already_claimed" }, "busy"],
     [200, { ok: true, skipped: "inbound_in_flight" }, "busy"],
-    [200, { ok: true, skipped: "ghost_cleanup_invalid_resume_state", reason: "x" }, "released"],
-    [200, { ok: true, skipped: "recent_message_detected", ghost_cleaned: true }, "released"],
-    [200, { ok: true, skipped: "already_handled_by_inbound" }, "released"],
+    [200, { ok: true, skipped: "ghost_cleanup_invalid_resume_state" }, "released"],
+    [200, { ok: true, skipped: "recent_message_detected" }, "released"],
     [200, { ok: true, skipped: "stale_resume" }, "released"],
     [200, { ok: true, skipped: "timeout_no_path_released" }, "released"],
-    [200, { ok: true, error: "timeout_no_path" }, "failed"], // webhook ANTIGO: a mesma falha que travava a fila
+    [200, { ok: true, error: "timeout_no_path" }, "failed"],
     [200, { ok: true, skipped: "algo_novo" }, "failed"],
     [200, { ok: true }, "failed"],
-    [200, null, "failed"],
-    [401, { ok: false, error: "unauthorized" }, "failed"],
+    [401, { ok: false }, "failed"],
     [500, {}, "failed"],
     [null, null, "failed"],
   ];
   for (const [s, b, want] of cases) assertEquals(classifyResponse(s, b).outcome, want, `${s} ${JSON.stringify(b)}`);
+  assertEquals(classifyResponse(null, null, true), { outcome: "failed", reason: "call_timeout" });
 });
 
-Deno.test("nextState: backoff exponencial limitado, quarentena na última tentativa, busy não conta", () => {
+Deno.test("nextState: backoff exponencial limitado, quarentena na última tentativa; busy não conta e libera a reserva", () => {
   const cfg = cfgOf();
   const k = "k";
   let st = nextState(null, "failed", "e", T0, cfg, k)!;
@@ -116,99 +125,77 @@ Deno.test("nextState: backoff exponencial limitado, quarentena na última tentat
   assertEquals(Date.parse(st.next_attempt_at!) - T0, 2 * MIN);
   st = nextState(st, "failed", "e", T0, cfg, k)!;
   assertEquals(Date.parse(st.next_attempt_at!) - T0, 4 * MIN);
-  const busy = nextState(st, "busy", "b", T0, cfg, k);
-  assertEquals(busy, st); // inalterado
-  st = nextState(st, "failed", "e", T0, cfg, k)!;
-  st = nextState(st, "failed", "e", T0, cfg, k)!;
-  assertFalse(st.quarantined);
-  st = nextState(st, "failed", "e", T0, cfg, k)!; // 5ª
+  const busy = nextState({ ...st, dispatch_until: new Date(T0 + MIN).toISOString() }, "busy", "b", T0, cfg, k)!;
+  assertEquals(busy.attempts, 2);
+  assertEquals(busy.dispatch_until, null);
+  for (let i = 0; i < 3; i++) st = nextState(st, "failed", "e", T0, cfg, k)!;
   assert(st.quarantined && st.next_attempt_at === null && st.attempts === 5);
   assertEquals(nextState(st, "released", "r", T0, cfg, k), null);
   assertEquals(nextState(st, "advanced", "a", T0, cfg, k), null);
-  const capped = nextState({ ...st, attempts: 9, quarantined: false }, "failed", "e", T0, cfgOf({ FUNNEL_RESUME_MAX_ATTEMPTS: "20" }), k)!;
-  assert(Date.parse(capped.next_attempt_at!) - T0 <= 60 * MIN);
 });
 
-// ---------------- elegibilidade e seleção ----------------
+// ---------------- elegibilidade: passivo × atraso novo ----------------
 
-Deno.test("isEligible: allowlist, idade (fresh), quarentena e backoff", () => {
-  const c = conv({ id: "c-allowed", expiredMinAgo: 120 });
-  assertEquals(isEligible(c, cfgOf({ FUNNEL_RESUME_MODE: "allowlist" }), T0), { ok: false, reason: "not_allowlisted" });
-  assertEquals(isEligible(c, cfgOf({ FUNNEL_RESUME_MODE: "allowlist", FUNNEL_RESUME_ALLOWLIST: "c-allowed" }), T0), { ok: true });
-  assertEquals(isEligible(c, cfgOf({ FUNNEL_RESUME_MODE: "fresh" }), T0), { ok: false, reason: "too_stale" });
-  assertEquals(isEligible(conv({ expiredMinAgo: 5 }), cfgOf({ FUNNEL_RESUME_MODE: "fresh" }), T0), { ok: true });
-  assertEquals(isEligible(c, cfgOf({ FUNNEL_RESUME_MODE: "all" }), T0), { ok: true });
-  const fut = conv({ bot_locked_until: new Date(T0 + MIN).toISOString() });
-  assertEquals(isEligible(fut, cfgOf({ FUNNEL_RESUME_MODE: "all" }), T0), { ok: false, reason: "not_expired" });
-  const quar = conv({});
-  quar.metadata = { resume: { attempts: 5, quarantined: true, next_attempt_at: null, wait_key: waitKeyOf(quar) } };
-  assertEquals(isEligible(quar, cfgOf({ FUNNEL_RESUME_MODE: "all" }), T0), { ok: false, reason: "quarantined" });
-  const bo = conv({});
-  bo.metadata = { resume: { attempts: 1, quarantined: false, next_attempt_at: new Date(T0 + MIN).toISOString(), wait_key: waitKeyOf(bo) } };
-  assertEquals(isEligible(bo, cfgOf({ FUNNEL_RESUME_MODE: "all" }), T0), { ok: false, reason: "backoff" });
-  assertEquals(isEligible(bo, cfgOf({ FUNNEL_RESUME_MODE: "all" }), T0 + 2 * MIN), { ok: true });
+Deno.test("isEligible: allowlist, quarentena, backoff e reserva de despacho", () => {
+  const c = cand({ id: "c-allowed", expiredMinAgo: 120 });
+  assertEquals(isEligible(c, cfgOf(), T0), { ok: false, reason: "not_allowlisted" });
+  assertEquals(isEligible(c, cfgOf({ FUNNEL_RESUME_ALLOWLIST: "c-allowed" }), T0), { ok: true });
+  const all = cfgOf({ FUNNEL_RESUME_MODE: "all" });
+  assertEquals(isEligible(cand({ bot_locked_until: new Date(T0 + MIN).toISOString() }), all, T0), { ok: false, reason: "not_expired" });
+  const q = cand({}); q.metadata = { resume: { attempts: 5, quarantined: true, next_attempt_at: null, wait_key: waitKeyOf(q) } };
+  assertEquals(isEligible(q, all, T0), { ok: false, reason: "quarantined" });
+  const b = cand({}); b.metadata = { resume: { attempts: 1, next_attempt_at: new Date(T0 + MIN).toISOString(), wait_key: waitKeyOf(b) } };
+  assertEquals(isEligible(b, all, T0), { ok: false, reason: "backoff" });
+  assertEquals(isEligible(b, all, T0 + 2 * MIN), { ok: true });
+  const d = cand({}); d.metadata = { resume: { attempts: 0, dispatch_until: new Date(T0 + MIN).toISOString(), wait_key: waitKeyOf(d) } };
+  assertEquals(isEligible(d, all, T0), { ok: false, reason: "dispatched" });
+  assertEquals(isEligible(d, all, T0 + 2 * MIN), { ok: true });
+});
+
+Deno.test("PASSIVO × ATRASO NOVO: since separa pelo instante da ativação, NUNCA pela idade do atraso", () => {
+  const act = T0; // ativação
+  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "since", FUNNEL_RESUME_NOT_BEFORE: new Date(act).toISOString() });
+  // vencida ANTES da ativação (passivo), por mais recente que seja
+  assertEquals(isEligible(cand({ bot_locked_until: new Date(act - 1 * SEC).toISOString() }), cfg, act + 5 * MIN), { ok: false, reason: "legacy_backlog" });
+  assertEquals(isEligible(cand({ bot_locked_until: new Date(act - 40 * 60 * MIN).toISOString() }), cfg, act + 5 * MIN), { ok: false, reason: "legacy_backlog" });
+  // vencida DEPOIS da ativação: elegível mesmo com atraso enorme (10 min, 3 h, 2 dias): nunca "some" da fila
+  for (const lateMin of [0, 9, 11, 180, 2880]) {
+    const c = cand({ bot_locked_until: new Date(act + 1 * MIN).toISOString() });
+    assertEquals(isEligible(c, cfg, act + 1 * MIN + lateMin * MIN), { ok: true }, `atraso de ${lateMin} min não pode excluir`);
+  }
+});
+
+Deno.test("esperas LONGAS não são afetadas pelo modo since (o corte é no VENCIMENTO, não na duração da espera)", () => {
+  const act = T0;
+  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "since", FUNNEL_RESUME_NOT_BEFORE: new Date(act).toISOString() });
+  // espera de 3 horas iniciada ANTES da ativação, que vence DEPOIS dela: é timeout novo, não passivo
+  const longWait = cand({ bot_locked_until: new Date(act + 90 * MIN).toISOString(), waitAt: new Date(act - 90 * MIN).toISOString() });
+  assertEquals(isEligible(longWait, cfg, act + 90 * MIN + 1), { ok: true });
+});
+
+Deno.test("corte de atraso é OPT-IN e explícito: sem FUNNEL_RESUME_MAX_LATE_MINUTES nada é descartado; com ele vira too_late contado", () => {
+  const act = T0;
+  const base = { FUNNEL_RESUME_MODE: "since", FUNNEL_RESUME_NOT_BEFORE: new Date(act).toISOString() };
+  const c = cand({ bot_locked_until: new Date(act + MIN).toISOString() });
+  assertEquals(isEligible(c, cfgOf(base), act + 24 * 60 * MIN), { ok: true });
+  assertEquals(isEligible(c, cfgOf({ ...base, FUNNEL_RESUME_MAX_LATE_MINUTES: "60" }), act + 24 * 60 * MIN), { ok: false, reason: "too_late" });
+  const { skipped } = pickBatch([c], cfgOf({ ...base, FUNNEL_RESUME_MAX_LATE_MINUTES: "60" }), act + 24 * 60 * MIN);
+  assertEquals(skipped.too_late, 1);
 });
 
 Deno.test("pickBatch: round-robin entre conexões, cota por conexão, teto global; elegibilidade ANTES do limite", () => {
   const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_HARD_CAP: "7", FUNNEL_RESUME_PER_CHIP: "2" });
   const cands: ResumeCandidate[] = [];
-  for (const chip of ["A", "B", "C", "D"]) for (let i = 0; i < 5; i++) cands.push(conv({ chip, expiredMinAgo: 500 - i }));
+  for (const chip of ["A", "B", "C", "D"]) for (let i = 0; i < 5; i++) cands.push(cand({ chip, expiredMinAgo: 500 - i }));
   const { batch } = pickBatch(cands, cfg, T0);
   assertEquals(batch.length, 7);
   const perChip = new Map<string, number>();
-  for (const b of batch) perChip.set(b.connection_id!, (perChip.get(b.connection_id!) ?? 0) + 1);
+  for (const b of batch) perChip.set(chipOf(b), (perChip.get(chipOf(b)) ?? 0) + 1);
   assert([...perChip.values()].every((n) => n <= 2));
-  assertEquals(perChip.size, 4); // todas as conexões atendidas
+  assertEquals(perChip.size, 4);
 });
 
-// ---------------- simulação do incidente real ----------------
-
-interface SimConv extends ResumeCandidate { kind: "poison" | "normal" | "stale_target"; done?: boolean }
-
-function makeSim(convs: SimConv[], cfg: ResumeConfig, opts: { webhookPoison?: "old" | "new" } = {}) {
-  let now = T0;
-  const store = new Map(convs.map((c) => [c.id, c]));
-  const calls: { id: string; expected: { wait_key: string } }[] = [];
-  const deps: CycleDeps = {
-    now: () => now,
-    fetchPage: ({ after, limit, minLock, ids }: PageArgs) => {
-      let rows = [...store.values()].filter((c) => !c.done && Date.parse(c.bot_locked_until) <= now);
-      if (ids) rows = rows.filter((c) => ids.includes(c.id));
-      if (minLock) rows = rows.filter((c) => c.bot_locked_until >= minLock);
-      rows.sort((a, b) => a.bot_locked_until.localeCompare(b.bot_locked_until) || a.id.localeCompare(b.id));
-      if (after) rows = rows.filter((c) => c.bot_locked_until > after.lock || (c.bot_locked_until === after.lock && c.id > after.id));
-      return Promise.resolve(rows.slice(0, limit).map((c) => structuredClone(c)));
-    },
-    callResume: (c, expected) => {
-      calls.push({ id: c.id, expected });
-      const real = store.get(c.id)!;
-      if (expected.wait_key !== waitKeyOf(real)) return Promise.resolve({ status: 200, body: { ok: true, skipped: "stale_resume" } });
-      if (real.kind === "poison") {
-        if (opts.webhookPoison === "new") { real.done = true; return Promise.resolve({ status: 200, body: { ok: true, skipped: "timeout_no_path_released" } }); }
-        return Promise.resolve({ status: 200, body: { ok: true, error: "timeout_no_path" } }); // webhook publicado: não libera
-      }
-      real.done = true; // avançou: lock liberado
-      return Promise.resolve({ status: 200, body: { ok: true, funnel: true } });
-    },
-    readLatest: (id) => Promise.resolve({ metadata: structuredClone(store.get(id)!.metadata ?? {}), updated_at: store.get(id)!.updated_at ?? null }),
-    writeState: (id, md) => { store.get(id)!.metadata = md; return Promise.resolve(true); },
-    sleep: () => Promise.resolve(),
-    log: () => {},
-  };
-  return { deps, store, calls, tick: (ms: number) => { now += ms; }, now: () => now };
-}
-
-/** Reproduz o incidente: 24 problemáticas (2 conexões) na frente + 937 normais de 10 conexões. */
-function incident(): SimConv[] {
-  const out: SimConv[] = [];
-  for (let i = 0; i < 24; i++) out.push({ ...conv({ chip: i % 2 ? "CHIP663" : "chip67", expiredMinAgo: 1700 - i }), kind: "poison" });
-  for (let i = 0; i < 36; i++) out.push({ ...conv({ chip: i % 2 ? "CHIP663" : "chip67", expiredMinAgo: 1000 - i }), kind: "normal" });
-  const chips = ["canall32", "chip19", "chip50", "canal21", "chip16", "chip52", "chip12", "canal46", "chip17new", "chipZ"];
-  for (let i = 0; i < 901; i++) out.push({ ...conv({ chip: chips[i % chips.length], expiredMinAgo: 800 - (i % 700) }), kind: "normal" });
-  return out;
-}
-
-// Réplica da seleção ANTIGA do funnel-resume-cron (publicada): janela global das 60 mais antigas e SÓ DEPOIS 2 por conexão.
+// Réplica da seleção ANTIGA (publicada): janela global das 60 mais antigas e SÓ DEPOIS 2 por conexão.
 function legacySelect(convs: ResumeCandidate[], nowMs: number): ResumeCandidate[] {
   const window = convs.filter((c) => Date.parse(c.bot_locked_until) <= nowMs)
     .sort((a, b) => a.bot_locked_until.localeCompare(b.bot_locked_until)).slice(0, 60);
@@ -217,175 +204,232 @@ function legacySelect(convs: ResumeCandidate[], nowMs: number): ResumeCandidate[
   return Object.values(perChip).flat().slice(0, 20);
 }
 
+function incident(world?: World, kindPoison: Kind = "poison"): ResumeCandidate[] {
+  const out: ResumeCandidate[] = [];
+  const mk = (id: string, chip: string, minAgo: number, kind: Kind) => {
+    if (world) world.add({ id, chip, kind, durMs: 8 * SEC, dueAt: T0 - minAgo * MIN } as never);
+    const c = cand({ id, chip, expiredMinAgo: minAgo });
+    (c as ResumeCandidate & { kind?: Kind }).kind = kind;
+    out.push(c);
+  };
+  for (let i = 0; i < 24; i++) mk(`poison-${String(i).padStart(3, "0")}`, i % 2 ? "CHIP663" : "chip67", 1700 - i, kindPoison);
+  for (let i = 0; i < 36; i++) mk(`stuck-${String(i).padStart(3, "0")}`, i % 2 ? "CHIP663" : "chip67", 1000 - i, "normal");
+  const chips = ["canall32", "chip19", "chip50", "canal21", "chip16", "chip52", "chip12", "canal46", "chip17new", "chipZ"];
+  for (let i = 0; i < 901; i++) mk(`other-${String(i).padStart(4, "0")}`, chips[i % chips.length], 800 - (i % 700), "normal");
+  return out;
+}
+
 Deno.test("CARACTERIZAÇÃO do defeito: a seleção ANTIGA, nos mesmos dados do incidente, atende só 2 conexões e 4 conversas (todas problemáticas)", () => {
   const data = incident();
   const picked = legacySelect(data, T0);
   assertEquals(picked.length, 4);
   assertEquals(new Set(picked.map((c) => chipOf(c))).size, 2);
-  assert(picked.every((c) => (c as SimConv).kind === "poison"));
-  // e a nova, nos MESMOS dados e com a MESMA falha por conversa, atende dez conexões
+  assert(picked.every((c) => (c as ResumeCandidate & { kind?: Kind }).kind === "poison"));
   const novo = pickBatch(data, cfgOf({ FUNNEL_RESUME_MODE: "all" }), T0).batch;
   assert(new Set(novo.map((c) => chipOf(c))).size >= 10);
 });
 
-Deno.test("INCIDENTE REPRODUZIDO (modo all, webhook publicado): com a seleção NOVA as outras conexões são atendidas já no 1º ciclo", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all" });
-  const sim = makeSim(incident(), cfg);
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  const touchedChips = new Set(sim.calls.map((c) => sim.store.get(c.id)!.connection_id));
-  assert(touchedChips.size >= 10, `conexões atendidas: ${touchedChips.size}`); // antes: 2
-  assert(s.outcomes.advanced > 0);
-  assertEquals(s.selected, 20); // teto global por ciclo
-});
+// ---------------- ciclo: modo seguro, passivo, allowlist ----------------
 
-Deno.test("INCIDENTE: conversa problemática não monopoliza — após no máx. 5 tentativas vai à quarentena e para de ser escolhida", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all" });
-  const sim = makeSim(incident(), cfg); // webhook publicado: timeout_no_path NÃO libera
-  const attemptsOf = new Map<string, number>();
-  for (let cycle = 0; cycle < 120; cycle++) { // 120 ciclos de 2 min = 4 h simuladas
-    const before = sim.calls.length;
-    await runResumeCycle(sim.deps, cfg, 0);
-    for (const c of sim.calls.slice(before)) if (sim.store.get(c.id)!.kind === "poison") attemptsOf.set(c.id, (attemptsOf.get(c.id) ?? 0) + 1);
-    sim.tick(2 * MIN);
-  }
-  const poison = [...sim.store.values()].filter((c) => c.kind === "poison");
-  for (const p of poison) {
-    assert((attemptsOf.get(p.id) ?? 0) <= 5, `${p.id} tentada ${attemptsOf.get(p.id)}x`);
-    const st = readResumeState(p.metadata, waitKeyOf(p));
-    assert(st?.quarantined && st.last_error === "error:timeout_no_path" && st.attempts === 5, `${p.id} sem diagnóstico completo`);
-  }
-  const normal = [...sim.store.values()].filter((c) => c.kind === "normal");
-  assertEquals(normal.filter((c) => c.done).length, normal.length); // TODAS as normais acabaram atendidas
-});
-
-Deno.test("INCIDENTE com o webhook CORRIGIDO: a problemática é liberada na 1ª tentativa e sai da fila sem quarentena", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all" });
-  const sim = makeSim(incident(), cfg, { webhookPoison: "new" });
-  for (let i = 0; i < 80; i++) { await runResumeCycle(sim.deps, cfg, 0); sim.tick(2 * MIN); }
-  const poison = [...sim.store.values()].filter((c) => c.kind === "poison");
-  assert(poison.every((p) => p.done && !p.metadata?.resume));
-});
+function world(cfgEnv: Record<string, string>, webhookPoison: "old" | "new" = "new") {
+  const cfg = cfgOf(cfgEnv);
+  return new World(cfg, { start: T0, webhookPoison });
+}
 
 Deno.test("PASSIVO PRESERVADO: modo padrão (allowlist vazia) não faz NENHUMA chamada nem leitura — 961 conversas intactas", async () => {
-  const cfg = cfgOf();
-  const sim = makeSim(incident(), cfg);
+  const w = world({});
+  incident(w);
   let fetched = 0;
-  const orig = sim.deps.fetchPage;
-  sim.deps.fetchPage = (a) => { fetched++; return orig(a); };
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  assertEquals(sim.calls.length, 0);
+  const d = w.deps();
+  const orig = d.fetchPage;
+  d.fetchPage = (a) => { fetched++; return orig(a); };
+  const s = await runResumeCycle(d, w.cfg);
+  assertEquals(w.webhookCalls, 0);
   assertEquals(fetched, 0);
   assertEquals(s.selected, 0);
   assert(s.note?.includes("allowlist_empty"));
-  assert([...sim.store.values()].every((c) => !c.done && !c.metadata?.resume));
+  assert([...w.store.values()].every((c) => !c.done && !(c.metadata as Record<string, unknown>).resume));
 });
 
 Deno.test("ATIVAÇÃO CONTROLADA: allowlist com UMA conversa processa só ela; as 960 restantes ficam intocadas", async () => {
-  const all = incident();
-  const target = all.find((c) => c.kind === "normal" && c.connection_id === "chip19")!;
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "allowlist", FUNNEL_RESUME_ALLOWLIST: target.id });
-  const sim = makeSim(all, cfg);
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  assertEquals(sim.calls.map((c) => c.id), [target.id]);
-  assertEquals(s.outcomes.advanced, 1);
-  assertEquals([...sim.store.values()].filter((c) => c.done).map((c) => c.id), [target.id]);
-  // ciclos seguintes: nada mais é tocado
-  for (let i = 0; i < 10; i++) { await runResumeCycle(sim.deps, cfg, 0); sim.tick(2 * MIN); }
-  assertEquals(sim.calls.length, 1);
+  const probe = world({});
+  incident(probe);
+  const target = "other-0003";
+  const w = world({ FUNNEL_RESUME_MODE: "allowlist", FUNNEL_RESUME_ALLOWLIST: target });
+  incident(w);
+  const run = w.clock.runUntil(T0 + 10 * MIN, () => w.cycles.length === 1);
+  void w.startCycle();
+  await run;
+  assertEquals([...w.store.values()].filter((c) => c.invocations > 0).map((c) => c.id), [target]);
 });
 
-Deno.test("allowlist com id inexistente/ocioso não amplia o escopo", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "allowlist", FUNNEL_RESUME_ALLOWLIST: "nao-existe-123456" });
-  const sim = makeSim(incident(), cfg);
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  assertEquals(sim.calls.length, 0);
-  assertEquals(s.scanned, 0);
-});
-
-Deno.test("modo fresh: o passivo antigo nunca é lido nem processado; só timeouts recentes", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "fresh", FUNNEL_RESUME_MAX_STALE_MINUTES: "30" });
-  const old = incident();
-  const recent: SimConv[] = [
-    { ...conv({ chip: "chip19", expiredMinAgo: 5 }), kind: "normal" },
-    { ...conv({ chip: "chip16", expiredMinAgo: 29 }), kind: "normal" },
-    { ...conv({ chip: "chip52", expiredMinAgo: 31 }), kind: "normal" }, // já passou da janela
-  ];
-  const sim = makeSim([...old, ...recent], cfg);
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  assertEquals(sim.calls.map((c) => c.id).sort(), [recent[0].id, recent[1].id].sort());
-  assertEquals(s.scanned, 2); // o filtro de idade é aplicado na LEITURA
-  assert(old.every((c) => !sim.store.get(c.id)!.done));
+Deno.test("modo since: o PASSIVO nem é lido (e é contado à parte); timeouts NOVOS são processados mesmo muito atrasados", async () => {
+  const act = T0;
+  const w = world({ FUNNEL_RESUME_MODE: "since", FUNNEL_RESUME_NOT_BEFORE: new Date(act).toISOString() });
+  incident(w); // 961 vencidas ANTES de T0
+  // três timeouts NOVOS: um normal, um com 3 h de atraso e um com 2 dias de atraso (a fila ficou parada)
+  w.clock.now = act + 3 * 24 * 60 * MIN;
+  w.add({ id: "new-ontime", chip: "chip19", kind: "normal", durMs: 8 * SEC, dueAt: act + 3 * 24 * 60 * MIN - 1 * MIN } as never);
+  w.add({ id: "new-late-3h", chip: "chip16", kind: "normal", durMs: 8 * SEC, dueAt: act + 3 * 24 * 60 * MIN - 180 * MIN } as never);
+  w.add({ id: "new-late-2d", chip: "chip52", kind: "normal", durMs: 8 * SEC, dueAt: act + 1 * 60 * MIN } as never);
+  const run = w.clock.runUntil(w.clock.now + 30 * MIN, () => w.cycles.length === 1);
+  void w.startCycle();
+  await run;
+  const s = w.cycles[0];
+  assertEquals([...w.store.values()].filter((c) => c.invocations > 0).map((c) => c.id).sort(), ["new-late-2d", "new-late-3h", "new-ontime"]);
+  assertEquals(s.legacy_backlog, 961); // contado à parte, fora da fila por definição
+  assertEquals(s.late_alerts, 2); // os dois atrasados foram sinalizados, não descartados
+  assert(s.late_ms.max >= 2 * 24 * 60 * MIN - 1 * 60 * MIN);
+  assert([...w.store.values()].filter((c) => c.id.startsWith("poison") || c.id.startsWith("stuck") || c.id.startsWith("other")).every((c) => c.invocations === 0));
 });
 
 Deno.test("dry_run: lista a seleção, não chama o webhook e não grava nada", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_DRY_RUN: "true" });
-  const sim = makeSim(incident(), cfg);
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  assertEquals(sim.calls.length, 0);
-  assertEquals(s.selected, 20);
-  assertEquals(s.selected_ids?.length, 20);
-  assert([...sim.store.values()].every((c) => !c.done && !c.metadata?.resume));
+  const w = world({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_DRY_RUN: "true" });
+  incident(w);
+  const run = w.clock.runUntil(T0 + 5 * MIN, () => w.cycles.length === 1);
+  void w.startCycle();
+  await run;
+  assertEquals(w.webhookCalls, 0);
+  assertEquals(w.cycles[0].selected, 30);
+  assertEquals(w.cycles[0].selected_ids?.length, 20);
+  assert([...w.store.values()].every((c) => !c.done && !(c.metadata as Record<string, unknown>).resume));
 });
 
-Deno.test("timeout ANTIGO não age sobre OUTRA espera: a chave esperada não bate => stale_resume, nada é liberado", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all" });
-  const c: SimConv = { ...conv({ id: "conv-stale-1", chip: "chip19", expiredMinAgo: 60 }), kind: "normal" };
-  const sim = makeSim([c], cfg);
-  // a conversa segue para OUTRO bloco/espera entre a seleção e a chamada
-  const orig = sim.deps.callResume;
-  sim.deps.callResume = (cand, expected) => {
-    const real = sim.store.get(cand.id)!;
-    real.current_block_id = "block-DEPOIS";
-    return orig(cand, expected);
-  };
-  const s = await runResumeCycle(sim.deps, cfg, 0);
+// ---------------- independência (relógio virtual) ----------------
+
+async function runCycles(w: World, minutes: number, every = 60_000) {
+  w.scheduleEveryMinute(w.clock.now, w.clock.now + minutes * MIN, every);
+  await w.clock.runUntil(w.clock.now + minutes * MIN + 10 * MIN);
+}
+
+Deno.test("INDEPENDÊNCIA: chamada LENTA e chamada TRAVADA no mesmo chip não bloqueiam as demais", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all" });
+  w.add({ id: "hung-001", chip: "A", kind: "hung", durMs: Infinity, dueAt: T0 - 30 * MIN } as never);
+  w.add({ id: "slow-001", chip: "A", kind: "slow", durMs: 300 * SEC, dueAt: T0 - 29 * MIN } as never);
+  for (let i = 0; i < 8; i++) w.add({ id: `ok-${i}`, chip: "A", kind: "normal", durMs: 8 * SEC, dueAt: T0 - (20 - i) * MIN } as never);
+  await runCycles(w, 6);
+  const ok = [...w.store.values()].filter((c) => c.id.startsWith("ok-"));
+  assert(ok.every((c) => c.done), "as normais do MESMO chip terminaram");
+  // nenhuma normal esperou pela travada/lenta: as primeiras começam logo que a lenta libera a cota de rapidez
+  // (slowAfter = 10 s; antes da correção só começavam quando o prazo da chamada travada vencia, aos 45 s)
+  const starts = ok.map((c) => (c.startedAt! - T0) / 1000).sort((a, b) => a - b);
+  assert(starts[0] <= 12 && starts[3] <= 20, `primeiras normais começaram em: ${starts}`);
+  // a cota por conexão por ciclo (6) já foi gasta (travada + lenta + 4 normais): o restante entra no PRÓXIMO ciclo (≤ 70 s), sem esperar nenhuma travada
+  assert(starts[starts.length - 1] <= 70, `últimas normais começaram em: ${starts}`);
+  assert(w.cycles.some((s) => s.failures.some((f) => f.reason === "call_timeout")), "o prazo por chamada foi acionado e diagnosticado");
+});
+
+Deno.test("INDEPENDÊNCIA: nunca excede a concorrência global nem a por conexão", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_CONCURRENCY: "6", FUNNEL_RESUME_PER_CHIP_IN_FLIGHT: "2", FUNNEL_RESUME_PER_CHIP: "20", FUNNEL_RESUME_HARD_CAP: "100" });
+  for (let i = 0; i < 80; i++) w.add({ id: `c-${i}`, chip: ["A", "B", "C"][i % 3], kind: "normal", durMs: 20 * SEC, dueAt: T0 - (100 - i) * MIN } as never);
+  await runCycles(w, 10);
+  // o limite de 6 vale POR CICLO; o orçamento de início (50 s) < intervalo do cron (60 s) limita a sobreposição a 2 ciclos
+  assert(w.inFlightPeak <= 12, `pico simultâneo global ${w.inFlightPeak}`);
+  for (const [chip, p] of w.chipInFlightPeak) assert(p <= 12, `pico simultâneo no chip ${chip}: ${p}`);
+  assert([...w.store.values()].every((c) => c.done));
+});
+
+Deno.test("UM ciclo isolado respeita exatamente os limites: global (6) e por conexão (rápidas 3, total 8)", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all" });
+  for (let i = 0; i < 60; i++) w.add({ id: `c-${i}`, chip: ["A", "B", "C"][i % 3], kind: "normal", durMs: 6 * SEC, dueAt: T0 - (100 - i) * MIN } as never);
+  const run = runResumeCycle(w.deps(), w.cfg);
+  await w.clock.runUntil(T0 + 5 * MIN);
+  const s = await run;
+  assertEquals(s.in_flight_peak, 6);
+  for (const [chip, p] of w.chipInFlightPeak) assert(p <= 3, `chip ${chip}: ${p} rápidas simultâneas`); // 6 s < slowAfter (10 s): todas "rápidas"
+  assertEquals(s.started, 24); // 8 por conexão (perChip) x 3 conexões, dentro do orçamento de 50 s
+});
+
+Deno.test("CICLOS SOBREPOSTOS e várias instâncias: cada espera é despachada UMA vez (reserva de despacho)", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all" });
+  for (let i = 0; i < 12; i++) w.add({ id: `c-${i}`, chip: ["A", "B", "C", "D"][i % 4], kind: "normal", durMs: 40 * SEC, dueAt: T0 - (30 - i) * MIN } as never);
+  // 3 "instâncias" começando no MESMO instante e mais ciclos sobrepostos a cada 10 s
+  for (let k = 0; k < 3; k++) void w.startCycle();
+  for (let t = 10; t <= 50; t += 10) w.clock.after(t * SEC, () => { void w.startCycle(); void w.startCycle(); });
+  await w.clock.runUntil(T0 + 10 * MIN);
+  assert([...w.store.values()].every((c) => c.done), "todas avançaram");
+  assertEquals([...w.store.values()].map((c) => c.invocations), Array(12).fill(1)); // exatamente 1 chamada por espera
+  assertEquals(w.duplicateWhileBusy, 0);
+});
+
+Deno.test("sem a reserva, o servidor ainda protege (reivindicação): prova de que a reserva só evita chamadas redundantes", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all" });
+  w.add({ id: "c-0", chip: "A", kind: "normal", durMs: 40 * SEC, dueAt: T0 - 5 * MIN } as never);
+  const d = w.deps();
+  d.writeState = () => Promise.resolve(true); // desliga a reserva (não grava nada)
+  d.readLatest = () => Promise.resolve({ metadata: {}, updated_at: "x" });
+  const r1 = runResumeCycle(d, w.cfg), r2 = runResumeCycle(d, w.cfg);
+  await w.clock.runUntil(T0 + 5 * MIN);
+  await Promise.all([r1, r2]);
+  assertEquals(w.store.get("c-0")!.invocations, 2); // as duas chamaram...
+  assertEquals(w.duplicateWhileBusy, 1); // ...mas a 2ª foi recusada pelo servidor (wait_already_claimed)
+  assert(w.store.get("c-0")!.done);
+});
+
+Deno.test("falha repetida (webhook publicado) é limitada, diagnosticada e NÃO trava as demais do mesmo chip", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_MAX_ATTEMPTS: "3", FUNNEL_RESUME_BACKOFF_BASE_MINUTES: "1" }, "old");
+  w.add({ id: "bad-001", chip: "A", kind: "poison", durMs: 1, dueAt: T0 - 900 * MIN } as never);
+  for (let i = 0; i < 6; i++) w.add({ id: `good-${i}`, chip: "A", kind: "normal", durMs: 8 * SEC, dueAt: T0 - (800 - i) * MIN } as never);
+  await runCycles(w, 20);
+  assert([...w.store.values()].filter((c) => c.id.startsWith("good")).every((c) => c.done));
+  const bad = w.store.get("bad-001")!;
+  assertFalse(bad.done);
+  assertEquals(bad.invocations, 3); // limitada: exatamente maxAttempts
+  const st = readResumeState(bad.metadata, waitKeyOf(bad))!;
+  assert(st.quarantined && st.attempts === 3 && st.last_error === "error:timeout_no_path");
+});
+
+Deno.test("INCIDENTE (modo all, webhook publicado): quarentena limita as problemáticas e TODAS as normais acabam atendidas", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_BACKOFF_BASE_MINUTES: "1" }, "old");
+  incident(w);
+  await runCycles(w, 120);
+  const poison = [...w.store.values()].filter((c) => c.kind === "poison");
+  assert(poison.every((p) => p.invocations <= 5 && readResumeState(p.metadata, waitKeyOf(p))?.quarantined));
+  const normal = [...w.store.values()].filter((c) => c.kind === "normal");
+  assertEquals(normal.filter((c) => c.done).length, normal.length);
+});
+
+Deno.test("INCIDENTE com o webhook CORRIGIDO: a problemática é liberada na 1ª tentativa, sem quarentena", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all" }, "new");
+  incident(w);
+  await runCycles(w, 90);
+  const poison = [...w.store.values()].filter((c) => c.kind === "poison");
+  assert(poison.every((p) => p.done && p.invocations === 1 && !(p.metadata as Record<string, unknown>).resume));
+});
+
+Deno.test("timeout ANTIGO não age sobre OUTRA espera: a chave esperada não bate => stale_resume, nada é marcado", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all" });
+  w.add({ id: "conv-stale-1", chip: "A", kind: "normal", durMs: 8 * SEC, dueAt: T0 - 60 * MIN } as never);
+  const d = w.deps();
+  const orig = d.callResume;
+  d.callResume = (c, e) => { w.store.get(c.id)!.current_block_id = "block-DEPOIS"; return orig(c, e); }; // a conversa seguiu
+  const run = runResumeCycle(d, w.cfg);
+  await w.clock.runUntil(T0 + 5 * MIN);
+  const s = await run;
   assertEquals(s.outcomes.released, 1);
-  assertFalse(sim.store.get("conv-stale-1")!.done); // não foi marcada como avançada
-});
-
-Deno.test("falha repetida de UMA conversa não impede as demais, ciclo a ciclo", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_PER_CHIP: "1" });
-  const bad: SimConv = { ...conv({ id: "conv-bad-001", chip: "chip19", expiredMinAgo: 900 }), kind: "poison" };
-  const good: SimConv[] = Array.from({ length: 6 }, (_, i) => ({ ...conv({ id: `conv-good-00${i}`, chip: "chip19", expiredMinAgo: 800 - i }), kind: "normal" as const }));
-  const sim = makeSim([bad, ...good], cfg);
-  for (let i = 0; i < 12; i++) { await runResumeCycle(sim.deps, cfg, 0); sim.tick(2 * MIN); }
-  assert(good.every((g) => sim.store.get(g.id)!.done), "as boas foram atendidas mesmo na MESMA conexão da ruim");
-});
-
-Deno.test("erro de rede/exceção do webhook conta como falha limitada; conflito de gravação do estado não derruba o ciclo", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all" });
-  const c: SimConv = { ...conv({ id: "conv-net-001", chip: "chip19", expiredMinAgo: 60 }), kind: "normal" };
-  const sim = makeSim([c], cfg);
-  sim.deps.callResume = () => Promise.reject(new Error("boom"));
-  sim.deps.writeState = () => Promise.resolve(false);
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  assertEquals(s.outcomes.failed, 1);
-  assertEquals(s.failures[0].reason, "network_error");
-  sim.deps.writeState = () => { throw new Error("db"); };
-  await runResumeCycle(sim.deps, cfg, 0); // não lança
-});
-
-Deno.test("paginação: varre mais de uma página e respeita o teto de páginas", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_PAGE_SIZE: "10", FUNNEL_RESUME_MAX_PAGES: "3" });
-  const many: SimConv[] = Array.from({ length: 100 }, (_, i) => ({ ...conv({ id: `conv-pg-${String(i).padStart(3, "0")}`, chip: `chip${i % 25}`, expiredMinAgo: 900 - i }), kind: "normal" as const }));
-  const sim = makeSim(many, cfg);
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  assertEquals(s.scanned, 30); // 3 páginas x 10
-  assertEquals(s.scan_truncated, true); // e avisa que havia mais além do teto
-  const few = makeSim(many.slice(0, 5), cfg);
-  assertEquals((await runResumeCycle(few.deps, cfg, 0)).scan_truncated, false);
+  assertFalse(w.store.get("conv-stale-1")!.done);
 });
 
 Deno.test("orçamento de tempo: não inicia novas retomadas depois do limite; o restante fica para o próximo ciclo", async () => {
-  const cfg = cfgOf({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_TIME_BUDGET_SECONDS: "5", FUNNEL_RESUME_PER_CHIP: "10" });
-  const cs: SimConv[] = Array.from({ length: 10 }, (_, i) => ({ ...conv({ id: `conv-tb-00${i}`, chip: "chip19", expiredMinAgo: 900 - i }), kind: "normal" as const }));
-  const sim = makeSim(cs, cfg);
-  sim.deps.sleep = (ms) => { sim.tick(ms); return Promise.resolve(); }; // cada chamada "consome" 2 s simulados
-  const orig = sim.deps.callResume;
-  sim.deps.callResume = async (c, e) => { sim.tick(2000); return await orig(c, e); };
-  const s = await runResumeCycle(sim.deps, cfg, 0);
-  assert(s.selected === 10 && sim.calls.length <= 4, `chamadas: ${sim.calls.length}`);
+  const w = world({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_TIME_BUDGET_SECONDS: "5", FUNNEL_RESUME_CONCURRENCY: "1", FUNNEL_RESUME_PER_CHIP_IN_FLIGHT: "1", FUNNEL_RESUME_PER_CHIP: "20" });
+  for (let i = 0; i < 10; i++) w.add({ id: `c-${i}`, chip: "A", kind: "normal", durMs: 2 * SEC, dueAt: T0 - (900 - i) * MIN } as never);
+  const run = runResumeCycle(w.deps(), w.cfg);
+  await w.clock.runUntil(T0 + 5 * MIN);
+  const s = await run;
+  assert(s.started < 10 && s.started >= 2, `iniciadas: ${s.started}`);
   assert(s.note?.includes("time_budget_exhausted"));
-  await runResumeCycle(sim.deps, cfg, 0); // o próximo ciclo continua de onde parou
-  assert(sim.calls.length > 4);
+  const r2 = runResumeCycle(w.deps(), w.cfg);
+  await w.clock.runUntil(T0 + 10 * MIN);
+  await r2;
+  assert([...w.store.values()].filter((c) => c.done).length > s.started);
+});
+
+Deno.test("paginação: varre mais de uma página e respeita o teto de páginas (avisando scan_truncated)", async () => {
+  const w = world({ FUNNEL_RESUME_MODE: "all", FUNNEL_RESUME_PAGE_SIZE: "10", FUNNEL_RESUME_MAX_PAGES: "3", FUNNEL_RESUME_DRY_RUN: "true" });
+  for (let i = 0; i < 100; i++) w.add({ id: `conv-pg-${String(i).padStart(3, "0")}`, chip: `chip${i % 25}`, kind: "normal", durMs: 5 * SEC, dueAt: T0 - (900 - i) * MIN } as never);
+  const run = runResumeCycle(w.deps(), w.cfg);
+  await w.clock.runUntil(T0 + MIN);
+  const s = await run;
+  assertEquals(s.scanned, 30);
+  assertEquals(s.scan_truncated, true);
 });

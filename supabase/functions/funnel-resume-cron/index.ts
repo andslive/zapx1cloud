@@ -31,6 +31,9 @@ Deno.serve(async (req) => {
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, serviceKey);
     const cfg = parseResumeConfig((k) => Deno.env.get(k));
+    const cycleStart = Date.now();
+    // chamadas que passaram do prazo do ciclo mas seguem em andamento (não são abortadas)
+    const detached: Promise<unknown>[] = [];
 
     const deps: CycleDeps = {
       now: () => Date.now(),
@@ -52,21 +55,28 @@ Deno.serve(async (req) => {
         return (data ?? []) as ResumeCandidate[];
       },
       callResume: async (c, expected) => {
-        try {
-          const response = await fetch(`${supabaseUrl}/functions/v1/uazapi-webhook`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${serviceKey}`,
-              "apikey": serviceKey,
-            },
-            body: JSON.stringify({ action: "resume_funnel", conversationId: c.id, expected_wait: expected }),
-          });
-          const body = await response.json().catch(() => null);
-          return { status: response.status, body };
-        } catch (_e) {
-          return { status: null, body: null };
+        // Prazo por chamada: ao estourar, o cron PARA DE ESPERAR (libera a vaga para as demais) mas NÃO
+        // aborta a conexão — abortar poderia interromper, dependendo do runtime, uma execução que já
+        // está enviando mensagens. A chamada pendente segue viva até o fim do ciclo (ver `detached`).
+        const call = fetch(`${supabaseUrl}/functions/v1/uazapi-webhook`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${serviceKey}`,
+            "apikey": serviceKey,
+          },
+          body: JSON.stringify({ action: "resume_funnel", conversationId: c.id, expected_wait: expected }),
+        }).then(async (response) => ({ status: response.status as number | null, body: await response.json().catch(() => null) }))
+          .catch(() => ({ status: null as number | null, body: null }));
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), cfg.callTimeoutMs); });
+        const winner = await Promise.race([call, timeout]);
+        if (timer !== undefined) clearTimeout(timer);
+        if (winner === "timeout") {
+          detached.push(call);
+          return { status: null, body: null, timedOut: true };
         }
+        return winner;
       },
       readLatest: async (id) => {
         const { data } = await supabase.from("webchat_conversations").select("metadata, updated_at").eq("id", id).maybeSingle();
@@ -81,13 +91,29 @@ Deno.serve(async (req) => {
           .select("id");
         return !error && Array.isArray(data) && data.length > 0;
       },
-      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      after: (ms, fn) => { setTimeout(fn, ms); },
+      countBacklog: async (beforeIso) => {
+        const { count } = await supabase
+          .from("webchat_conversations")
+          .select("id", { count: "exact", head: true })
+          .eq("status", "bot_active")
+          .lt("bot_locked_until", beforeIso)
+          .not("current_block_id", "is", null);
+        return count ?? 0;
+      },
       // diagnóstico estruturado, sem dados pessoais (só ids de conversa e motivos)
       log: (msg, extra) => console.warn(`[funnel-resume-cron] ${msg}`, JSON.stringify(extra ?? {})),
     };
 
     const s = await runResumeCycle(deps, cfg);
-    console.log("[funnel-resume-cron] ciclo", JSON.stringify({ mode: s.mode, scanned: s.scanned, eligible: s.eligible, selected: s.selected, outcomes: s.outcomes, skipped: s.skipped, note: s.note }));
+    // mantém a função viva por uma tolerância final para as chamadas pendentes concluírem (limite total ~130 s)
+    if (detached.length > 0) {
+      let t: ReturnType<typeof setTimeout> | undefined;
+      const grace = new Promise<void>((r) => { t = setTimeout(r, Math.max(0, 130_000 - (Date.now() - cycleStart))); });
+      await Promise.race([Promise.allSettled(detached), grace]);
+      if (t !== undefined) clearTimeout(t);
+    }
+    console.log("[funnel-resume-cron] ciclo", JSON.stringify({ mode: s.mode, scanned: s.scanned, eligible: s.eligible, selected: s.selected, started: s.started, outcomes: s.outcomes, skipped: s.skipped, late_ms: s.late_ms, late_alerts: s.late_alerts, call_timeouts: s.call_timeouts, legacy_backlog: s.legacy_backlog, in_flight_peak: s.in_flight_peak, duration_ms: s.duration_ms, note: s.note }));
 
     const attempted = s.outcomes.advanced + s.outcomes.released + s.outcomes.busy + s.outcomes.failed;
     return new Response(
@@ -100,6 +126,14 @@ Deno.serve(async (req) => {
         mode: s.mode,
         dry_run: s.dry_run,
         scan_truncated: s.scan_truncated,
+        started: s.started,
+        late_ms: s.late_ms,
+        late_alerts: s.late_alerts,
+        call_timeouts: s.call_timeouts,
+        detached_calls: detached.length,
+        legacy_backlog: s.legacy_backlog,
+        in_flight_peak: s.in_flight_peak,
+        duration_ms: s.duration_ms,
         eligible: s.eligible,
         outcomes: s.outcomes,
         skipped: s.skipped,
