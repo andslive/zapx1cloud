@@ -122,7 +122,7 @@ export async function persistLidEvidence(
  * continua trazendo o par verdadeiro (`chatid`, `sender_lid`, `sender_pn`, `sender`).
  *
  * Só é chamada quando o remetente derivado == número do chip. Devolve o primeiro JID de pessoa (`@lid` ou
- * `@s.whatsapp.net`) que NÃO seja o do chip e NÃO seja de grupo; null se não houver evidência (nada muda).
+ * `@s.whatsapp.net`) que NÃO seja o do chip; null se o evento for de GRUPO (qualquer indício) ou se não houver evidência (nada muda).
  */
 export function recoverPeerJidWhenChatIsOwn(payload: unknown, ownDigits: string): string | null {
   if (!ownDigits) return null;
@@ -130,6 +130,12 @@ export function recoverPeerJidWhenChatIsOwn(payload: unknown, ownDigits: string)
   const d = (root.data && typeof root.data === "object" ? root.data : root) as Record<string, any>;
   const msg = (d.message && typeof d.message === "object" ? d.message : {}) as Record<string, any>;
   const chat = (d.chat && typeof d.chat === "object" ? d.chat : {}) as Record<string, any>;
+  // Grupo: o participante NUNCA pode ser tratado como lead em conversa individual.
+  const isGroupJid = (v: unknown) => typeof v === "string" && /@g\.us$/i.test(v.trim());
+  if (
+    msg.isGroup === true || chat.wa_isGroup === true || d.isGroup === true ||
+    [msg.chatid, msg.sender, chat.wa_chatid, chat.wa_chatlid, d.chatid].some(isGroupJid)
+  ) return null;
   const candidates: unknown[] = [msg.chatid, msg.sender_lid, msg.sender_pn, chat.wa_chatlid, msg.sender];
   for (const c of candidates) {
     if (typeof c !== "string") continue;

@@ -149,7 +149,7 @@ Deno.test("recoverPeerJidWhenChatIsOwn: devolve o par verdadeiro do `message` (L
 
 Deno.test("recoverPeerJidWhenChatIsOwn: usa os demais campos na ordem e ignora o próprio chip e grupos", () => {
   assertEquals(recoverPeerJidWhenChatIsOwn({ chat: { wa_chatlid: LID15 }, message: { chatid: `${OWN}@s.whatsapp.net` } }, OWN), LID15);
-  assertEquals(recoverPeerJidWhenChatIsOwn({ message: { chatid: "120363000000000000@g.us", sender_pn: "5511999990001@s.whatsapp.net" } }, OWN), "5511999990001@s.whatsapp.net");
+  assertEquals(recoverPeerJidWhenChatIsOwn({ message: { chatid: `${OWN}@s.whatsapp.net`, sender_pn: "5511999990001@s.whatsapp.net" } }, OWN), "5511999990001@s.whatsapp.net");
   assertEquals(recoverPeerJidWhenChatIsOwn({ message: { chatid: `${OWN}:7@s.whatsapp.net`, sender: `${OWN}@s.whatsapp.net` } }, OWN), null); // só o chip
 });
 
@@ -158,5 +158,17 @@ Deno.test("recoverPeerJidWhenChatIsOwn: sem evidência ou entradas estranhas => 
     assertEquals(recoverPeerJidWhenChatIsOwn(p, OWN), null);
   }
   assertEquals(recoverPeerJidWhenChatIsOwn({ message: { chatid: LID15 } }, ""), null); // sem número do chip não há como comparar
+});
+
+Deno.test("recoverPeerJidWhenChatIsOwn: GRUPO nunca devolve o participante como se fosse lead (qualquer indício de grupo => null)", () => {
+  const participant = "5511999990001@s.whatsapp.net";
+  const G = "120363000000000000@g.us";
+  for (const p of [
+    { chat: { wa_chatid: `${OWN}@s.whatsapp.net` }, message: { chatid: G, sender_pn: participant } },
+    { chat: { wa_chatid: `${OWN}@s.whatsapp.net`, wa_isGroup: true }, message: { chatid: LID15, sender_pn: participant } },
+    { chat: { wa_chatid: `${OWN}@s.whatsapp.net` }, message: { chatid: LID15, isGroup: true, sender_pn: participant } },
+    { chat: { wa_chatid: G, wa_chatlid: LID15 }, message: { chatid: LID15, sender_pn: participant } },
+    { data: { chat: { wa_chatid: `${OWN}@s.whatsapp.net` }, message: { chatid: G, sender: participant } } },
+  ]) assertEquals(recoverPeerJidWhenChatIsOwn(p, OWN), null);
 });
 
