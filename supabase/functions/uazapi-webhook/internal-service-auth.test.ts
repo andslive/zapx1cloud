@@ -104,7 +104,7 @@ Deno.test("autenticação ocorre antes de qualquer leitura/lease/mutação: o ga
   assertEquals(gateIdx < convFetchIdx, true, "auth deve rodar antes da leitura de webchat_conversations do resume_funnel");
 });
 
-Deno.test("execute_recovery e execute_silent_recovery são rejeitados incondicionalmente (400, sem detalhe interno) antes de alcançar seus próprios handlers", async () => {
+Deno.test("execute_silent_recovery segue rejeitada incondicionalmente (400, sem detalhe interno); execute_recovery só passa com a credencial interna de serviço", async () => {
   const src = await readIndexSource();
   const rejectIdx = src.indexOf("Allowlist estrita");
   const executeRecoveryHandlerIdx = src.indexOf('if (action === "execute_recovery" && (payload as any).recoveryId) {');
@@ -112,28 +112,35 @@ Deno.test("execute_recovery e execute_silent_recovery são rejeitados incondicio
   assertEquals(rejectIdx > 0, true);
   assertEquals(executeRecoveryHandlerIdx > 0, true);
   assertEquals(executeSilentHandlerIdx > 0, true);
-  // O bloco de rejeição precisa vir ANTES dos dois handlers antigos --
-  // torna-os definitivamente inalcançáveis (dead code), sem precisar
-  // deletá-los (fora do escopo desta correção: lógica de recibos).
-  assertEquals(rejectIdx < executeRecoveryHandlerIdx, true);
+  // execute_silent_recovery: o bloco de rejeição vem ANTES do handler e a
+  // allowlist não a inclui -- continua inalcançável.
   assertEquals(rejectIdx < executeSilentHandlerIdx, true);
-  // A rejeição não revela nenhum detalhe interno -- só um código genérico.
-  // Isola só o corpo da resposta JSON efetivamente enviada ao cliente
-  // (não os comentários explicativos ao redor, que legitimamente citam
-  // execute_recovery/execute_silent_recovery por nome).
-  const responseBodyIdx = src.indexOf("JSON.stringify({ ok: false, error: \"unsupported_action\" })", rejectIdx);
-  assertEquals(responseBodyIdx > 0 && responseBodyIdx < rejectIdx + 1100, true);
-  const responseBody = src.slice(responseBodyIdx, responseBodyIdx + 60);
-  assertEquals(responseBody.toLowerCase().includes("recovery"), false, "o corpo da resposta não deve mencionar execute_recovery/recibo, só o código genérico");
-  const rejectBlock = src.slice(rejectIdx, rejectIdx + 1100);
+  const rejectBlock = src.slice(rejectIdx, rejectIdx + 1200);
+  assertEquals(rejectBlock.includes('action !== "execute_silent_recovery"'), false);
   assertEquals(rejectBlock.includes('"unsupported_action"'), true);
   assertEquals(rejectBlock.includes("status: 400"), true);
+  // A rejeição não revela nenhum detalhe interno -- só um código genérico.
+  const responseBodyIdx = src.indexOf("JSON.stringify({ ok: false, error: \"unsupported_action\" })", rejectIdx);
+  assertEquals(responseBodyIdx > 0 && responseBodyIdx < rejectIdx + 1200, true);
+  const responseBody = src.slice(responseBodyIdx, responseBodyIdx + 60);
+  assertEquals(responseBody.toLowerCase().includes("recovery"), false);
+  // execute_recovery: aceita pela allowlist, mas SOMENTE depois do mesmo
+  // gate de autenticação interna de resume_funnel, que precisa rodar antes
+  // do handler (e portanto antes de qualquer leitura/escrita dele).
+  assertEquals(rejectBlock.includes('action !== "execute_recovery"'), true);
+  const authGateIdx = src.indexOf('if (action === "execute_recovery") {');
+  assertEquals(authGateIdx > rejectIdx, true, "gate de auth deve existir depois da allowlist");
+  assertEquals(authGateIdx < executeRecoveryHandlerIdx, true, "auth deve rodar antes do handler de execute_recovery");
+  const authBlock = src.slice(authGateIdx, authGateIdx + 700);
+  assertEquals(authBlock.includes("evaluateResumeFunnelInternalAuth"), true);
+  assertEquals(authBlock.includes('recoveryAuthResult !== "match"'), true);
+  assertEquals(authBlock.includes("status: 401"), true);
 });
 
 Deno.test("action interna desconhecida (qualquer valor não vazio diferente de resume_funnel, incluindo debug-insert-tracking) é rejeitada com 400", async () => {
   const src = await readIndexSource();
   const rejectIdx = src.indexOf("Allowlist estrita");
-  const block = src.slice(rejectIdx, rejectIdx + 1100);
+  const block = src.slice(rejectIdx, rejectIdx + 1200);
   // A allowlist agora só verifica resume_funnel -- nenhuma outra exceção
   // (nem debug-insert-tracking) sobrevive.
   assertEquals(block.includes('action !== "resume_funnel"'), true);
@@ -153,7 +160,7 @@ Deno.test("debug-insert-tracking, como qualquer action não reconhecida, recebe 
   // A allowlist rejeita qualquer action !== resume_funnel incondicionalmente
   // -- debug-insert-tracking cai nesse caminho igual a qualquer outra string
   // não reconhecida, sem branch dedicado.
-  const block = src.slice(rejectIdx, rejectIdx + 1100);
+  const block = src.slice(rejectIdx, rejectIdx + 1200);
   assertEquals(block.includes('action !== "resume_funnel"'), true);
   assertEquals(/action\s*!==\s*"resume_funnel"\s*&&\s*action\s*!==\s*"debug-insert-tracking"/.test(block), false);
 });

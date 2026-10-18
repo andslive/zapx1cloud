@@ -2838,7 +2838,7 @@ Deno.serve(async (req) => {
     // 1d2ec5a, Fase 19O).
     if (
       typeof action === "string" && action.length > 0 &&
-      action !== "resume_funnel"
+      action !== "resume_funnel" && action !== "execute_recovery"
     ) {
       return new Response(
         JSON.stringify({ ok: false, error: "unsupported_action" }),
@@ -2857,6 +2857,27 @@ Deno.serve(async (req) => {
         console.warn(
           "[uazapi-webhook] resume_funnel internal auth rejected:",
           internalAuthResult,
+        );
+        return new Response(
+          JSON.stringify({ ok: false, error: "unauthorized" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+    }
+
+    // `execute_recovery` (recuperação controlada de comprovantes — incidente de
+    // crédito OpenAI) é aceita SOMENTE com a mesma credencial interna de
+    // serviço exigida por `resume_funnel`. `execute_silent_recovery` segue
+    // bloqueada na allowlist acima.
+    if (action === "execute_recovery") {
+      const recoveryAuthResult = evaluateResumeFunnelInternalAuth(
+        req.headers.get("Authorization"),
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY"),
+      );
+      if (recoveryAuthResult !== "match") {
+        console.warn(
+          "[uazapi-webhook] execute_recovery internal auth rejected:",
+          recoveryAuthResult,
         );
         return new Response(
           JSON.stringify({ ok: false, error: "unauthorized" }),
