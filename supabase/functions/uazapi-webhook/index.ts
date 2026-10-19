@@ -23,6 +23,7 @@ import {
   outboundCountUnchanged,
   resolveOriginalEventTime,
 } from "../_shared/receipt-recovery.ts";
+import { parseMoneyAmount } from "../_shared/money-normalize.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -9430,19 +9431,10 @@ Mensagem do lead:
                 }
 
                 const normalizeDeterministicReceiptValue = (rawValue: string): string => {
-                  let cleaned = String(rawValue || "").replace(/[^\d.,]/g, "").trim();
-                  if (!cleaned) return "";
-                  const lastComma = cleaned.lastIndexOf(",");
-                  const lastDot = cleaned.lastIndexOf(".");
-                  if (lastComma >= 0 && lastDot >= 0) {
-                    cleaned = lastComma > lastDot
-                      ? cleaned.replace(/\./g, "").replace(",", ".")
-                      : cleaned.replace(/,/g, "");
-                  } else if (lastComma >= 0) {
-                    cleaned = cleaned.replace(",", ".");
-                  }
-                  const parsed = parseFloat(cleaned);
-                  return Number.isFinite(parsed) && parsed > 0 ? parsed.toFixed(2) : "";
+                  // Interpretação única BRL/COP (ver _shared/money-normalize.ts): "10.000" = 10000,
+                  // nunca 10. Ambíguo/inválido => "" (sem valor).
+                  const parsed = parseMoneyAmount(rawValue);
+                  return parsed !== null ? parsed.toFixed(2) : "";
                 };
 
                 const extractDeterministicReceiptFromOcr = (ocrText: string) => {
@@ -10474,21 +10466,10 @@ FORMATO JSON:
                       ).trim();
                       let extractedValue = String(result.value || "0").trim();
 
-                      // Cleanup value: handle BR currency formats precisely
-                      // "R$ 1.500,00" -> "1500.00"
-                      // "316" -> "316.00"
-                      extractedValue = extractedValue.replace(/[^\d.,]/g, "");
-                      
-                      if (extractedValue.includes(",") && extractedValue.includes(".")) {
-                        // "1.500,00" -> remove all dots, then replace comma with dot
-                        extractedValue = extractedValue.replace(/\./g, "").replace(",", ".");
-                      } else if (extractedValue.includes(",")) {
-                        // "316,00" -> "316.00"
-                        extractedValue = extractedValue.replace(",", ".");
-                      }
-                      
-                      // Ensure it's a valid number or default to 0
-                      const finalValueNum = parseFloat(extractedValue);
+                      // Interpretação única BRL/COP (ver _shared/money-normalize.ts):
+                      // "R$ 1.500,00" -> 1500.00 | "$ 10.000" -> 10000.00 | "316" -> 316.00.
+                      // Ambíguo/inválido -> 0.00 (como antes).
+                      const finalValueNum = parseMoneyAmount(extractedValue) ?? NaN;
                       let finalValue = isNaN(finalValueNum) ? "0.00" : finalValueNum.toFixed(2);
 
                       // [FASE 27] Releitura de valor alto antes de gravar.
