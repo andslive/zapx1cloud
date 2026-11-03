@@ -5912,7 +5912,11 @@ Deno.serve(async (req) => {
           );
         }
 
-        // Safety net: fecha qualquer outra conversa aberta do mesmo telefone normalizado
+        // Safety net: fecha qualquer outra conversa aberta do mesmo telefone normalizado.
+        // Não fecha conversa com funil em execução: em mensagens simultâneas (produção não tem
+        // índice único de conversa aberta por telefone) cada requisição fecharia a conversa da
+        // outra e o funil vencedor ficaria fixado numa conversa fechada, sem enviar nada, com o
+        // histórico 'running' impedindo o lead de iniciar esse funil novamente.
         const { error: closeErr } = await supabase
           .from("webchat_conversations")
           .update({ status: "closed", closed_at: new Date().toISOString() })
@@ -5920,7 +5924,8 @@ Deno.serve(async (req) => {
           .eq("visitor_phone_normalized", phoneCanonical)
           .eq("channel", "whatsapp")
           .neq("status", "closed")
-          .neq("id", conversationId);
+          .neq("id", conversationId)
+          .or("current_flow_id.is.null,flow_completed.eq.true");
         if (closeErr) {
           console.warn(
             "[uazapi-webhook] close duplicates warn:",
