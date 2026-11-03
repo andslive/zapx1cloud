@@ -301,6 +301,8 @@ export type FunnelGateResult =
   // legacyMode.
   | { acquired: true; gated: false }
   | { acquired: false; reason: "already_running" }
+  // rejectIfStarted: o lead já iniciou este funil (running/completed/stopped/abandoned).
+  | { acquired: false; reason: "already_started"; status: string }
   | { acquired: false; reason: "missing_lead_id" }
   | { acquired: false; reason: "error"; message: string };
 
@@ -329,8 +331,42 @@ export type FunnelGateResult =
  */
 export async function acquireFunnelRunGate(
   supabase: any,
-  { leadId, funnelId, legacyMode }: { leadId: string | null | undefined; funnelId: string; legacyMode?: boolean },
+  { leadId, funnelId, legacyMode, rejectIfStarted }: {
+    leadId: string | null | undefined;
+    funnelId: string;
+    legacyMode?: boolean;
+    // Regra "cada lead inicia cada funil uma única vez" (entrada AUTOMÁTICA): qualquer histórico
+    // running/completed/stopped/abandoned do mesmo (lead, funil) bloqueia, mesmo antigo. Necessário
+    // porque o trigger de produção (20261102140000) marca como 'stopped' o funil que sai da conversa;
+    // antes, a linha ficava 'running' e o índice único bloqueava a volta por acidente. 'released',
+    // 'reserved' e 'cancelled' não contam como iniciado. Reinício manual do operador não passa por aqui.
+    rejectIfStarted?: boolean;
+  },
 ): Promise<FunnelGateResult> {
+  if (rejectIfStarted && leadId) {
+    const { data: started, error: startedErr } = await supabase
+      .from("lead_funnel_history")
+      .select("id, status")
+      .eq("lead_id", leadId)
+      .eq("funnel_id", funnelId)
+      .in("status", ["running", "completed", "stopped", "abandoned"])
+      .limit(1);
+    if (startedErr) {
+      console.error(
+        "[FUNNEL_GATE] db_error checking started history — funnel NOT started (fail-closed):",
+        JSON.stringify({ lead_id: leadId, funnel_id: funnelId, message: (startedErr as any)?.message }),
+      );
+      return { acquired: false, reason: "error", message: (startedErr as any)?.message || String(startedErr) };
+    }
+    if (Array.isArray(started) && started.length > 0) {
+      console.log(
+        "[FUNNEL_GATE] already_started — entrada automática bloqueada (histórico existente):",
+        JSON.stringify({ lead_id: leadId, funnel_id: funnelId, status: started[0]?.status }),
+      );
+      return { acquired: false, reason: "already_started", status: String(started[0]?.status ?? "") };
+    }
+  }
+
   // legacyMode: rollout gradual via conversation_isolation_feature_flags
   // (migration 20260827145000). Enquanto a flag estiver desligada para a
   // organização, replica EXATAMENTE o comportamento pré-existente
@@ -4681,6 +4717,7 @@ Deno.serve(async (req) => {
                 leadId,
                 funnelId: cand.id,
                 legacyMode: !conversationIsolationEnabled,
+                rejectIfStarted: true,
               });
               if (!reopenGate.acquired) {
                 console.log(
@@ -4951,6 +4988,7 @@ Deno.serve(async (req) => {
                 leadId: convData?.lead_id,
                 funnelId: cand.id,
                 legacyMode: !conversationIsolationEnabled,
+                rejectIfStarted: true,
               });
               if (!existingGate.acquired) {
                 console.log(
@@ -5591,6 +5629,7 @@ Deno.serve(async (req) => {
               leadId: lead?.id,
               funnelId: cand.id,
               legacyMode: !conversationIsolationEnabled,
+                rejectIfStarted: true,
             });
             if (!newGate.acquired) {
               console.log(

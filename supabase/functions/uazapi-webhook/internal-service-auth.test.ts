@@ -94,7 +94,7 @@ Deno.test("autenticação ocorre antes de qualquer leitura/lease/mutação: o ga
   const gateIdx = src.indexOf('if (action === "resume_funnel") {\n      const internalAuthResult');
   const webhookLogsInsertIdx = src.indexOf('await supabase.from("webhook_logs").insert({');
   const leaseIdx = src.indexOf('acquire_conversation_lease');
-  const convFetchIdx = src.indexOf('"visitor_phone_normalized, evolution_instance_id, organization_id, visitor_name, current_flow_id, current_block_id, status, flow_source, flow_completed, flow_variables, lead_id"');
+  const convFetchIdx = src.indexOf('"visitor_phone_normalized, evolution_instance_id, organization_id, visitor_name, current_flow_id, current_block_id, status, flow_source, flow_completed, flow_variables, lead_id, metadata"');
   assertEquals(gateIdx > 0, true, "gate precisa existir");
   assertEquals(webhookLogsInsertIdx > 0, true);
   assertEquals(leaseIdx > 0, true);
