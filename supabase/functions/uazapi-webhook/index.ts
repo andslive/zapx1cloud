@@ -24,6 +24,7 @@ import {
   resolveOriginalEventTime,
 } from "../_shared/receipt-recovery.ts";
 import { parseMoneyAmount } from "../_shared/money-normalize.ts";
+import { runPinWithFallback } from "./pin-fallback.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -253,6 +254,29 @@ async function isDuplicateInboundMessage(
     (error as any).message,
   );
   return false;
+}
+
+/**
+ * Somente leitura (não registra nada): a mensagem já foi aceita antes? Usado para NÃO iniciar funil
+ * numa reentrega do mesmo webhook — o dedup que registra a mensagem roda depois da resolução do
+ * funil, e sem esta checagem uma reentrega fixaria o funil e seria descartada como duplicada,
+ * deixando o funil fixado sem execução.
+ */
+async function wasInboundMessageAlreadyProcessed(
+  supabase: any,
+  instanceId: string | null,
+  messageId: string | null,
+): Promise<boolean> {
+  if (!messageId || !instanceId) return false;
+  const { data, error } = await supabase
+    .from("processed_messages")
+    .select("message_id")
+    .eq("instance_id", instanceId)
+    .eq("message_id", messageId)
+    .limit(1)
+    .maybeSingle();
+  if (error) return false; // fail-open: o dedup posterior continua valendo
+  return !!data;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -4611,6 +4635,14 @@ Deno.serve(async (req) => {
       // histórico entre conexões é, deliberadamente, uma operação manual
       // futura, fora deste webhook.
       let conversationId: string | null = null;
+      const inboundAlreadyProcessed = await wasInboundMessageAlreadyProcessed(
+        supabase,
+        instance.id,
+        norm.messageId || null,
+      );
+      if (inboundAlreadyProcessed) {
+        console.log("[FUNNEL_ENTRY] skip_entry_redelivered_message", JSON.stringify({ message_id: norm.messageId }));
+      }
       let existing: { id: string } | null = null;
 
       // Busca por telefone NORMALIZADO (canonical BR) + MESMA conexão que
@@ -4713,6 +4745,7 @@ Deno.serve(async (req) => {
               // Gate atômico: adquire o direito de rodar ANTES de setar
               // qualquer coisa na conversa. Se outra conexão já está com
               // este (lead_id, funnel_id) running, não inicia aqui.
+              if (inboundAlreadyProcessed) continue;
               const reopenGate = await acquireFunnelRunGate(supabase, {
                 leadId,
                 funnelId: cand.id,
@@ -4776,11 +4809,34 @@ Deno.serve(async (req) => {
           // Reabre a mesma conversa em vez de criar uma nova: preserva histórico.
           // CAS em status='closed': se outra requisição concorrente já reabriu
           // esta mesma conversa, não sobrescrevemos o funil que ela já fixou.
-          const reopenResult = await pinConversationFunnelOnReopenCAS(
-            supabase,
-            existingByPhone.id,
-            updatePayload,
+          let reopenAttempt = await runPinWithFallback(
+            () => pinConversationFunnelOnReopenCAS(supabase, existingByPhone.id, updatePayload),
+            { label: "reopen" },
           );
+          if (!reopenAttempt.ok && funnelToRunReopen) {
+            // K8: recusa (P0001) ou deadlock esgotado ao fixar o funil. Libera o gate (sem linha
+            // 'running' órfã) e reabre a conversa SEM funil, preservando a mensagem recebida.
+            console.warn(
+              "[FUNNEL_ENTRY] pin_failed_fallback_no_funnel",
+              JSON.stringify({ ctx: "reopen", conversation_id: existingByPhone.id, funnel_id: funnelToRunReopen.id, kind: reopenAttempt.kind }),
+            );
+            if (funnelToRunReopenGateHistoryId) {
+              await releaseFunnelRunGate(supabase, funnelToRunReopenGateHistoryId);
+              funnelToRunReopenGateHistoryId = null;
+            }
+            funnelToRunReopen = null;
+            delete (payload as any).__is_new_funnel;
+            for (const k of ["current_flow_id", "current_block_id", "flow_variables", "flow_completed", "flow_source", "current_agent_id"]) {
+              delete updatePayload[k];
+            }
+            updatePayload.status = "human_active";
+            reopenAttempt = await runPinWithFallback(
+              () => pinConversationFunnelOnReopenCAS(supabase, existingByPhone.id, updatePayload),
+              { label: "reopen_no_funnel" },
+            );
+          }
+          if (!reopenAttempt.ok) throw reopenAttempt.error;
+          const reopenResult = reopenAttempt.value;
           if (!reopenResult.won) {
             console.warn(
               "[FUNNEL_RESOLUTION] reopen race lost — conversation already reopened by a concurrent request:",
@@ -4984,6 +5040,7 @@ Deno.serve(async (req) => {
               // Gate atômico: adquire o direito de rodar ANTES de setar
               // qualquer coisa na conversa. Se outra conexão já está com
               // este (lead_id, funnel_id) running, não inicia aqui.
+              if (inboundAlreadyProcessed) continue;
               const existingGate = await acquireFunnelRunGate(supabase, {
                 leadId: convData?.lead_id,
                 funnelId: cand.id,
@@ -5025,12 +5082,28 @@ Deno.serve(async (req) => {
             // CAS: só fixa se current_flow_id ainda for o mesmo do snapshot lido
             // em convData — evita duas mensagens quase simultâneas iniciarem
             // funis diferentes para a mesma conversa.
-            const pinResult = await pinConversationFunnelCAS(
-              supabase,
-              existing.id,
-              convData?.current_flow_id ?? null,
-              updateData,
+            const pinAttempt = await runPinWithFallback(
+              () => pinConversationFunnelCAS(supabase, existing.id, convData?.current_flow_id ?? null, updateData),
+              { label: "existing" },
             );
+            if (!pinAttempt.ok) {
+              // K8: recusa (P0001) ou deadlock esgotado. O UPDATE foi revertido: a conversa segue como
+              // estava, a mensagem é processada normalmente e a linha 'running' do gate é liberada.
+              console.warn(
+                "[FUNNEL_ENTRY] pin_failed_fallback_no_funnel",
+                JSON.stringify({ ctx: "existing", conversation_id: existing.id, funnel_id: funnelToRunExisting.id, kind: pinAttempt.kind }),
+              );
+              if (funnelToRunExistingGateHistoryId) {
+                await releaseFunnelRunGate(supabase, funnelToRunExistingGateHistoryId);
+                funnelToRunExistingGateHistoryId = null;
+              }
+              delete (payload as any).__is_new_funnel;
+              delete (payload as any).__trigger_message_id;
+            }
+            // Em falha, segue como "corrida perdida": mantém o funil atual da conversa, sem execução nova.
+            const pinResult = pinAttempt.ok
+              ? pinAttempt.value
+              : { won: false, current_flow_id: convData?.current_flow_id ?? null, current_block_id: convData?.current_block_id ?? null };
             const wonPinning = pinResult.won;
             const finalFunnelId = wonPinning ? funnelToRunExisting.id : pinResult.current_flow_id;
 
@@ -5625,6 +5698,7 @@ Deno.serve(async (req) => {
             // Gate atômico: adquire o direito de rodar ANTES de setar
             // qualquer coisa na conversa nova. Se outra conexão já está com
             // este (lead_id, funnel_id) running, não inicia aqui.
+            if (inboundAlreadyProcessed) continue;
             const newGate = await acquireFunnelRunGate(supabase, {
               leadId: lead?.id,
               funnelId: cand.id,
@@ -5707,6 +5781,9 @@ Deno.serve(async (req) => {
         const ctwaSnapshot = (lead as any)?.__ctwa_snapshot;
         if (ctwaSnapshot) newConv.ctwa_data = ctwaSnapshot;
 
+        // Cópia sem funil, usada no fallback de K8 (recusa/deadlock ao fixar o funil na criação).
+        const newConvNoFunnel: any = structuredClone(newConv);
+
         // If a funnel matches, the funnel takes over: bot_active + flow state set
         if (funnelToRun && funnelToRun.start_block_id) {
           newConv.status = "bot_active";
@@ -5740,11 +5817,33 @@ Deno.serve(async (req) => {
           );
         }
 
-        const { data: created, error: convErr } = await supabase
-          .from("webchat_conversations")
-          .insert(newConv)
-          .select("id")
-          .single();
+        const insertConv = async (row: any) => {
+          const r = await supabase.from("webchat_conversations").insert(row).select("id").single();
+          // O deadlock chega como erro do PostgREST; relança para o retry limitado tratar.
+          if (r.error && (r.error.code === "40P01" || /deadlock detected/i.test(String(r.error.message ?? "")))) throw r.error;
+          return r;
+        };
+        let insertAttempt = await runPinWithFallback(() => insertConv(newConv), { label: "new" });
+        let insertRes: any = insertAttempt.ok ? insertAttempt.value : { data: null, error: insertAttempt.error };
+        const refusedByPin = !!(insertRes.error && funnelToRun && insertRes.error.code !== "23505");
+        if (refusedByPin) {
+          // K8: o INSERT com funil foi recusado (P0001 do trigger) ou deu deadlock esgotado; a conversa
+          // NÃO foi criada. Libera o gate e cria a conversa SEM funil, para a mensagem recebida ser salva.
+          console.warn(
+            "[FUNNEL_ENTRY] pin_failed_fallback_no_funnel",
+            JSON.stringify({ ctx: "new", funnel_id: funnelToRun!.id, code: insertRes.error.code ?? null }),
+          );
+          if (funnelToRunGateHistoryId) {
+            await releaseFunnelRunGate(supabase, funnelToRunGateHistoryId);
+            funnelToRunGateHistoryId = null;
+          }
+          funnelToRun = null;
+          delete (payload as any).__is_new_funnel;
+          delete (payload as any).__trigger_message_id;
+          insertAttempt = await runPinWithFallback(() => insertConv(newConvNoFunnel), { label: "new_no_funnel" });
+          insertRes = insertAttempt.ok ? insertAttempt.value : { data: null, error: insertAttempt.error };
+        }
+        const { data: created, error: convErr } = insertRes;
 
         if (created?.id) {
           conversationId = created.id;

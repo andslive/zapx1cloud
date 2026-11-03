@@ -212,8 +212,9 @@ Deno.test("Parte B: compensação (releaseFunnelRunGate) é chamada quando a cor
   const src = await Deno.readTextFile(new URL("./index.ts", import.meta.url));
   const occurrences = src.split("await releaseFunnelRunGate(supabase,").length - 1;
   // existing (CAS de conversa aberta), reopen (CAS de reabertura), e o
-  // branch de erro na criação da conversa nova (convErr) = 3 pontos.
-  assertEquals(occurrences, 3);
+  // branch de erro na criação da conversa nova (convErr) = 3 pontos; mais 3 do fallback de K8
+  // (pin recusado/deadlock esgotado em reopen, existing e new) = 6.
+  assertEquals(occurrences, 6);
 });
 
 Deno.test("Parte B: acquireFunnelRunGate e releaseFunnelRunGate são exportados (testáveis isoladamente)", async () => {
