@@ -1,6 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneBR } from "../_shared/phone.ts";
 import { resolveUazapiRecipient } from "../_shared/uazapi-recipient.ts";
+import { buildCopyButtonMenuPayload } from "../_shared/copy-button.ts";
 import { dispatchMetaCloudSend, type MetaCloudSendType } from "../_shared/meta-cloud-dispatch.ts";
 
 const corsHeaders = {
@@ -427,6 +428,26 @@ export async function handleUazapiSendRequest(req: Request): Promise<Response> {
              // If the button failed, use the text response as the main result
              if (!res.ok) res = textRes;
           }
+          break;
+        }
+        case "copy_button": {
+          // POST /send/menu type=button, text=U+200B (sem legenda visível; "" dá 400), imagem opcional em `file`.
+          // Sem fallback de texto/legenda: se a UazAPI rejeitar, o erro é devolvido como está.
+          const menuPayload = buildCopyButtonMenuPayload({
+            number: uazNumber,
+            label: String(payload.label ?? ""),
+            value: String(payload.value ?? ""),
+            imageUrl: payload.url ?? payload.file ?? null,
+          });
+          if (!menuPayload) {
+            return new Response(JSON.stringify({
+              success: false,
+              error_code: "UAZAPI_SEND_FAILED",
+              step_failed: "COPY_BUTTON_INVALID_PAYLOAD",
+              message: "copy_button requer rótulo e valor a copiar",
+            }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+          }
+          res = await uazFetch(url, apiKey, "/send/menu", menuPayload);
           break;
         }
         default:

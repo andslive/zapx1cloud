@@ -8224,6 +8224,33 @@ Mensagem do lead:
                 currentBlock = findBlock(nextBlockId);
                 break;
               }
+              case "copy_button": {
+                const copyLabel = replaceVars(b.data?.copy_label || "");
+                const copyValue = replaceVars(b.data?.copy_value || "");
+                if (copyLabel.trim() && copyValue.trim()) {
+                  const delay = b.data.delay_ms || 0;
+                  console.log(`[copy_button_block_enter] flow_id=${funnel.id} block_id=${b.id} conversation_id=${conversationId} has_image=${!!b.data?.image_url}`);
+                  chunksToSend.push({
+                    type: "copy_button",
+                    // `url` (imagem) passa pelo refresh/validação de mídia do loop de envio.
+                    payload: {
+                      url: b.data?.image_url || undefined,
+                      label: copyLabel,
+                      value: copyValue,
+                    },
+                    show_typing: false,
+                    delay: pendingDelayMs + delay,
+                    source_block_id: b.id,
+                  });
+                } else {
+                  console.warn(`[copy_button_validation_failed] flow_id=${funnel.id} block_id=${b.id} - Missing copy_label or copy_value`);
+                }
+                // Não espera o clique: segue para o próximo bloco.
+                pendingDelayMs = 0;
+                nextBlockId = b.next_block_id || null;
+                currentBlock = findBlock(nextBlockId);
+                break;
+              }
               case "pixel": {
                 pixelEnteredThisLoop = true;
                 const pageId = b.data?.pixel_page_id;
@@ -11237,7 +11264,11 @@ FORMATO JSON:
               console.log(`[uazapi-webhook] [STEP_FINISH] ${stepId}`);
 
               // Persist message to DB so it shows up in the inbox
-              const text = typeof chunk.payload === "string"
+              // copy_button: o histórico do CRM mostra só um marcador; o valor a
+              // copiar (chave) NÃO é gravado no texto exibido.
+              const text = chunk.type === "copy_button"
+                ? "[Botão Copiar]"
+                : typeof chunk.payload === "string"
                 ? chunk.payload
                 : (chunk.payload?.text || chunk.payload?.caption || "");
               if (text || chunk.type !== "text") {
