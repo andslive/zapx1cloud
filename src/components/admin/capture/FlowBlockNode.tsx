@@ -72,6 +72,7 @@ const BLOCK_ICONS: Record<FunnelBlockType, React.ComponentType<{ className?: str
   link: ExternalLink,
   delay: Clock,
   pix_button: CreditCard,
+  copy_button: Copy,
   input: FormInput,
   wait_response: Clock,
   quick_form: ClipboardList,
@@ -174,6 +175,8 @@ function getBlockPreview(block: FunnelBlock): string {
       return block.data.success_message?.substring(0, 40) || 'Finalizar';
     case 'pix_button':
       return `${block.data.pix_type || 'PIX'} → ${block.data.pix_key || '...'}`;
+    case 'copy_button':
+      return block.data.copy_label || 'Botão Copiar';
     case 'pixel':
       return `${block.data.pixel_event_type || 'Evento'} → ${block.data.pixel_name || 'Pixel'}`;
 

@@ -27,6 +27,7 @@ export type ExperienceBlockType =
   | 'link'         // Link clicável
   | 'pix_button'   // Botão de pagamento PIX
   | 'pixel'        // Facebook Pixel tracking
+  | 'copy_button'  // Botão Copiar (imagem opcional + botão que copia um valor)
   | 'delay';       // Pausa/timing
 
 // Tipo de incorporação de vídeo
@@ -276,6 +277,10 @@ export interface FunnelBlockData {
   pix_type?: 'CPF' | 'CNPJ' | 'PHONE' | 'EMAIL' | 'EVP';
   pix_key?: string;
   pix_name?: string;
+
+  // Botão Copiar (imagem usa image_url)
+  copy_label?: string;
+  copy_value?: string;
   
   // Criar Tarefa
   task_config?: CreateTaskConfig;
@@ -684,6 +689,14 @@ export const FUNNEL_BLOCK_PALETTE: BlockPaletteItem[] = [
     label: 'Pixel Facebook', 
     icon: '🎯', 
     description: 'Trackear conversão no FB', 
+    category: 'experience',
+    color: 'bg-blue-500'
+  },
+  { 
+    type: 'copy_button', 
+    label: 'Botão Copiar', 
+    icon: '📋', 
+    description: 'Imagem opcional + botão que copia um valor', 
     category: 'experience',
     color: 'bg-blue-500'
   },
@@ -1215,6 +1228,11 @@ Não consigo te orientar sobre isso por aqui 🙏
         url: '',
         method: 'POST',
       };
+      break;
+    case 'copy_button':
+      block.data.image_url = '';
+      block.data.copy_label = 'Copiar llave Bre-B';
+      block.data.copy_value = '';
       break;
     case 'pixel':
       block.data.pixel_event_type = 'Purchase';
