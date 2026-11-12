@@ -39,6 +39,7 @@ import {
   UserCog,
   Mic,
   CreditCard,
+  Copy,
   BrainCircuit,
 } from 'lucide-react';
 
@@ -57,6 +58,7 @@ const BLOCK_ICONS: Record<FunnelBlockType, React.ComponentType<{ className?: str
   link: ExternalLink,
   delay: Clock,
   pix_button: CreditCard,
+  copy_button: Copy,
   pixel: Zap,
   input: FormInput,
   wait_response: Clock,

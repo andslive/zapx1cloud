@@ -39,6 +39,7 @@ import {
   Clock,
   Dices,
   CreditCard,
+  Copy,
   HelpCircle,
   RefreshCw,
   MoreVertical,
@@ -116,6 +117,7 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
       case 'wait_response': return Clock;
       case 'ia_pergunta': return HelpCircle;
       case 'pix_button': return CreditCard;
+      case 'copy_button': return Copy;
       case 'input': return Monitor;
       case 'buttons': return Plus;
       case 'ai_decide': return Brain;
@@ -1399,6 +1401,37 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
                   </SelectContent>
                 </Select>
               </div>
+            </div>
+          </div>
+        )}
+
+        {block.type === 'copy_button' && (
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label className="text-xs font-semibold">Imagem (opcional)</Label>
+              <FileAndMediaUpload
+                value={block.data.image_url}
+                onChange={(url) => updateData('image_url', url)}
+                type="image"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs font-semibold">Rótulo do botão</Label>
+              <Input
+                value={block.data.copy_label ?? ''}
+                onChange={(e) => updateData('copy_label', e.target.value)}
+                placeholder="Ex: Copiar llave Bre-B"
+                className="h-8 text-xs"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs font-semibold">Valor a copiar</Label>
+              <Input
+                value={block.data.copy_value ?? ''}
+                onChange={(e) => updateData('copy_value', e.target.value)}
+                placeholder="Texto que será copiado ao tocar no botão"
+                className="h-8 text-xs font-mono"
+              />
             </div>
           </div>
         )}
