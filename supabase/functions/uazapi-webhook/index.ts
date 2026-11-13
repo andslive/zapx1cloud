@@ -8289,6 +8289,13 @@ Mensagem do lead:
                 if (_answer && _need === "email") {
                   if (/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(_answer)) flowVariables["__charge_asked_email"] = _answer;
                 }
+                if (_answer) {
+                  // A resposta ao pedido de nome/e-mail foi consumida AQUI: o bloco seguinte (ex.: Reconhecer
+                  // comprovante) não pode tratá-la como mensagem nova do lead.
+                  const _mid = (norm as any)?.messageId;
+                  if (!Array.isArray(flowVariables["__consumed_input_message_ids"])) flowVariables["__consumed_input_message_ids"] = [];
+                  if (_mid && !flowVariables["__consumed_input_message_ids"].includes(_mid)) flowVariables["__consumed_input_message_ids"].push(_mid);
+                }
                 delete flowVariables["__charge_answer"];
                 delete flowVariables["__charge_need"];
 
