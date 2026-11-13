@@ -15,3 +15,7 @@ verify_jwt = false
 verify_jwt = false
 [functions.receipt-recovery-runner]
 verify_jwt = true
+
+# Cadastro de contas de gateway de pagamento (autenticado por JWT do usuário).
+[functions.payment-gateways-api]
+verify_jwt = true
