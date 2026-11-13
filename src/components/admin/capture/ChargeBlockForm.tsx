@@ -213,26 +213,26 @@ export function ChargeBlockForm({ block, updateMany }: Props) {
             <div className="space-y-1">
               <Label className="text-[11px]">E-mail (exigido pelo OXXO)</Label>
               <div className="flex gap-2">
-                <Select value={draft.payer_email_mode} onValueChange={(v) => set('payer_email_mode', v as 'auto' | 'variable' | 'random')}>
+                <Select value={draft.payer_email_mode} onValueChange={(v) => set('payer_email_mode', v as 'auto' | 'variable' | 'ask')}>
                   <SelectTrigger className="h-8 w-32 text-xs"><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="random">Aleatório</SelectItem>
-                    <SelectItem value="auto">Do lead (pergunta se faltar)</SelectItem>
+                    <SelectItem value="auto">Automático</SelectItem>
+                    <SelectItem value="ask">Perguntar ao lead</SelectItem>
                     <SelectItem value="variable">Variável</SelectItem>
                   </SelectContent>
                 </Select>
-                {draft.payer_email_mode === 'random' && (
-                  <Input value={draft.payer_email_domain ?? ''} onChange={(e) => set('payer_email_domain', e.target.value)} placeholder="example.com" className="h-8 text-xs font-mono" />
+                {(draft.payer_email_mode === 'auto' || draft.payer_email_mode === 'random') && (
+                  <Input value={draft.payer_email_domain ?? ''} onChange={(e) => set('payer_email_domain', e.target.value)} placeholder="gmail.com" className="h-8 text-xs font-mono" />
                 )}
                 {draft.payer_email_mode === 'variable' && (
                   <Input value={draft.payer_email_var ?? ''} onChange={(e) => set('payer_email_var', e.target.value)} placeholder="{{email}}" className="h-8 text-xs font-mono" />
                 )}
               </div>
-              {draft.payer_email_mode === 'random' && (
-                <p className="text-[10px] text-muted-foreground">Usa o e-mail do lead se existir; senão gera nome+4 dígitos@domínio (ex.: ana0042@{draft.payer_email_domain || 'example.com'}) e não pergunta nada ao lead. O padrão é example.com, domínio reservado que não recebe e-mail; informe um domínio seu se quiser.</p>
+              {(draft.payer_email_mode === 'auto' || draft.payer_email_mode === 'random') && (
+                <p className="text-[10px] text-muted-foreground">Usa o e-mail do lead se existir; senão gera nome.sobrenome + 3 dígitos@domínio (ex.: anderson.silva001@{draft.payer_email_domain || 'gmail.com'}) e não pergunta nada ao lead. O domínio é editável ao lado.</p>
               )}
-              {draft.payer_email_mode === 'auto' && (
-                <p className="text-[10px] text-muted-foreground">E-mail do lead. Se faltar, o bot pergunta só o e-mail.</p>
+              {draft.payer_email_mode === 'ask' && (
+                <p className="text-[10px] text-muted-foreground">Se o lead não tiver e-mail, o bot pergunta só o e-mail e retoma a mesma execução.</p>
               )}
             </div>
           )}
