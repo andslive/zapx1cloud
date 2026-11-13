@@ -1,5 +1,5 @@
 // Execução do bloco `charge` dentro do funil: carrega conta/segredo, resolve dados e gera o instrumento.
-import { createCharge, type ChargeRow, type ChargeStore, type GatewayVars, varsFromCharge } from "./charge.ts";
+import { createCharge, parseAmount, type ChargeRow, type ChargeStore, type GatewayVars, varsFromCharge } from "./charge.ts";
 import type { FetchFn } from "./types.ts";
 
 export function supabaseChargeStore(sb: any): ChargeStore {
@@ -57,6 +57,18 @@ function roundFor(flowVariables: Record<string, any>, blockId: string, prev: Cha
   return r;
 }
 
+/** Cobrança aberta que já não corresponde à configuração atual do bloco (conta, meio ou valor). */
+export function isChargeStale(
+  prev: Pick<ChargeRow, "status" | "gateway_account_id" | "method" | "amount"> | null,
+  accountId: string, method: string, rawAmount: string,
+): boolean {
+  if (!prev || prev.status === "paid") return false;
+  const wantMethod = method.toUpperCase() === "OXXO" ? "OXXO" : "SPEI";
+  const wantAmount = parseAmount(rawAmount);
+  return prev.gateway_account_id !== accountId || prev.method !== wantMethod ||
+    (wantAmount !== null && Number(prev.amount) !== Number(wantAmount));
+}
+
 export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOutcome> {
   const { sb, blockData: d } = ctx;
   // A organização vem SEMPRE da conversa (fonte de verdade), nunca só do objeto em memória do chamador.
@@ -85,9 +97,15 @@ export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOu
   // Cobrança já vinculada a esta execução/bloco?
   const linked = ctx.flowVariables.__gateway;
   let prev: ChargeRow | null = null;
+  let prevStale: ChargeRow | null = null;
   if (linked?.charge_id && linked.block_id === ctx.blockId) {
     const { data } = await sb.from("payment_charges").select("*").eq("id", linked.charge_id).maybeSingle();
     prev = data ?? null;
+    // A cobrança vinculada só vale se ainda corresponde à configuração ATUAL do bloco
+    // (conta, meio e valor). Se o bloco foi reconfigurado, ela é de outra configuração:
+    // não é reaproveitada nem entregue, e a execução abre uma nova rodada.
+    const staleConfig = isChargeStale(prev, account.id, String(d.method ?? ""), ctx.replaceVars(d.amount ?? ""));
+    if (staleConfig) { prevStale = prev; prev = null; }
     if (prev && prev.status === "paid") {
       return { kind: "advance", chargeId: prev.id, vars: tag(varsFromCharge(prev), { provider: prev.provider, method: prev.method }) };
     }
@@ -95,7 +113,7 @@ export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOu
       return { kind: "advance", chargeId: prev.id, vars: tag(varsFromCharge(prev), { provider: prev.provider, method: prev.method }) };
     }
   }
-  const round = roundFor(ctx.flowVariables, ctx.blockId, prev);
+  const round = roundFor(ctx.flowVariables, ctx.blockId, prev) + (prevStale ? 1 : 0);
   if (round > 1) {
     ctx.flowVariables.__charge_rounds = { ...(ctx.flowVariables.__charge_rounds ?? {}), [ctx.blockId]: round };
   }
