@@ -29,14 +29,14 @@ const PROVIDER_LABEL: Record<GatewayProvider, string> = { colocapay: 'ColocaPay'
 
 type Draft = Pick<FunnelBlock['data'],
   | 'gateway_provider' | 'gateway_account_id' | 'charge_currency' | 'amount_mode' | 'amount' | 'method'
-  | 'payer_name_mode' | 'payer_name_var' | 'payer_email_mode' | 'payer_email_var'
+  | 'payer_name_mode' | 'payer_name_var' | 'payer_email_mode' | 'payer_email_var' | 'payer_email_domain'
   | 'ask_name_message' | 'ask_email_message'>;
 
 const pickDraft = (d: FunnelBlock['data']): Draft => ({
   gateway_provider: d.gateway_provider, gateway_account_id: d.gateway_account_id, charge_currency: d.charge_currency ?? 'MXN',
   amount_mode: d.amount_mode ?? 'fixed', amount: d.amount ?? '', method: d.method,
   payer_name_mode: d.payer_name_mode ?? 'auto', payer_name_var: d.payer_name_var ?? '',
-  payer_email_mode: d.payer_email_mode ?? 'auto', payer_email_var: d.payer_email_var ?? '',
+  payer_email_mode: d.payer_email_mode ?? 'auto', payer_email_var: d.payer_email_var ?? '', payer_email_domain: d.payer_email_domain ?? '',
   ask_name_message: d.ask_name_message ?? '', ask_email_message: d.ask_email_message ?? '',
 });
 
@@ -213,19 +213,26 @@ export function ChargeBlockForm({ block, updateMany }: Props) {
             <div className="space-y-1">
               <Label className="text-[11px]">E-mail (exigido pelo OXXO)</Label>
               <div className="flex gap-2">
-                <Select value={draft.payer_email_mode} onValueChange={(v) => set('payer_email_mode', v as 'auto' | 'variable')}>
+                <Select value={draft.payer_email_mode} onValueChange={(v) => set('payer_email_mode', v as 'auto' | 'variable' | 'random')}>
                   <SelectTrigger className="h-8 w-32 text-xs"><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="auto">Automático</SelectItem>
+                    <SelectItem value="random">Aleatório</SelectItem>
+                    <SelectItem value="auto">Do lead (pergunta se faltar)</SelectItem>
                     <SelectItem value="variable">Variável</SelectItem>
                   </SelectContent>
                 </Select>
+                {draft.payer_email_mode === 'random' && (
+                  <Input value={draft.payer_email_domain ?? ''} onChange={(e) => set('payer_email_domain', e.target.value)} placeholder="example.com" className="h-8 text-xs font-mono" />
+                )}
                 {draft.payer_email_mode === 'variable' && (
                   <Input value={draft.payer_email_var ?? ''} onChange={(e) => set('payer_email_var', e.target.value)} placeholder="{{email}}" className="h-8 text-xs font-mono" />
                 )}
               </div>
+              {draft.payer_email_mode === 'random' && (
+                <p className="text-[10px] text-muted-foreground">Usa o e-mail do lead se existir; senão gera nome+4 dígitos@domínio (ex.: ana0042@{draft.payer_email_domain || 'example.com'}) e não pergunta nada ao lead. O padrão é example.com, domínio reservado que não recebe e-mail; informe um domínio seu se quiser.</p>
+              )}
               {draft.payer_email_mode === 'auto' && (
-                <p className="text-[10px] text-muted-foreground">E-mail do lead. Se faltar, o bot pergunta só o e-mail. Alias automático desativado.</p>
+                <p className="text-[10px] text-muted-foreground">E-mail do lead. Se faltar, o bot pergunta só o e-mail.</p>
               )}
             </div>
           )}
