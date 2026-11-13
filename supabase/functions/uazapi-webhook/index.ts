@@ -7165,6 +7165,7 @@ Deno.serve(async (req) => {
             "ia_pergunta",
             "ai_receipt",
             "charge",
+            "buttons",
           ];
           const isAtInputBlock = currentBlock &&
             inputTypes.includes(String(currentBlock.type).toLowerCase());
@@ -7348,17 +7349,41 @@ Deno.serve(async (req) => {
                 savedValue = processedContent || norm.content || "";
               }
 
-              // Update both the specific variable and the global "resposta" variable
-              flowVariables[varName] = savedValue;
-              flowVariables["resposta"] = savedValue;
+              // Botões / Menu: a resposta (número ou texto da opção) vira o valor da opção e define a saída.
+              let _btnInvalid = false;
+              let _btnRoute: string | null = null;
+              if (currentBlock?.type === "buttons") {
+                const _bopts: any[] = currentBlock.data?.options || [];
+                const _raw = typeof savedValue === "string" ? savedValue.trim() : "";
+                const _normTxt = (t: any) => String(t ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+                let _hit: any = null;
+                if (/^\d{1,2}$/.test(_raw) && Number(_raw) >= 1 && Number(_raw) <= _bopts.length) {
+                  _hit = _bopts[Number(_raw) - 1];
+                } else if (_raw) {
+                  const _n = _normTxt(_raw);
+                  _hit = _bopts.find((o: any) => _normTxt(o.label) === _n || (o.value != null && _normTxt(o.value) === _n)) || null;
+                }
+                if (_hit) {
+                  savedValue = String(_hit.value != null && String(_hit.value) !== "" ? _hit.value : _hit.label);
+                  _btnRoute = _hit.next_block_id || null;
+                } else {
+                  _btnInvalid = true;
+                }
+              }
 
-              // Sincroniza imediatamente com o lead
-              await syncFlowVarsToLead(
-                supabase,
-                conversationId,
-                flowVariables,
-                { onlyKeys: [varName, "resposta"] },
-              );
+              // Update both the specific variable and the global "resposta" variable
+              if (!_btnInvalid) {
+                flowVariables[varName] = savedValue;
+                flowVariables["resposta"] = savedValue;
+
+                // Sincroniza imediatamente com o lead
+                await syncFlowVarsToLead(
+                  supabase,
+                  conversationId,
+                  flowVariables,
+                  { onlyKeys: [varName, "resposta"] },
+                );
+              }
 
               console.log(
                 "[uazapi-webhook] question_answer_saved_variable:",
@@ -7373,7 +7398,15 @@ Deno.serve(async (req) => {
               // de "answer-success" (que avançaria direto para success_next_block_id pulando
               // o case "ai_receipt"). Forçamos a re-entrada no mesmo bloco para que o handler
               // de ai_receipt processe OCR/regex/LLM/fallback e grave as variáveis.
-              if (currentBlock?.type === 'ai_receipt' || currentBlock?.type === 'charge') {
+              if (currentBlock?.type === 'buttons' && _btnInvalid) {
+                // Resposta que não corresponde a nenhuma opção: não grava variável, repete o menu.
+                if (norm.messageId && !consumedIds.includes(norm.messageId)) {
+                  consumedIds.push(norm.messageId);
+                  flowVariables["__consumed_input_message_ids"] = consumedIds;
+                }
+                nextBlockId = currentBlock.id;
+                advancedByInteraction = true;
+              } else if (currentBlock?.type === 'ai_receipt' || currentBlock?.type === 'charge') {
                 console.log('[AI_RECEIPT_INBOUND_ROUTE_ENTERED]', {
                   conversation_id: conversationId,
                   block_id: currentBlock.id,
@@ -7595,6 +7628,8 @@ Mensagem do lead:
                   currentBlock?.data?.sim_next_block_id ||
                   null;
               }
+
+              if (currentBlock?.type === "buttons" && _btnRoute) nextBlockId = _btnRoute;
 
               console.log("[uazapi-webhook] question_success_execute:", {
                 waiting_block_id: waitingBlockId,
@@ -9018,7 +9053,34 @@ Mensagem do lead:
                 });
                 pendingDelayMs = 0;
                 nextBlockId = b.id; // wait here for next user message
+                // Espera a escolha do lead (número ou texto da opção) e grava na variável configurada.
+                {
+                  const _bnow = new Date().toISOString();
+                  const _bvar = String(b.data?.variable_name || "resposta").replace(/{{|}}/g, "") || "resposta";
+                  flowVariables["waiting_for_input"] = true;
+                  flowVariables["__waiting_input"] = {
+                    block_id: b.id,
+                    variable_name: _bvar,
+                    question_sent_at: _bnow,
+                    question_text: header,
+                    timeout_at: new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
+                    is_timeout: false,
+                    success_next_block_id: b.next_block_id || null,
+                    timeout_next_block_id: null,
+                    question_sent: true,
+                    answered: false,
+                    answer_text: null,
+                    answered_at: null,
+                    trigger_message_id: (norm as any)?.messageId || null,
+                  };
+                  await supabase.from("webchat_conversations").update({
+                    flow_variables: flowVariables,
+                    current_block_id: b.id,
+                    flow_completed: false,
+                  }).eq("id", conversationId);
+                }
                 currentBlock = null;
+                safety = 1000;
                 break;
               }
               case "ai_receipt": {
