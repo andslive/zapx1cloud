@@ -69,6 +69,19 @@ export function isChargeStale(
     (wantAmount !== null && Number(prev.amount) !== Number(wantAmount));
 }
 
+/** Domínio reservado (RFC 2606) por padrão: nenhuma pessoa real recebe e-mail nele. */
+export const DEFAULT_ALIAS_DOMAIN = "example.com";
+export function aliasDomain(raw: unknown): string {
+  const d = String(raw ?? "").trim().toLowerCase().replace(/^@/, "");
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d) ? d : DEFAULT_ALIAS_DOMAIN;
+}
+/** Sufixo numérico 0–9999 estável para a mesma execução (replay gera o mesmo e-mail). */
+export function aliasSeqFor(key: string): number {
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+  return h % 10000;
+}
+
 export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOutcome> {
   const { sb, blockData: d } = ctx;
   // A organização vem SEMPRE da conversa (fonte de verdade), nunca só do objeto em memória do chamador.
@@ -150,7 +163,12 @@ export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOu
       conversationId: ctx.conversationId, leadId: ctx.leadId, flowId: ctx.flowId, blockId: ctx.blockId,
       lead, whatsappDisplayName: ctx.whatsappDisplayName,
       askedName: askedName || null, askedEmail: askedEmail || null,
-      aliasConfig: undefined, // alias automático DESATIVADO até domínio operacional + confirmação da LeonaPay
+      // E-mail aleatório só quando o bloco pede (payer_email_mode = "random"): lead.email tem prioridade e,
+      // sem ele, gera nome+4 dígitos@domínio (estável por execução) em vez de pedir ao lead.
+      aliasConfig: d.payer_email_mode === "random"
+        ? { enabled: true, providerAcceptsAlias: true, domain: aliasDomain(d.payer_email_domain) }
+        : undefined,
+      aliasSeq: aliasSeqFor(`${ctx.conversationId}:${ctx.blockId}:${round}`),
     },
   );
 

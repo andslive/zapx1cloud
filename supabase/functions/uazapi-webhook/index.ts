@@ -887,6 +887,8 @@ type Normalized =
     contextInfo?: any;
     createdAt?: number; // Unix timestamp in seconds
     referral?: any;
+    /** Id do botão/linha de lista tocado pelo lead (resposta a /send/menu). */
+    buttonId?: string;
   }
   | {
     kind: "message_delete";
@@ -1586,6 +1588,12 @@ function normalizePayload(payload: any): Normalized | null {
           Math.floor(Date.now() / 1000),
       ),
       referral,
+      buttonId: extractString(
+        msg.buttonOrListid || msg.message?.buttonOrListid || data.buttonOrListid ||
+          msg.message?.buttonsResponseMessage?.selectedButtonId ||
+          msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
+          msg.message?.selectedButtonId || msg.message?.selectedID || "",
+      ),
     };
   }
 
@@ -7357,7 +7365,11 @@ Deno.serve(async (req) => {
                 const _raw = typeof savedValue === "string" ? savedValue.trim() : "";
                 const _normTxt = (t: any) => String(t ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
                 let _hit: any = null;
-                if (/^\d{1,2}$/.test(_raw) && Number(_raw) >= 1 && Number(_raw) <= _bopts.length) {
+                const _bid = String((norm as any)?.buttonId || "");
+                if (_bid) _hit = _bopts.find((o: any) => String(o.id) === _bid) || null;
+                if (_hit) {
+                  // clique no botão: o id identifica a opção
+                } else if (/^\d{1,2}$/.test(_raw) && Number(_raw) >= 1 && Number(_raw) <= _bopts.length) {
                   _hit = _bopts[Number(_raw) - 1];
                 } else if (_raw) {
                   const _n = _normTxt(_raw);
@@ -8296,7 +8308,7 @@ Mensagem do lead:
                     type: "copy_button",
                     // `url` (imagem) passa pelo refresh/validação de mídia do loop de envio.
                     payload: {
-                      url: b.data?.image_url || undefined,
+                      url: replaceVars(b.data?.image_url || "").trim() || undefined,
                       label: copyLabel,
                       value: copyValue,
                     },
@@ -9040,12 +9052,14 @@ Mensagem do lead:
                   b.data?.content || "Escolha uma opção:",
                 );
                 chunksToSend.push({
-                  type: "text",
+                  // Botões de resposta reais do WhatsApp (≤3) ou lista (4–10); reserva numerada no envio.
+                  type: "quick_buttons",
                   payload: {
-                    text: header + "\n\n" +
-                      opts.map((o: any, i: number) =>
-                        `${i + 1}) ${o.emoji ? o.emoji + " " : ""}${o.label}`
-                      ).join("\n"),
+                    text: header,
+                    options: opts.map((o: any) => ({
+                      id: String(o.id),
+                      label: `${o.emoji ? o.emoji + " " : ""}${replaceVars(o.label)}`,
+                    })),
                   },
                   show_typing: b.data.show_typing,
                   typing_duration: b.data.typing_duration_ms,
@@ -11525,6 +11539,8 @@ FORMATO JSON:
               // copiar (chave) NÃO é gravado no texto exibido.
               const text = chunk.type === "copy_button"
                 ? "[Botão Copiar]"
+                : chunk.type === "quick_buttons"
+                ? `${chunk.payload?.text || ""}\n` + (chunk.payload?.options || []).map((o: any) => `[${o.label}]`).join(" ")
                 : typeof chunk.payload === "string"
                 ? chunk.payload
                 : (chunk.payload?.text || chunk.payload?.caption || "");
