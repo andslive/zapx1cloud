@@ -33,7 +33,7 @@ export interface PaymentGatewayAccount {
 export interface PaymentGatewayCatalogEntry {
   provider: GatewayProvider;
   label: string;
-  methods: { method: string; currency: string; requiresAmount: boolean }[];
+  methods: { method: string; currency: string; country?: string; requiresAmount: boolean; supportsAmountless?: boolean }[];
   credential_help: { apiKey: string; webhookSecret: string };
 }
 

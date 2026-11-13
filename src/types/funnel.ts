@@ -28,6 +28,7 @@ export type ExperienceBlockType =
   | 'pix_button'   // Botão de pagamento PIX
   | 'pixel'        // Facebook Pixel tracking
   | 'copy_button'  // Botão Copiar (imagem opcional + botão que copia um valor)
+  | 'charge'       // Cobrança (gera SPEI/OXXO e guarda gateway.* na execução)
   | 'delay';       // Pausa/timing
 
 // Tipo de incorporação de vídeo
@@ -281,6 +282,21 @@ export interface FunnelBlockData {
   // Botão Copiar (imagem usa image_url)
   copy_label?: string;
   copy_value?: string;
+
+  // Cobrança (gateway de pagamento). Segredos NUNCA entram aqui: só o id da conta cadastrada.
+  gateway_provider?: 'colocapay' | 'leonapay';
+  gateway_account_id?: string;
+  charge_currency?: string;            // MXN no piloto
+  amount_mode?: 'fixed' | 'variable'; // valor fixo ou {{variável}}
+  amount?: string;                     // "250.00" ou "{{valor}}"; resolvido e validado no backend
+  method?: 'SPEI' | 'OXXO';
+  payer_name_mode?: 'auto' | 'variable';
+  payer_name_var?: string;
+  payer_email_mode?: 'auto' | 'variable';
+  payer_email_var?: string;
+  ask_name_message?: string;           // pergunta quando falta nome utilizável
+  ask_email_message?: string;          // pergunta quando falta e-mail (OXXO)
+  error_next_block_id?: string;        // saída opcional quando a cobrança falha
   
   // Criar Tarefa
   task_config?: CreateTaskConfig;
@@ -691,6 +707,14 @@ export const FUNNEL_BLOCK_PALETTE: BlockPaletteItem[] = [
     description: 'Trackear conversão no FB', 
     category: 'experience',
     color: 'bg-blue-500'
+  },
+  { 
+    type: 'charge', 
+    label: 'Cobrança', 
+    icon: '💳', 
+    description: 'Gera SPEI (ColocaPay) ou OXXO (LeonaPay) e guarda os dados na execução', 
+    category: 'integration',
+    color: 'bg-emerald-500'
   },
   { 
     type: 'copy_button', 
@@ -1228,6 +1252,13 @@ Não consigo te orientar sobre isso por aqui 🙏
         url: '',
         method: 'POST',
       };
+      break;
+    case 'charge':
+      block.data.charge_currency = 'MXN';
+      block.data.amount_mode = 'fixed';
+      block.data.amount = '';
+      block.data.payer_name_mode = 'auto';
+      block.data.payer_email_mode = 'auto';
       break;
     case 'copy_button':
       block.data.image_url = '';

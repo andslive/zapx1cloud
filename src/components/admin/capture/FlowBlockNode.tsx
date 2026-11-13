@@ -73,6 +73,7 @@ const BLOCK_ICONS: Record<FunnelBlockType, React.ComponentType<{ className?: str
   delay: Clock,
   pix_button: CreditCard,
   copy_button: Copy,
+  charge: CreditCard,
   input: FormInput,
   wait_response: Clock,
   quick_form: ClipboardList,
@@ -177,6 +178,8 @@ function getBlockPreview(block: FunnelBlock): string {
       return `${block.data.pix_type || 'PIX'} → ${block.data.pix_key || '...'}`;
     case 'copy_button':
       return block.data.copy_label || 'Botão Copiar';
+    case 'charge':
+      return block.data.method ? `${block.data.method} · ${block.data.charge_currency || 'MXN'} ${block.data.amount || ''}`.trim() : 'Configurar cobrança...';
     case 'pixel':
       return `${block.data.pixel_event_type || 'Evento'} → ${block.data.pixel_name || 'Pixel'}`;
 
