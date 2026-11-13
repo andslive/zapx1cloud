@@ -34,7 +34,8 @@ export interface ChargeBlockCtx {
   blockData: Record<string, any>;
   conversationId: string;
   flowId: string;
-  organizationId: string;
+  /** Pode vir vazio: o bloco confirma a organização pela própria conversa. */
+  organizationId?: string | null;
   leadId: string | null;
   whatsappDisplayName: unknown;
   flowVariables: Record<string, any>;
@@ -58,12 +59,16 @@ function roundFor(flowVariables: Record<string, any>, blockId: string, prev: Cha
 
 export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOutcome> {
   const { sb, blockData: d } = ctx;
+  // A organização vem SEMPRE da conversa (fonte de verdade), nunca só do objeto em memória do chamador.
+  const { data: convRow } = await sb.from("webchat_conversations").select("organization_id").eq("id", ctx.conversationId).maybeSingle();
+  const orgId: string | null = convRow?.organization_id ?? ctx.organizationId ?? null;
+  if (!orgId) return { kind: "error", retryable: false, vars: { transaction_id: "", payment_code: "", payment_qrcode: "", payment_link: "", expires_at: "", value: "", bank_name: "", beneficiary: "", erro: "account_not_configured", charge_id: "", status: "failed", block_id: ctx.blockId } };
   const tag = <T extends GatewayVars>(v: T, extra: Record<string, string> = {}) => ({ ...v, block_id: ctx.blockId, ...extra } as any);
 
   const accountId = String(d.gateway_account_id ?? "");
   const { data: account } = accountId
     ? await sb.from("payment_gateway_accounts").select("id, organization_id, provider, environment, enabled")
-      .eq("id", accountId).eq("organization_id", ctx.organizationId).maybeSingle()
+      .eq("id", accountId).eq("organization_id", orgId).maybeSingle()
     : { data: null };
   const emptyErr = (code: string): ChargeBlockOutcome => ({
     kind: "error", retryable: false,
@@ -72,7 +77,7 @@ export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOu
   if (!account) return emptyErr("account_not_configured");
 
   const { data: apiKey, error: keyErr } = await sb.rpc("get_payment_gateway_secret", {
-    p_account_id: account.id, p_organization_id: ctx.organizationId, p_secret_kind: "api_key",
+    p_account_id: account.id, p_organization_id: orgId, p_secret_kind: "api_key",
   });
   if (keyErr || typeof apiKey !== "string") return emptyErr("account_not_configured");
 
