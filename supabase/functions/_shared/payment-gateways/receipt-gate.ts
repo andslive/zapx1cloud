@@ -9,13 +9,15 @@ export interface ReceiptGateDeps {
   loadCharge: (id: string) => Promise<{ id: string; status: string; amount: string; paid_amount?: string | null; consumed_at?: string | null; consumed_block_id?: string | null } | null>;
   /** true apenas na PRIMEIRA consumição (consumo atômico no banco). */
   consume: (chargeId: string, blockId: string) => Promise<boolean>;
+  /** Cobrança paga e ainda NÃO entregue do mesmo pedido (a 1ª que ficou pronta). */
+  findDeliverableInOrder: (orderRef: string) => Promise<{ id: string; amount: string; paid_amount?: string | null } | null>;
   /** Consulta autenticada ao gateway e convergência (mesma rotina do webhook). */
   reconcile: (chargeId: string) => Promise<void>;
 }
 
 export async function evaluateReceiptGate(
   deps: ReceiptGateDeps,
-  input: { chargeId: string | null | undefined; blockId: string; leadSentReceipt: boolean; paymentResume: boolean },
+  input: { chargeId: string | null | undefined; orderRef?: string | null; blockId: string; leadSentReceipt: boolean; paymentResume: boolean },
 ): Promise<ReceiptGateDecision> {
   if (!input.chargeId) return { decision: "none" };
   let c = await deps.loadCharge(input.chargeId);
@@ -27,11 +29,17 @@ export async function evaluateReceiptGate(
     c = (await deps.loadCharge(input.chargeId)) ?? c;
   }
 
-  if (c.status === "paid") {
+  // Entrega UMA vez por pedido: qualquer cobrança paga do pedido (SPEI ou OXXO) serve, a 1ª que ainda não foi entregue.
+  if (c.status === "paid" && !c.consumed_at) {
     if (await deps.consume(c.id, input.blockId)) return { decision: "success", chargeId: c.id, paidAmount: c.paid_amount ?? c.amount };
-    // Replay do mesmo bloco após consumo: idempotente, nada é entregue de novo.
-    if (c.consumed_block_id === input.blockId) return { decision: "pending", chargeId: c.id, status: "paid_already_consumed" };
-    return { decision: "pending", chargeId: c.id, status: "paid_elsewhere" }; // 2º pagamento / já entregue
+  }
+  const mate = await deps.findDeliverableInOrder(input.orderRef ?? "");
+  if (mate && await deps.consume(mate.id, input.blockId)) {
+    return { decision: "success", chargeId: mate.id, paidAmount: mate.paid_amount ?? mate.amount };
+  }
+  if (c.status === "paid") {
+    // Replay do mesmo bloco após consumo: idempotente; ou pedido já entregue por outra cobrança.
+    return { decision: "pending", chargeId: c.id, status: c.consumed_block_id === input.blockId ? "paid_already_consumed" : "paid_elsewhere" };
   }
   return { decision: "pending", chargeId: c.id, status: c.status };
 }

@@ -8,7 +8,7 @@ import type { ChargeRow } from "./charge.ts";
  */
 export async function resumeLinkedExecution(
   supabase: any,
-  charge: Pick<ChargeRow, "id" | "conversation_id" | "flow_id" | "block_id">,
+  charge: Pick<ChargeRow, "id" | "conversation_id" | "flow_id" | "block_id" | "order_ref">,
   reason: "paid" | "instructions",
 ): Promise<{ resumed: boolean; why: string }> {
   if (!charge.conversation_id) return { resumed: false, why: "no_conversation" };
@@ -18,11 +18,14 @@ export async function resumeLinkedExecution(
   if (!conv) return { resumed: false, why: "conversation_missing" };
   if (conv.status !== "bot_active" || conv.flow_completed) return { resumed: false, why: "execution_not_active" };
   if (conv.current_flow_id !== charge.flow_id) return { resumed: false, why: "funnel_changed" };
-  if (conv.flow_variables?.__gateway?.charge_id !== charge.id) return { resumed: false, why: "other_execution" };
+  // O vínculo da execução é com o PEDIDO (várias cobranças podem pertencer ao mesmo pedido).
+  if (conv.flow_variables?.__gateway?.order_ref !== charge.order_ref) return { resumed: false, why: "other_execution" };
 
   if (reason === "instructions") {
     // O bloco Cobrança está parado aguardando o voucher completo.
-    if (conv.current_block_id !== charge.block_id) return { resumed: false, why: "not_waiting_instructions" };
+    if (conv.current_block_id !== charge.block_id || conv.flow_variables?.__gateway?.charge_id !== charge.id) {
+      return { resumed: false, why: "not_waiting_instructions" };
+    }
   } else {
     const { data: funnel } = await supabase.from("capture_funnels").select("flow_blocks").eq("id", charge.flow_id).maybeSingle();
     const cur = (funnel?.flow_blocks ?? []).find((b: any) => b.id === conv.current_block_id);

@@ -44,7 +44,7 @@ export interface ChargeBlockCtx {
 }
 
 export type ChargeBlockOutcome =
-  | { kind: "advance"; vars: GatewayVars & { block_id: string; provider: string; method: string }; chargeId: string }
+  | { kind: "advance"; vars: GatewayVars & { block_id: string; provider: string; method: string; order_ref?: string }; chargeId: string }
   | { kind: "error"; vars: GatewayVars & { block_id: string }; retryable: boolean }
   | { kind: "need_input"; need: "name" | "email" }
   | { kind: "awaiting_instructions"; vars: GatewayVars & { block_id: string; provider: string; method: string }; chargeId: string };
@@ -63,7 +63,8 @@ export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOu
   const { data: convRow } = await sb.from("webchat_conversations").select("organization_id").eq("id", ctx.conversationId).maybeSingle();
   const orgId: string | null = convRow?.organization_id ?? ctx.organizationId ?? null;
   if (!orgId) return { kind: "error", retryable: false, vars: { transaction_id: "", payment_code: "", payment_qrcode: "", payment_link: "", expires_at: "", value: "", bank_name: "", beneficiary: "", erro: "account_not_configured", charge_id: "", status: "failed", block_id: ctx.blockId } };
-  const tag = <T extends GatewayVars>(v: T, extra: Record<string, string> = {}) => ({ ...v, block_id: ctx.blockId, ...extra } as any);
+  const orderRefValue = `${ctx.conversationId}:${ctx.flowId}`;
+  const tag = <T extends GatewayVars>(v: T, extra: Record<string, string> = {}) => ({ ...v, block_id: ctx.blockId, order_ref: orderRefValue, ...extra } as any);
 
   const accountId = String(d.gateway_account_id ?? "");
   const { data: account } = accountId
@@ -118,7 +119,7 @@ export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOu
       method: String(d.method ?? "").toUpperCase() === "OXXO" ? "OXXO" : "SPEI",
       rawAmount: ctx.replaceVars(d.amount ?? ""),
       executionKey: `${ctx.conversationId}:${ctx.blockId}:${round}`,
-      orderRef: `${ctx.conversationId}:${ctx.flowId}`,
+      orderRef: orderRefValue,
       conversationId: ctx.conversationId, leadId: ctx.leadId, flowId: ctx.flowId, blockId: ctx.blockId,
       lead, whatsappDisplayName: ctx.whatsappDisplayName,
       askedName: askedName || null, askedEmail: askedEmail || null,

@@ -9026,6 +9026,13 @@ Mensagem do lead:
                       const { data } = await supabase.from("payment_charges").select("id, status, amount, paid_amount, consumed_at, consumed_block_id").eq("id", id).maybeSingle();
                       return data ?? null;
                     },
+                    findDeliverableInOrder: async (orderRef) => {
+                      if (!orderRef) return null;
+                      const { data } = await supabase.from("payment_charges").select("id, amount, paid_amount")
+                        .eq("order_ref", orderRef) // order_ref = conversa:funil (UUIDs): já é específico da execução
+                        .eq("status", "paid").is("consumed_at", null).order("paid_at", { ascending: true }).limit(1);
+                      return (data && data[0]) ?? null;
+                    },
                     consume: async (id, blk) => {
                       const { data } = await supabase.rpc("payment_charge_consume", { p_charge_id: id, p_block_id: blk });
                       return data === true;
@@ -9036,6 +9043,7 @@ Mensagem do lead:
                     },
                   }, {
                     chargeId: _gwLink?.charge_id ?? null,
+                    orderRef: _gwLink?.order_ref ?? null,
                     blockId: b.id,
                     leadSentReceipt: !!(norm as any)?.media,
                     paymentResume: (payload as any).paymentResume === true,
