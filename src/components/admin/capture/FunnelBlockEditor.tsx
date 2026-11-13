@@ -45,6 +45,7 @@ import {
   MoreVertical,
 } from 'lucide-react';
 import { FileAndMediaUpload } from '@/components/ui/file-and-media-upload';
+import { ChargeBlockForm } from './ChargeBlockForm';
 import { 
   FunnelBlock, 
   FunnelBlockData, 
@@ -118,6 +119,7 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
       case 'ia_pergunta': return HelpCircle;
       case 'pix_button': return CreditCard;
       case 'copy_button': return Copy;
+      case 'charge': return CreditCard;
       case 'input': return Monitor;
       case 'buttons': return Plus;
       case 'ai_decide': return Brain;
@@ -1403,6 +1405,10 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
               </div>
             </div>
           </div>
+        )}
+
+        {block.type === 'charge' && (
+          <ChargeBlockForm block={block} updateData={updateData} />
         )}
 
         {block.type === 'copy_button' && (

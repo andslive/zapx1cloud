@@ -15,6 +15,7 @@ import { GoogleCalendarOAuthConfig } from './GoogleCalendarOAuthConfig';
 import { SankhyaConfigManager } from './SankhyaConfigManager';
 import { CaktoAdminPanel } from '../payments/CaktoAdminPanel';
 import { HotmartConfigManager } from './HotmartConfigManager';
+import { PaymentGatewayConfig } from './PaymentGatewayConfig';
 import { DoppusConfigManager } from './DoppusConfigManager';
 import {
   OpenAIConfig,
@@ -95,6 +96,10 @@ export function IntegrationConfigDrawer({ item, open, onOpenChange, onHookCloudL
         return <HotmartConfigManager />;
       case 'doppus':
         return <DoppusConfigManager />;
+      case 'colocapay':
+        return <PaymentGatewayConfig provider="colocapay" />;
+      case 'leonapay':
+        return <PaymentGatewayConfig provider="leonapay" />;
       case 'webhooks-link':
         return <WebhooksLink />;
       default:

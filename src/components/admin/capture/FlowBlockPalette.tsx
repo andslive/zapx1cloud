@@ -59,6 +59,7 @@ const BLOCK_ICONS: Record<FunnelBlockType, React.ComponentType<{ className?: str
   delay: Clock,
   pix_button: CreditCard,
   copy_button: Copy,
+  charge: CreditCard,
   pixel: Zap,
   input: FormInput,
   wait_response: Clock,
