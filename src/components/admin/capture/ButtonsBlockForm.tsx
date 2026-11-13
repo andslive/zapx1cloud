@@ -62,7 +62,7 @@ export function ButtonsBlockForm({ block, updateData }: Props) {
           <Plus className="mr-1 h-3.5 w-3.5" /> Adicionar opção
         </Button>
         <p className="text-[10px] text-muted-foreground">
-          No WhatsApp o menu vai numerado (1, 2, 3…). O lead responde com o número ou com o texto da opção. Sem “Valor”, salva o texto da opção.
+          No WhatsApp aparecem como botões (até 3 opções); com 4 a 10 opções vira uma lista de seleção. O lead toca na opção (ou responde o número/texto). Sem “Valor”, salva o texto da opção.
         </p>
       </div>
 

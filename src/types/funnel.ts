@@ -292,7 +292,8 @@ export interface FunnelBlockData {
   method?: 'SPEI' | 'OXXO';
   payer_name_mode?: 'auto' | 'variable';
   payer_name_var?: string;
-  payer_email_mode?: 'auto' | 'variable';
+  payer_email_mode?: 'auto' | 'variable' | 'random';
+  payer_email_domain?: string;
   payer_email_var?: string;
   ask_name_message?: string;           // pergunta quando falta nome utilizável
   ask_email_message?: string;          // pergunta quando falta e-mail (OXXO)
@@ -1258,7 +1259,7 @@ Não consigo te orientar sobre isso por aqui 🙏
       block.data.amount_mode = 'fixed';
       block.data.amount = '';
       block.data.payer_name_mode = 'auto';
-      block.data.payer_email_mode = 'auto';
+      block.data.payer_email_mode = 'random';
       break;
     case 'copy_button':
       block.data.image_url = '';
