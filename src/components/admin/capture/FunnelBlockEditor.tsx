@@ -46,6 +46,7 @@ import {
 } from 'lucide-react';
 import { FileAndMediaUpload } from '@/components/ui/file-and-media-upload';
 import { ChargeBlockForm } from './ChargeBlockForm';
+import { ButtonsBlockForm } from './ButtonsBlockForm';
 import { 
   FunnelBlock, 
   FunnelBlockData, 
@@ -1411,6 +1412,10 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
           </div>
         )}
 
+        {block.type === 'buttons' && (
+          <ButtonsBlockForm block={block} updateData={updateData} />
+        )}
+
         {block.type === 'charge' && (
           <ChargeBlockForm block={block} updateData={updateData} updateMany={updateMany} />
         )}
@@ -1612,7 +1617,7 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
           </div>
         )}
 
-        {['input', 'buttons', 'ai_decide', 'ia_pergunta'].includes(block.type) && (
+        {['input', 'ai_decide', 'ia_pergunta'].includes(block.type) && (
           <div className="p-4 bg-muted/20 rounded-lg border border-dashed text-center italic text-muted-foreground text-[10px]">
             Configurações padrão ativas para {paletteItem?.label || block.type}.
           </div>
