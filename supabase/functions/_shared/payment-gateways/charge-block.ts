@@ -113,7 +113,16 @@ export async function runChargeBlock(ctx: ChargeBlockCtx): Promise<ChargeBlockOu
       return { kind: "advance", chargeId: prev.id, vars: tag(varsFromCharge(prev), { provider: prev.provider, method: prev.method }) };
     }
   }
-  const round = roundFor(ctx.flowVariables, ctx.blockId, prev) + (prevStale ? 1 : 0);
+  let round = roundFor(ctx.flowVariables, ctx.blockId, prev) + (prevStale ? 1 : 0);
+  // Mesmo sem vínculo na execução (funil reiniciado na mesma conversa), uma cobrança ABERTA desta
+  // rodada de outra conta/meio/valor não pode ser devolvida no lugar da nova: pula para a próxima rodada.
+  const wantAmountRaw = ctx.replaceVars(d.amount ?? "");
+  for (let i = 0; i < 20; i++) {
+    const { data: open } = await sb.from("payment_charges").select("*").eq("organization_id", orgId)
+      .eq("execution_key", `${ctx.conversationId}:${ctx.blockId}:${round}`)
+      .in("status", ["creating", "awaiting_instructions", "pending"]).maybeSingle();
+    if (open && isChargeStale(open, account.id, String(d.method ?? ""), wantAmountRaw)) round += 1; else break;
+  }
   if (round > 1) {
     ctx.flowVariables.__charge_rounds = { ...(ctx.flowVariables.__charge_rounds ?? {}), [ctx.blockId]: round };
   }
