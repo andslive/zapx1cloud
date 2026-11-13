@@ -1,11 +1,9 @@
 // "Testar conexão": consulta autenticada, NUNCA cria cobrança.
 // Resultado em duas partes independentes: credencial aceita? método disponível?
 //
-// ATENÇÃO: o formato de resposta de GET /payments/corridors (ColocaPay) e de
-// GET /api/v2/payment-methods (LeonaPay) não está documentado publicamente. Os parsers abaixo
-// são tolerantes (busca recursiva por objetos que casem método/moeda). O resultado inclui
-// `parser_confidence` para sinalizar quando a decisão veio de heurística; a validação real
-// depende do primeiro teste com credencial de sandbox.
+// ColocaPay: parser segue o OpenAPI oficial. LeonaPay: o formato de GET /api/v2/payment-methods
+// não está documentado; o parser é tolerante e `parser_confidence` sinaliza a heurística até o
+// primeiro teste com credencial de sandbox.
 
 import { GATEWAYS, type GatewayEnvironment, type GatewayProvider } from "./catalog.ts";
 
@@ -52,30 +50,37 @@ function num(v: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-/** ColocaPay: procura um corredor SPEI/MEX/MXN. */
+/**
+ * ColocaPay (contrato OpenAPI oficial): GET /public/payments/corridors devolve
+ * `{ corridors: [{ rail, country, currency, direction, available, unavailable_reason,
+ *   limits: [{ payer_type: "PERSON"|"COMPANY", min_amount, max_amount }] }] }`.
+ * Corredor ausente = não oferecido; `available:false` = indisponível (ex.: rail_disabled,
+ * no_fee_config). Pagador de SPEI é PESSOA, então os limites PERSON têm prioridade.
+ */
 export function parseColocaCorridors(body: unknown): Pick<ConnectionTestResult, "method_available" | "limits" | "parser_confidence" | "detail"> {
-  let found: Record<string, unknown> | undefined;
-  for (const o of walk(body)) {
-    const rail = norm(pick(o, ["rail", "method", "type"]));
-    const cur = norm(pick(o, ["currency", "currency_code"]));
-    const ctry = norm(pick(o, ["country", "country_code"]));
-    if (rail === "SPEI" && cur === "MXN" && (ctry === "" || ctry === "MEX" || ctry === "MX")) {
-      found = o;
-      break;
-    }
+  const list = Array.isArray((body as any)?.corridors) ? ((body as any).corridors as Record<string, unknown>[]) : null;
+  if (!list) {
+    return { method_available: null, parser_confidence: "none", detail: "Resposta de corridors fora do formato esperado (campo corridors ausente)." };
   }
+  const found = list.find((c) =>
+    norm(c.rail) === "SPEI" && norm(c.country) === "MEX" && norm(c.currency) === "MXN" &&
+    (c.direction === undefined || norm(c.direction) === "PAYIN")
+  );
   if (!found) {
-    return { method_available: false, parser_confidence: "none", detail: "Nenhum corredor SPEI/MEX/MXN na resposta de corridors." };
+    return { method_available: false, parser_confidence: "matched", detail: "SPEI/MEX/MXN não é oferecido para esta conta." };
   }
-  if (isExplicitlyOff(found)) {
-    return { method_available: false, parser_confidence: "matched", detail: "Corredor SPEI/MEX/MXN presente, mas desabilitado para esta conta." };
+  if (found.available !== true) {
+    const why = found.unavailable_reason ? ` (${String(found.unavailable_reason)})` : "";
+    return { method_available: false, parser_confidence: "matched", detail: `SPEI/MEX/MXN indisponível agora${why}.` };
   }
-  const min = num(pick(found, ["min_amount", "minAmount", "min", "minimum"]));
-  const max = num(pick(found, ["max_amount", "maxAmount", "max", "maximum"]));
+  const limits = Array.isArray(found.limits) ? (found.limits as Record<string, unknown>[]) : [];
+  const lim = limits.find((l) => norm(l.payer_type) === "PERSON") ?? limits[0];
+  const min = lim ? num(lim.min_amount) : undefined;
+  const max = lim ? num(lim.max_amount) : undefined;
   return {
     method_available: true,
     limits: { ...(min !== undefined ? { min } : {}), ...(max !== undefined ? { max } : {}) },
-    parser_confidence: min !== undefined || max !== undefined ? "matched" : "heuristic",
+    parser_confidence: "matched",
     detail: "Corredor SPEI/MEX/MXN disponível.",
   };
 }

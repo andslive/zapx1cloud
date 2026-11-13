@@ -6,13 +6,22 @@ const mk = (status: number, body: unknown) => () =>
   Promise.resolve(new Response(typeof body === "string" ? body : JSON.stringify(body), { status }));
 
 Deno.test("Coloca: corredor SPEI/MEX/MXN disponível com limites", () => {
-  const r = parseColocaCorridors({ data: [{ rail: "SPEI", country: "MEX", currency: "MXN", min_amount: "10", max_amount: "50000" }] });
+  const r = parseColocaCorridors({ corridors: [
+    { rail: "BREB", country: "COL", currency: "COP", direction: "PAYIN", available: true, limits: [] },
+    { rail: "SPEI", country: "MEX", currency: "MXN", direction: "PAYIN", available: true, unavailable_reason: null,
+      limits: [{ payer_type: "COMPANY", min_amount: "1.00000000", max_amount: null }, { payer_type: "PERSON", min_amount: "10.00000000", max_amount: "50000.00000000" }] },
+  ] });
   assertEquals(r.method_available, true);
   assertEquals(r.limits, { min: 10, max: 50000 });
+  assertEquals(r.parser_confidence, "matched");
 });
 Deno.test("Coloca: sem SPEI → indisponível; desabilitado → indisponível", () => {
-  assertEquals(parseColocaCorridors([{ rail: "PIX", country: "BRA", currency: "BRL" }]).method_available, false);
-  assertEquals(parseColocaCorridors([{ rail: "SPEI", country: "MEX", currency: "MXN", enabled: false }]).method_available, false);
+  assertEquals(parseColocaCorridors({ corridors: [{ rail: "PIX", country: "BRA", currency: "BRL", direction: "PAYIN", available: true }] }).method_available, false);
+  const off = parseColocaCorridors({ corridors: [{ rail: "SPEI", country: "MEX", currency: "MXN", direction: "PAYIN", available: false, unavailable_reason: "rail_disabled" }] });
+  assertEquals(off.method_available, false);
+  assert(off.detail.includes("rail_disabled"));
+  assertEquals(parseColocaCorridors({ corridors: [{ rail: "SPEI", country: "MEX", currency: "MXN", direction: "PAYOUT", available: true }] }).method_available, false);
+  assertEquals(parseColocaCorridors([]).method_available, null);
 });
 Deno.test("Leona: OXXO/MXN habilitado; SPEI sozinho não basta", () => {
   assertEquals(parseLeonaMethods({ data: [{ method: "OXXO", currency: "MXN", available: true, minAmount: 10, maxAmount: 10000 }] }).method_available, true);
