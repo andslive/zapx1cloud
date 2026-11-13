@@ -43,9 +43,11 @@ const pickDraft = (d: FunnelBlock['data']): Draft => ({
 interface Props {
   block: FunnelBlock;
   updateData: (key: string, value: unknown) => void;
+  /** Grava vários campos numa única atualização (várias chamadas de updateData em sequência se sobrescrevem). */
+  updateMany: (patch: Record<string, unknown>) => void;
 }
 
-export function ChargeBlockForm({ block, updateData }: Props) {
+export function ChargeBlockForm({ block, updateMany }: Props) {
   const { data, isLoading } = usePaymentGatewayAccounts();
   const applied = useMemo(() => pickDraft(block.data), [block.data]);
   const [draft, setDraft] = useState<Draft>(applied);
@@ -81,7 +83,7 @@ export function ChargeBlockForm({ block, updateData }: Props) {
   const dirty = JSON.stringify(draft) !== JSON.stringify(applied);
 
   const save = () => {
-    (Object.keys(draft) as (keyof Draft)[]).forEach((k) => updateData(k, draft[k]));
+    updateMany({ ...draft });
     toast.success('Cobrança salva no bloco');
   };
   const cancel = () => setDraft(applied);
