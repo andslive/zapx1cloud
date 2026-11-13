@@ -1,12 +1,13 @@
 import { assert, assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { type ChargeRow, type ChargeStore, createCharge, parseAmount, varsFromCharge } from "./charge.ts";
 
+// PostgREST devolve numeric como NÚMERO: o store de teste reproduz isso (regressão do E2E).
 const J = (s: number, b: unknown) => new Response(JSON.stringify(b), { status: s });
 function memStore(): ChargeStore & { rows: ChargeRow[]; inserts: number } {
   const rows: ChargeRow[] = []; const st = { rows, inserts: 0 };
   return Object.assign(st, {
     findOpenByExecution: (o: string, k: string) => Promise.resolve(rows.find((r) => r.organization_id === o && r.execution_key === k && ["creating", "awaiting_instructions", "pending"].includes(r.status)) ?? null),
-    insert: (r: any) => { st.inserts++; const row = { ...r, id: crypto.randomUUID(), internal_reference: crypto.randomUUID().replace(/-/g, "") } as ChargeRow; rows.push(row); return Promise.resolve(row); },
+    insert: (r: any) => { st.inserts++; const row = { ...r, amount: Number(r.amount) as any, id: crypto.randomUUID(), internal_reference: crypto.randomUUID().replace(/-/g, "") } as ChargeRow; rows.push(row); return Promise.resolve({ ...row }); },
     update: (id: string, p: Partial<ChargeRow>) => { Object.assign(rows.find((r) => r.id === id)!, p); return Promise.resolve(); },
   });
 }
@@ -87,4 +88,12 @@ Deno.test("validações: conta inativa, valor fora do limite OXXO, método incom
 Deno.test("variáveis nunca vazam segredo e mantêm tipos texto", () => {
   const v = varsFromCharge({ id: "c", external_id: "e", payment_code: "000123", payment_qrcode: null, payment_link: null, expires_at: null, amount: "10.00", bank_name: null, beneficiary: null, error_code: null, status: "pending" });
   assertEquals(typeof v.payment_code, "string"); assertEquals(v.payment_code, "000123");
+});
+
+Deno.test("regressão E2E: amount numérico vindo do banco ainda vai ao gateway como string 250.10", async () => {
+  const store = memStore(); let sent: any;
+  const f = (_u: string, init: RequestInit) => { sent = JSON.parse(String(init.body)); return Promise.resolve(J(201, { id: "p1", status: "CREATED", clabe: "012180004567890123", gross_amount: "250.10" })); };
+  const r = await createCharge({ store, fetch: f }, { ...base, account: acct("colocapay"), method: "SPEI", rawAmount: "250.10" });
+  assertEquals(sent.gross_amount, "250.10"); assertEquals(typeof sent.gross_amount, "string");
+  assert(r.status === "ready" && r.vars.value === "250.10");
 });

@@ -108,13 +108,18 @@ export function varsFromCharge(c: Pick<ChargeRow, "id" | "external_id" | "paymen
     payment_qrcode: c.payment_qrcode ?? "",
     payment_link: c.payment_link ?? "",
     expires_at: c.expires_at ?? "",
-    value: c.amount,
+    value: Number(c.amount).toFixed(2),
     bank_name: c.bank_name ?? "",
     beneficiary: c.beneficiary ?? "",
     erro: c.error_code ?? "",
     charge_id: c.id,
     status: c.status,
   };
+}
+
+/** Linhas lidas do banco (PostgREST) trazem `numeric` como número: volta SEMPRE a string "250.10". */
+export function normalizeRow<T extends { amount: unknown }>(r: T): T & { amount: string } {
+  return { ...r, amount: Number(r.amount).toFixed(2) };
 }
 
 /** Valida o valor no backend: decimal positivo, até 2 casas, sem notação científica. */
@@ -176,6 +181,7 @@ export async function createCharge(
 
   // Retry/replay da mesma execução: reaproveita a tentativa aberta.
   let row = await deps.store.findOpenByExecution(account.organization_id, input.executionKey);
+  if (row) row = normalizeRow(row);
   if (row && row.request_fingerprint !== fingerprint) {
     if (row.external_id) {
       // Já existe cobrança real no gateway para esta execução: NÃO cria outra com payload diferente.
@@ -207,6 +213,7 @@ export async function createCharge(
       conversation_id: input.conversationId ?? null, lead_id: input.leadId ?? null,
       flow_id: input.flowId ?? null, block_id: input.blockId ?? null,
     });
+    row = normalizeRow(row);
   }
 
   // Já tem instrumento (replay após sucesso): não chama o gateway de novo.
