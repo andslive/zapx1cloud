@@ -57,6 +57,8 @@ export interface IntegrationItem {
     | 'cakto'
     | 'hotmart'
     | 'doppus'
+    | 'colocapay'
+    | 'leonapay'
     | 'webhooks-link'
     | 'hookcloud-onboarding';
   /** Marks the card visually but still opens config (e.g. native always-on services) */
@@ -189,6 +191,24 @@ export const rawIntegrationsCatalog: IntegrationCategory[] = [
         configKey: 'doppus',
         logoSrc: '/integrations/logos/doppus.png',
         keywords: ['doppus', 'infoproduto', 'postback', 'webhook', 'assinatura', 'pagamento'],
+      },
+      {
+        id: 'colocapay',
+        name: 'ColocaPay — SPEI',
+        description: 'SPEI (México, MXN) com CLABE por cobrança',
+        icon: CreditCard,
+        color: 'bg-sky-500/10 text-sky-500',
+        configKey: 'colocapay',
+        keywords: ['colocapay', 'coloca', 'spei', 'clabe', 'mexico', 'mxn'],
+      },
+      {
+        id: 'leonapay',
+        name: 'LeonaPay — OXXO',
+        description: 'OXXO (México, MXN) com referência e código de barras',
+        icon: CreditCard,
+        color: 'bg-rose-500/10 text-rose-500',
+        configKey: 'leonapay',
+        keywords: ['leonapay', 'leona', 'oxxo', 'mexico', 'mxn', 'voucher'],
       },
       {
         id: 'stripe',
