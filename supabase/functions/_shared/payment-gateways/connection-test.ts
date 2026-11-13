@@ -5,7 +5,7 @@
 // não está documentado; o parser é tolerante e `parser_confidence` sinaliza a heurística até o
 // primeiro teste com credencial de sandbox.
 
-import { GATEWAYS, type GatewayEnvironment, type GatewayProvider } from "./catalog.ts";
+import { gatewayBaseUrl, type GatewayEnvironment, type GatewayProvider } from "./catalog.ts";
 
 export interface ConnectionTestResult {
   credential_accepted: boolean;
@@ -118,7 +118,7 @@ export async function testGatewayConnection(
   apiKey: string,
   doFetch: FetchFn = fetch,
 ): Promise<ConnectionTestResult> {
-  const base = GATEWAYS[provider].baseUrls[environment];
+  const base = gatewayBaseUrl(provider, environment);
   const path = provider === "colocapay" ? "/public/payments/corridors" : "/api/v2/payment-methods";
   const checked_at = new Date().toISOString();
   const fail = (detail: string, http_status: number | null, credential_accepted = false): ConnectionTestResult => ({

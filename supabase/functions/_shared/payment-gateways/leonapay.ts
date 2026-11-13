@@ -1,9 +1,9 @@
 // LeonaPay — OXXO/MXN. Contrato: docs.leonapay.com.br (OXXO, Webhooks, Sandbox).
-import { GATEWAYS, type GatewayEnvironment } from "./catalog.ts";
+import { gatewayBaseUrl, type GatewayEnvironment } from "./catalog.ts";
 import { hmacSha256Hex, timingSafeEqualStr } from "./crypto.ts";
 import { type ChargeStatus, type FetchFn, GatewayError, type GatewayChargeState, requestWithRetry, toMoney } from "./types.ts";
 
-const base = (env: GatewayEnvironment) => GATEWAYS.leonapay.baseUrls[env];
+const base = (env: GatewayEnvironment) => gatewayBaseUrl("leonapay", env);
 
 export function mapLeonaStatus(status: unknown): ChargeStatus {
   switch (String(status ?? "").toUpperCase()) {

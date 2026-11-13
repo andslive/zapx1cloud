@@ -1,10 +1,10 @@
 // ColocaPay — SPEI/MEX/MXN. Contrato: OpenAPI oficial (Coloca Public API 1.0).
 // Base já inclui /api/v1 (ver catalog.ts): os caminhos aqui NÃO repetem o prefixo.
-import { GATEWAYS, type GatewayEnvironment } from "./catalog.ts";
+import { gatewayBaseUrl, type GatewayEnvironment } from "./catalog.ts";
 import { hmacSha256Hex, timingSafeEqualStr } from "./crypto.ts";
 import { type ChargeStatus, type FetchFn, GatewayError, type GatewayChargeState, requestWithRetry, toMoney } from "./types.ts";
 
-const base = (env: GatewayEnvironment) => GATEWAYS.colocapay.baseUrls[env];
+const base = (env: GatewayEnvironment) => gatewayBaseUrl("colocapay", env);
 const headers = (apiKey: string) => ({ "x-api-key": apiKey, Accept: "application/json", "Content-Type": "application/json" });
 
 export function mapColocaStatus(status: unknown, failureReason?: unknown): ChargeStatus {

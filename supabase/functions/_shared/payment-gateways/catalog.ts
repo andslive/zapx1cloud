@@ -69,3 +69,18 @@ export function methodsFor(provider: GatewayProvider, currency?: string): Gatewa
 export function webhookPath(provider: GatewayProvider, token: string): string {
   return `/functions/v1/payments-webhook/${provider}/${token}`;
 }
+
+/**
+ * Base da API. Só o SANDBOX aceita sobrescrita por variável de ambiente do operador
+ * (PAYMENT_SANDBOX_BASE_URL_COLOCAPAY / _LEONAPAY), usada por testes E2E com gateway simulado.
+ * Contas de produção nunca são desviadas.
+ */
+export function gatewayBaseUrl(provider: GatewayProvider, env: GatewayEnvironment): string {
+  if (env === "sandbox") {
+    try {
+      const o = Deno.env.get(`PAYMENT_SANDBOX_BASE_URL_${provider.toUpperCase()}`);
+      if (o && /^https?:\/\//.test(o)) return o.replace(/\/$/, "");
+    } catch { /* sem permissão de env: usa o padrão */ }
+  }
+  return GATEWAYS[provider].baseUrls[env];
+}

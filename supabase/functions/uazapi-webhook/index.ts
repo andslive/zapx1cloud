@@ -10,6 +10,9 @@ import {
   persistLidEvidence,
   resolveStoredRemoteJid,
   resolveWebhookSendTarget, recoverPeerJidWhenChatIsOwn } from "../_shared/uazapi-recipient.ts";
+import { runChargeBlock } from "../_shared/payment-gateways/charge-block.ts";
+import { evaluateReceiptGate } from "../_shared/payment-gateways/receipt-gate.ts";
+import { reconcileCharge } from "../_shared/payment-gateways/reconcile.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { waitKeyOf } from "../_shared/funnel-resume.ts";
 import { claimLossIsFinal, claimWait, releaseTimeoutWithoutPath } from "../_shared/wait-claim.ts";
@@ -7134,6 +7137,17 @@ Deno.serve(async (req) => {
               /{{lead_name}}/g,
               (conv as any).contact_name || "",
             );
+            // Variáveis da cobrança (`{{gateway.payment_code}}` etc.) vivem em __gateway: não passam
+            // por syncFlowVarsToLead (prefixo "__"), logo nunca são gravadas nos campos do lead.
+            {
+              const _gwVars = flowVariables["__gateway"];
+              if (_gwVars && typeof _gwVars === "object") {
+                result = result.replace(
+                  /{{\s*gateway\.([a-z_]+)\s*}}/g,
+                  (_m: string, k: string) => (_gwVars[k] != null ? String(_gwVars[k]) : ""),
+                );
+              }
+            }
             // [FIX 18/18.1] Nunca vazar placeholders não resolvidos ({{ai.response}} etc.)
             // ao usuário: qualquer {{token}} restante vira string vazia.
             result = result.replace(/{{\s*[\w.]+\s*}}/g, "");
@@ -7150,6 +7164,7 @@ Deno.serve(async (req) => {
             "wait_response",
             "ia_pergunta",
             "ai_receipt",
+            "charge",
           ];
           const isAtInputBlock = currentBlock &&
             inputTypes.includes(String(currentBlock.type).toLowerCase());
@@ -7358,7 +7373,7 @@ Deno.serve(async (req) => {
               // de "answer-success" (que avançaria direto para success_next_block_id pulando
               // o case "ai_receipt"). Forçamos a re-entrada no mesmo bloco para que o handler
               // de ai_receipt processe OCR/regex/LLM/fallback e grave as variáveis.
-              if (currentBlock?.type === 'ai_receipt') {
+              if (currentBlock?.type === 'ai_receipt' || currentBlock?.type === 'charge') {
                 console.log('[AI_RECEIPT_INBOUND_ROUTE_ENTERED]', {
                   conversation_id: conversationId,
                   block_id: currentBlock.id,
@@ -7675,6 +7690,18 @@ Mensagem do lead:
                 "[uazapi-webhook] input_answer_rejected: too early (before question_sent_at)",
               );
             }
+          } else if (
+            isResume && (payload as any).paymentResume === true &&
+            (currentBlock?.type === "ai_receipt" || currentBlock?.type === "charge")
+          ) {
+            // Retomada disparada pela confirmação/instruções do gateway: NÃO é timeout de pergunta.
+            // Cai direto no loop; o gate de `ai_receipt` / o bloco `charge` decidem a saída.
+            console.log("[payments] payment_resume_enter", {
+              block_id: currentBlock?.id,
+              type: currentBlock?.type,
+            });
+            delete flowVariables["__waiting_input"];
+            delete flowVariables["waiting_for_input"];
           } else if (
             isAtInputBlock && isResume &&
             !(payload as any).__recovery_context
@@ -8248,6 +8275,100 @@ Mensagem do lead:
                 // Não espera o clique: segue para o próximo bloco.
                 pendingDelayMs = 0;
                 nextBlockId = b.next_block_id || null;
+                currentBlock = findBlock(nextBlockId);
+                break;
+              }
+              case "charge": {
+                // Bloco Cobrança: gera o instrumento, guarda `gateway.*` na execução e avança.
+                // O envio da mensagem e a espera pelo pagamento acontecem nos blocos seguintes.
+                const _answer = typeof flowVariables["__charge_answer"] === "string"
+                  ? String(flowVariables["__charge_answer"]).trim()
+                  : "";
+                const _need = flowVariables["__charge_need"];
+                if (_answer && _need === "name") flowVariables["__charge_asked_name"] = _answer;
+                if (_answer && _need === "email") {
+                  if (/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(_answer)) flowVariables["__charge_asked_email"] = _answer;
+                }
+                delete flowVariables["__charge_answer"];
+                delete flowVariables["__charge_need"];
+
+                const _cb = await runChargeBlock({
+                  sb: supabase,
+                  fetch: (u, i) => fetch(u, i),
+                  blockId: b.id,
+                  blockData: b.data || {},
+                  conversationId: conversationId as string,
+                  flowId: (funnel as any).id,
+                  organizationId: (conv as any).organization_id,
+                  leadId: (conv as any).lead_id || null,
+                  whatsappDisplayName: (conv as any).visitor_name || (conv as any).contact_name || null,
+                  flowVariables,
+                  replaceVars,
+                });
+                console.log("[payments] charge_block_outcome", { block_id: b.id, kind: _cb.kind, need: (_cb as any).need });
+
+                if (_cb.kind === "need_input") {
+                  const _ask = _cb.need === "name"
+                    ? (b.data?.ask_name_message || "¿Cuál es tu nombre completo?")
+                    : (b.data?.ask_email_message || "¿Cuál es tu correo electrónico?");
+                  chunksToSend.push({
+                    type: "text",
+                    payload: { text: replaceVars(_ask) },
+                    show_typing: b.data?.show_typing,
+                    delay: pendingDelayMs,
+                    source_block_id: b.id,
+                  });
+                  const _nowIso = new Date().toISOString();
+                  flowVariables["__charge_need"] = _cb.need;
+                  flowVariables["waiting_for_input"] = true;
+                  flowVariables["__waiting_input"] = {
+                    block_id: b.id,
+                    variable_name: "__charge_answer",
+                    question_sent_at: _nowIso,
+                    question_text: replaceVars(_ask),
+                    timeout_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+                    is_timeout: false,
+                    success_next_block_id: b.id,
+                    timeout_next_block_id: null,
+                    question_sent: true,
+                    answered: false,
+                    answer_text: null,
+                    answered_at: null,
+                    trigger_message_id: (norm as any)?.messageId || null,
+                  };
+                  pendingDelayMs = 0;
+                  nextBlockId = b.id;
+                  await supabase.from("webchat_conversations").update({
+                    flow_variables: flowVariables,
+                    current_block_id: b.id,
+                    flow_completed: false,
+                  }).eq("id", conversationId);
+                  currentBlock = null;
+                  safety = 1000;
+                  break;
+                }
+
+                // Variáveis sobrevivem à pausa/retomada (flow_variables da conversa), fora dos campos do lead.
+                flowVariables["__gateway"] = { ..._cb.vars, charge_id: (_cb as any).chargeId ?? _cb.vars.charge_id };
+
+                if (_cb.kind === "awaiting_instructions") {
+                  // Voucher ainda incompleto: não avança; o evento do gateway retoma a mesma execução.
+                  pendingDelayMs = 0;
+                  nextBlockId = b.id;
+                  await supabase.from("webchat_conversations").update({
+                    flow_variables: flowVariables,
+                    current_block_id: b.id,
+                    flow_completed: false,
+                  }).eq("id", conversationId);
+                  currentBlock = null;
+                  safety = 1000;
+                  break;
+                }
+
+                pendingDelayMs = 0;
+                nextBlockId = (_cb.kind === "error" && b.data?.error_next_block_id)
+                  ? b.data.error_next_block_id
+                  : (b.next_block_id || null);
                 currentBlock = findBlock(nextBlockId);
                 break;
               }
@@ -8887,6 +9008,55 @@ Mensagem do lead:
               }
               case "ai_receipt": {
                 // ─────────────────────────────────────────────────────────
+                // Cobrança vinculada (gateway): a saída de sucesso depende SÓ da confirmação do
+                // gateway. Sem cobrança vinculada, `_gateDecision = none` e nada muda (Bre-B fixo).
+                // ─────────────────────────────────────────────────────────
+                let _chargeLinked = false;
+                {
+                  const _gwLink = (flowVariables as any)["__gateway"];
+                  const _gateDecision = await evaluateReceiptGate({
+                    loadCharge: async (id) => {
+                      const { data } = await supabase.from("payment_charges").select("id, status, amount, paid_amount, consumed_at, consumed_block_id").eq("id", id).maybeSingle();
+                      return data ?? null;
+                    },
+                    consume: async (id, blk) => {
+                      const { data } = await supabase.rpc("payment_charge_consume", { p_charge_id: id, p_block_id: blk });
+                      return data === true;
+                    },
+                    reconcile: async (id) => {
+                      // Já estamos DENTRO da execução: a "retomada" do settle é no-op.
+                      await reconcileCharge({ supabase, fetch: (u, i) => fetch(u, i), resume: async () => {} }, id);
+                    },
+                  }, {
+                    chargeId: _gwLink?.charge_id ?? null,
+                    blockId: b.id,
+                    leadSentReceipt: !!(norm as any)?.media,
+                    paymentResume: (payload as any).paymentResume === true,
+                  });
+                  if (_gateDecision.decision !== "none") {
+                    _chargeLinked = true;
+                    console.log("[payments] receipt_gate", { block_id: b.id, decision: _gateDecision.decision, status: (_gateDecision as any).status });
+                    if (_gwLink) (flowVariables as any)["__gateway"] = { ..._gwLink, status: _gateDecision.decision === "success" ? "paid" : (_gateDecision as any).status };
+                  }
+                  if (_gateDecision.decision === "success") {
+                    const _gwNext = b.data?.receipt_success_block_id || b.data?.true_next_block_id || b.next_block_id || null;
+                    (flowVariables as any)["__gateway"] = { ...(flowVariables as any)["__gateway"], value: _gateDecision.paidAmount };
+                    delete (flowVariables as any).__waiting_input;
+                    delete (flowVariables as any).waiting_for_input;
+                    delete (flowVariables as any).__pending_receipt_media;
+                    try {
+                      await supabase.from("webchat_conversations").update({
+                        current_block_id: _gwNext,
+                        flow_variables: flowVariables,
+                        updated_at: new Date().toISOString(),
+                      }).eq("id", conversationId);
+                    } catch (_e) { /* best-effort: o próprio loop persiste ao final */ }
+                    nextBlockId = _gwNext;
+                    currentBlock = _gwNext ? findBlock(_gwNext) : null;
+                    break;
+                  }
+                }
+                // ─────────────────────────────────────────────────────────
                 // [FASE 27] Hardening do parser de valores. Helpers usados
                 // pelos 3 caminhos que gravam valorcomprovante (VPS2,
                 // determinístico, IA). Valor acima do limite passa por
@@ -9033,7 +9203,9 @@ Mensagem do lead:
                     (instance as any)?.name ?? null,
                     (funnel as any)?.name ?? null,
                   );
-                  if (!_gate.enabled) {
+                  if (_chargeLinked) {
+                    // cobrança vinculada: sem atalho VPS — a confirmação vem do gateway
+                  } else if (!_gate.enabled) {
                     console.log("[VPS_RECEIPT_BYPASS]", JSON.stringify({
                       conversation_id: conversationId,
                       block_id: b.id,
@@ -9764,7 +9936,7 @@ Mensagem do lead:
                   // do case (FASE 27) e compartilhada pelos 3 caminhos.
                   const _acceptedValues: number[] = _receiptAcceptedValues;
 
-                  if (_hasSignals && _detName.length >= 3 && Number.isFinite(_detVal) && _detVal > 0) {
+                  if (!_chargeLinked && _hasSignals && _detName.length >= 3 && Number.isFinite(_detVal) && _detVal > 0) {
                     await _auditReceipt({
                       source: "deterministic",
                       identified: false,
@@ -10625,7 +10797,7 @@ FORMATO JSON:
 
 
 
-                    if (isIdentified) {
+                    if (isIdentified && !_chargeLinked) {
                       receiptRecognizedThisLoop = true;
                       const nameVar = b.data?.receipt_name_var ||
                         "nomecomprovante";
