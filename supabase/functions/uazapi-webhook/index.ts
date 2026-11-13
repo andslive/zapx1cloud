@@ -8421,6 +8421,13 @@ Mensagem do lead:
                       valueStr = String(flowVariables[valueRaw]);
                     }
 
+                    // Cobrança por gateway paga e entregue NESTA execução: valor e moeda vêm da cobrança.
+                    // Só atua quando há __gateway.status === "paid"; fora disso o bloco se comporta como antes.
+                    const _gwPix: any = (flowVariables as any).__gateway;
+                    const _gwPixPaid = _gwPix && _gwPix.status === "paid" && _gwPix.value != null && _gwPix.currency ? _gwPix : null;
+                    if (_gwPixPaid && (!valueStr || !Number.isFinite(parseFloat(String(valueStr).replace(",", "."))))) {
+                      valueStr = String(_gwPixPaid.value);
+                    }
                     const numericValue = valueStr ? parseFloat(valueStr.replace(",", ".")) : NaN;
                     if (eventName === "Purchase" && (isNaN(numericValue) || numericValue <= 0)) {
                       console.error(`[pixel_value_invalid] PIXEL_VALUE_INVALID: ${valueStr}`);
@@ -8449,7 +8456,8 @@ Mensagem do lead:
                     const { data: integ } = await query.maybeSingle();
 
                     if (integ?.pixel_id && integ?.pixel_access_token) {
-                      const currency = b.data.pixel_currency || "BRL";
+                      // Moeda da cobrança paga (MXN) prevalece sobre o padrão BRL do bloco; sem gateway, inalterado.
+                      const currency = (_gwPixPaid ? String(_gwPixPaid.currency) : null) || b.data.pixel_currency || "BRL";
                       const leadPhone = flowVariables["telefone"] || flowVariables["phone"] || remotePhoneCanonical;
                       const leadEmail = flowVariables["email"];
                       const leadName = flowVariables["nome"] || flowVariables["name"] || norm.pushName;
@@ -9055,7 +9063,7 @@ Mensagem do lead:
                   }
                   if (_gateDecision.decision === "success") {
                     const _gwNext = b.data?.receipt_success_block_id || b.data?.true_next_block_id || b.next_block_id || null;
-                    (flowVariables as any)["__gateway"] = { ...(flowVariables as any)["__gateway"], value: _gateDecision.paidAmount };
+                    (flowVariables as any)["__gateway"] = { ...(flowVariables as any)["__gateway"], status: "paid", value: _gateDecision.paidAmount, currency: "MXN" /* única moeda permitida em payment_charges (CHECK) */ };
                     delete (flowVariables as any).__waiting_input;
                     delete (flowVariables as any).waiting_for_input;
                     delete (flowVariables as any).__pending_receipt_media;
