@@ -136,6 +136,10 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
     });
   };
 
+  const updateMany = (patch: Record<string, unknown>) => {
+    onUpdate({ data: { ...block.data, ...patch } });
+  };
+
   const otherBlocks = blocks.filter(b => b.id !== block.id);
 
   return (
@@ -1408,7 +1412,7 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
         )}
 
         {block.type === 'charge' && (
-          <ChargeBlockForm block={block} updateData={updateData} />
+          <ChargeBlockForm block={block} updateData={updateData} updateMany={updateMany} />
         )}
 
         {block.type === 'copy_button' && (
