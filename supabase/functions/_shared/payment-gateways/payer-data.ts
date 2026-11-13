@@ -62,12 +62,19 @@ export function aliasAvailable(cfg?: AliasConfig): boolean {
   return !!(cfg?.enabled && cfg.providerAcceptsAlias && cfg.domain && /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(cfg.domain));
 }
 
-/** alias = nome normalizado + sufixo numérico (ex.: joaosilva0012@dominio). Desativado por padrão. */
+/** Parte local: primeiro.último nome normalizados ("João da Silva" → "joao.silva"); um só nome → "joao". */
+export function aliasLocalPart(name: string): string {
+  const words = name.split(/\s+/).map(normalizeForAlias).filter(Boolean);
+  if (!words.length) return "";
+  return (words.length > 1 ? `${words[0]}.${words[words.length - 1]}` : words[0]).slice(0, 40);
+}
+
+/** alias = primeiro.último + 3 dígitos (ex.: anderson.silva001@dominio). Só com alias habilitado. */
 export function buildAliasEmail(name: string, seq: number, cfg?: AliasConfig): string | null {
   if (!aliasAvailable(cfg)) return null;
-  const local = normalizeForAlias(name);
+  const local = aliasLocalPart(name);
   if (!local) return null;
-  return `${local}${String(seq % 10000).padStart(4, "0")}@${cfg!.domain!.toLowerCase()}`;
+  return `${local}${String(seq % 1000).padStart(3, "0")}@${cfg!.domain!.toLowerCase()}`;
 }
 
 export type EmailResolution =

@@ -28,7 +28,7 @@ function q(t: string) {
 const sb: any = { from: q, rpc: () => Promise.resolve({ data: "KEY", error: null }) };
 
 const fetchStub = (u: string) => { return Promise.resolve(new Response(JSON.stringify({ success: true, data: { id: "p", status: "PENDING", amount: 100, nextAction: { type: "CASH_VOUCHER", reference: "0093", barcodeUrl: "https://x/v.png", expiresAt: "2026-11-15T15:00:00Z" } } }), { status: 201 })); };
-const mk = (fv: any) => ({ sb, fetch: fetchStub as any, blockId: "blk", blockData: { gateway_account_id: "leona", method: "OXXO", amount: "100" }, conversationId: "c1", flowId: "f1", organizationId: "org1", leadId: null, whatsappDisplayName: "Anderson", flowVariables: fv, replaceVars: (x: any) => String(x ?? "") });
+const mk = (fv: any) => ({ sb, fetch: fetchStub as any, blockId: "blk", blockData: { gateway_account_id: "leona", method: "OXXO", amount: "100", payer_email_mode: "ask" }, conversationId: "c1", flowId: "f1", organizationId: "org1", leadId: null, whatsappDisplayName: "Anderson", flowVariables: fv, replaceVars: (x: any) => String(x ?? "") });
 
 Deno.test("funil reiniciado na mesma conversa: cobrança aberta de outra conta/meio não é devolvida no lugar da nova", async () => {
   const fv: any = {};

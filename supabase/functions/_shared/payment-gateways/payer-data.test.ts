@@ -18,12 +18,19 @@ Deno.test("e-mail: lead válido; senão alias só se configurado e confirmado; s
   assertEquals(resolvePayerEmail({ leadEmail: "a@b.co", name: "Ana", seq: 1 }), { email: "a@b.co", source: "lead" });
   assertEquals(resolvePayerEmail({ leadEmail: "invalido", name: "Ana", seq: 1 }), null);
   const cfg = { enabled: true, providerAcceptsAlias: true, domain: "pagamentos.exemplo.com.br" };
-  assertEquals(resolvePayerEmail({ leadEmail: null, name: "João Silva", seq: 12, alias: cfg }), { email: "joaosilva0012@pagamentos.exemplo.com.br", source: "alias" });
+  assertEquals(resolvePayerEmail({ leadEmail: null, name: "João Silva", seq: 12, alias: cfg }), { email: "joao.silva012@pagamentos.exemplo.com.br", source: "alias" });
   assertEquals(resolvePayerEmail({ leadEmail: null, name: "Ana", seq: 1, alias: { ...cfg, providerAcceptsAlias: false } }), null);
   assertEquals(resolvePayerEmail({ leadEmail: null, name: "Ana", seq: 1, alias: { ...cfg, enabled: false } }), null);
   assertEquals(resolvePayerEmail({ leadEmail: null, name: "Ana", seq: 1 }), null);
 });
-Deno.test("alias: normaliza acentos e sufixo de 4 dígitos", () => {
+Deno.test("alias: normaliza acentos, primeiro.último e sufixo de 3 dígitos", () => {
   assertEquals(normalizeForAlias("María-José Ñandú"), "mariajosenandu");
-  assertEquals(buildAliasEmail("A", 5, { enabled: true, providerAcceptsAlias: true, domain: "x.com" }), "a0005@x.com");
+  assertEquals(buildAliasEmail("A", 5, { enabled: true, providerAcceptsAlias: true, domain: "x.com" }), "a005@x.com");
+});
+
+Deno.test("alias: nome composto vira primeiro.último; um só nome fica simples", () => {
+  const cfg = { enabled: true, providerAcceptsAlias: true, domain: "gmail.com" };
+  assertEquals(buildAliasEmail("Anderson da Silva", 1, cfg), "anderson.silva001@gmail.com");
+  assertEquals(buildAliasEmail("María José Ñandú", 42, cfg), "maria.nandu042@gmail.com");
+  assertEquals(buildAliasEmail("Ana", 7, cfg), "ana007@gmail.com");
 });
