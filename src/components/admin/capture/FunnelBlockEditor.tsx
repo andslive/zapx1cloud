@@ -44,6 +44,7 @@ import {
   RefreshCw,
   MoreVertical,
 } from 'lucide-react';
+import { CopyButtonBlockForm } from './CopyButtonBlockForm';
 import { FileAndMediaUpload } from '@/components/ui/file-and-media-upload';
 import { ChargeBlockForm } from './ChargeBlockForm';
 import { ButtonsBlockForm } from './ButtonsBlockForm';
@@ -1421,34 +1422,7 @@ export function FunnelBlockEditor({ block, blocks, productId, onUpdate, onConnec
         )}
 
         {block.type === 'copy_button' && (
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label className="text-xs font-semibold">Imagem (opcional)</Label>
-              <FileAndMediaUpload
-                value={block.data.image_url}
-                onChange={(url) => updateData('image_url', url)}
-                type="image"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs font-semibold">Rótulo do botão</Label>
-              <Input
-                value={block.data.copy_label ?? ''}
-                onChange={(e) => updateData('copy_label', e.target.value)}
-                placeholder="Ex: Copiar llave Bre-B"
-                className="h-8 text-xs"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs font-semibold">Valor a copiar</Label>
-              <Input
-                value={block.data.copy_value ?? ''}
-                onChange={(e) => updateData('copy_value', e.target.value)}
-                placeholder="Texto que será copiado ao tocar no botão"
-                className="h-8 text-xs font-mono"
-              />
-            </div>
-          </div>
+          <CopyButtonBlockForm block={block} blocks={blocks} updateData={updateData} />
         )}
 
         {block.type === 'pix_button' && (
