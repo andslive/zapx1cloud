@@ -280,6 +280,7 @@ export interface FunnelBlockData {
   pix_name?: string;
 
   // Botão Copiar (imagem usa image_url)
+  copy_caption?: string;  // texto/legenda opcional acima do botão (aceita {{variáveis}})
   copy_label?: string;
   copy_value?: string;
 
@@ -1263,6 +1264,7 @@ Não consigo te orientar sobre isso por aqui 🙏
       break;
     case 'copy_button':
       block.data.image_url = '';
+      block.data.copy_caption = '';
       block.data.copy_label = 'Copiar llave Bre-B';
       block.data.copy_value = '';
       break;
