@@ -8301,6 +8301,7 @@ Mensagem do lead:
               case "copy_button": {
                 const copyLabel = replaceVars(b.data?.copy_label || "");
                 const copyValue = replaceVars(b.data?.copy_value || "");
+                const copyCaption = replaceVars(b.data?.copy_caption || "");
                 if (copyLabel.trim() && copyValue.trim()) {
                   const delay = b.data.delay_ms || 0;
                   console.log(`[copy_button_block_enter] flow_id=${funnel.id} block_id=${b.id} conversation_id=${conversationId} has_image=${!!b.data?.image_url}`);
@@ -8311,6 +8312,7 @@ Mensagem do lead:
                       url: replaceVars(b.data?.image_url || "").trim() || undefined,
                       label: copyLabel,
                       value: copyValue,
+                      caption: copyCaption.trim() || undefined,
                     },
                     show_typing: false,
                     delay: pendingDelayMs + delay,

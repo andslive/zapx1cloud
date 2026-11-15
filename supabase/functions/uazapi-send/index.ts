@@ -455,13 +455,14 @@ export async function handleUazapiSendRequest(req: Request): Promise<Response> {
           break;
         }
         case "copy_button": {
-          // POST /send/menu type=button, text=U+200B (sem legenda visível; "" dá 400), imagem opcional em `file`.
+          // POST /send/menu type=button: imagem opcional em `file`, legenda em `text` (sem legenda: U+200B; "" dá 400).
           // Sem fallback de texto/legenda: se a UazAPI rejeitar, o erro é devolvido como está.
           const menuPayload = buildCopyButtonMenuPayload({
             number: uazNumber,
             label: String(payload.label ?? ""),
             value: String(payload.value ?? ""),
             imageUrl: payload.url ?? payload.file ?? null,
+            caption: payload.caption ?? payload.text ?? null,
           });
           if (!menuPayload) {
             return new Response(JSON.stringify({

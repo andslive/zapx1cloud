@@ -1,9 +1,9 @@
 // Bloco "Botão Copiar" — payload do POST /send/menu da UazAPI.
 //
-// Uma única mensagem: imagem opcional no topo + botão "copiar" logo abaixo,
-// sem legenda visível. A UazAPI rejeita text:"" (400 "missing required fields
-// in payload"), então usamos U+200B (zero-width space), validado no celular:
-// sem legenda/espaço perceptível. Formato do choice: "<rótulo>|copy:<valor>".
+// Uma única mensagem: imagem opcional no topo → texto/legenda (opcional) → botão "copiar".
+// A UazAPI rejeita text:"" (400 "missing required fields in payload"), então sem legenda
+// usamos U+200B (zero-width space), validado no celular: sem espaço perceptível.
+// Formato do choice: "<rótulo>|copy:<valor>".
 //
 // Função pura (sem rede/DB) para ser validada localmente com e sem imagem.
 
@@ -15,12 +15,14 @@ export interface CopyButtonInput {
   label: string;
   value: string;
   imageUrl?: string | null;
+  /** Texto/legenda já com variáveis resolvidas; vazio/ausente => U+200B. */
+  caption?: string | null;
 }
 
 export interface CopyButtonMenuPayload {
   number: string;
   type: "button";
-  text: "\u200B";
+  text: string;
   choices: string[];
   file?: string;
 }
@@ -35,6 +37,12 @@ export function sanitizeCopyValue(value: string): string {
   return String(value ?? "").replace(/[\r\n]+/g, " ").trim();
 }
 
+/** Legenda: mantém quebras de linha; sem conteúdo => U+200B (a UazAPI recusa ""). */
+export function sanitizeCopyCaption(caption: string | null | undefined): string {
+  const t = String(caption ?? "").replace(/\r\n?/g, "\n").replace(/\u200B/g, "").trim();
+  return t || COPY_BUTTON_TEXT;
+}
+
 /** Retorna null se rótulo ou valor estiverem vazios (bloco não deve ser enviado). */
 export function buildCopyButtonMenuPayload(
   input: CopyButtonInput,
@@ -46,7 +54,7 @@ export function buildCopyButtonMenuPayload(
   const payload: CopyButtonMenuPayload = {
     number: input.number,
     type: "button",
-    text: COPY_BUTTON_TEXT,
+    text: sanitizeCopyCaption(input.caption),
     choices: [`${label}|copy:${value}`],
   };
   const file = (input.imageUrl ?? "").trim();

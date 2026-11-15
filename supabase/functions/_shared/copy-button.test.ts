@@ -58,3 +58,26 @@ Deno.test("text é U+200B (nunca vazio, nunca ASCII visível)", () => {
   assertEquals(COPY_BUTTON_TEXT.length, 1);
   assertEquals(COPY_BUTTON_TEXT.charCodeAt(0), 0x200b);
 });
+
+Deno.test("legenda resolvida vai em text; quebras preservadas", () => {
+  const p = buildCopyButtonMenuPayload({
+    number: "1", label: "Copiar", value: "8203650029310851",
+    imageUrl: "https://x/y.png", caption: "Paga en OXXO\r\nReferencia: 8203650029310851 ",
+  })!;
+  assertEquals(p.text, "Paga en OXXO\nReferencia: 8203650029310851");
+  assertEquals(p.file, "https://x/y.png");
+  assertEquals(p.choices, ["Copiar|copy:8203650029310851"]);
+});
+
+Deno.test("legenda vazia, só espaços/U+200B, null ou ausente => U+200B", () => {
+  for (const caption of ["", "  \n ", "​", null, undefined]) {
+    const p = buildCopyButtonMenuPayload({ number: "1", label: "a", value: "b", caption })!;
+    assertEquals(p.text, "​");
+  }
+});
+
+Deno.test("sem imagem e com legenda: sem file, text = legenda", () => {
+  const p = buildCopyButtonMenuPayload({ number: "1", label: "a", value: "b", caption: "Olá" })!;
+  assertEquals("file" in p, false);
+  assertEquals(p.text, "Olá");
+});
