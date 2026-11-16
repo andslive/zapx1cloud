@@ -14,6 +14,7 @@
 //             (image-only PDFs -> OpenAI Responses API with input_file)
 // Both use OPENAI_API_KEY (centralizado em uma única chave da organização).
 
+import { extractClavesRastreo } from "../_shared/payment-gateways/receipt-match.ts";
 import {
   analyzeMultimodalPdf,
   extractPdfText,
@@ -150,6 +151,7 @@ async function describeImage(
         "2. Nome do Pagador " +
         "3. Data e Hora. " +
         "Seja extremamente preciso. Se houver múltiplos valores, use o valor total pago. " +
+        "Se o comprovante trouxer \"Clave de rastreo\" (SPEI, México), transcreva-a EXATAMENTE, caractere por caractere, em uma linha própria: \"Clave de rastreo: <valor>\". Nunca invente nem complete a clave." +
         "Responda de forma direta e objetiva, começando pelos dados extraídos se for um comprovante. " +
         "Se não for um comprovante, descreva brevemente o conteúdo da imagem. " +
         "Se a imagem estiver ilegível, descreva o que é possível ver.",
@@ -241,6 +243,7 @@ async function analyzeText(
             "2. Nome do Pagador " +
             "3. Data e Hora. " +
             "Se for um comprovante, sua resposta deve começar com 'COMPROVANTE IDENTIFICADO' e listar os dados. " +
+            "Se o comprovante trouxer \"Clave de rastreo\" (SPEI, México), transcreva-a EXATAMENTE, caractere por caractere, em uma linha própria: \"Clave de rastreo: <valor>\". Nunca invente nem complete a clave." +
             "Se não for um comprovante, resuma brevemente o conteúdo do texto.",
         },
         { role: "user", content: `Texto extraído do PDF:\n\n${text}` },
@@ -402,6 +405,11 @@ Deno.serve(async (req) => {
         }
       } else {
         resultText = await analyzeText(extractedText, apiKey, modelOverride);
+        // Clave de rastreo (SPEI): extração determinística do texto do PDF, independente da redação do modelo.
+        {
+          const claves = extractClavesRastreo(extractedText).filter((k) => !resultText.toUpperCase().includes(k));
+          if (claves.length) resultText = `${resultText}\nClave de rastreo: ${claves.join(" | ")}`;
+        }
       }
 
       return jsonResponse({

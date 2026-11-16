@@ -93,7 +93,7 @@ export const PDF_RECEIPT_PROMPT =
   "Você é um especialista em análise de comprovantes bancários brasileiros (Pix, Transferência, Boleto, Cartão). " +
   "Você recebeu um arquivo PDF anexado. Leia o conteúdo textual e visual das páginas. " +
   "Se for um comprovante de pagamento CONCLUÍDO, responda começando com 'COMPROVANTE IDENTIFICADO' e liste, um por linha, apenas os campos visíveis no documento: " +
-  "Valor: (numérico, ex: 15.00) | Nome do Pagador: | Recebedor: | Data e Hora: | Instituição: | ID transação: | Status: | Moeda:. " +
+  "Valor: (numérico, ex: 15.00) | Nome do Pagador: | Recebedor: | Data e Hora: | Instituição: | ID transação: | Status: | Moeda: | Clave de rastreo: (SPEI, México; transcreva exatamente, nunca invente). " +
   "Nunca invente campos que não estejam visíveis. " +
   "Agendamento, QR Code ou instrução/solicitação de pagamento NÃO são pagamento concluído: nesses casos, e se não for comprovante, descreva brevemente o documento sem usar 'COMPROVANTE IDENTIFICADO'.";
 

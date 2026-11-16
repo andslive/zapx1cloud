@@ -12,6 +12,7 @@ import {
   resolveWebhookSendTarget, recoverPeerJidWhenChatIsOwn } from "../_shared/uazapi-recipient.ts";
 import { runChargeBlock } from "../_shared/payment-gateways/charge-block.ts";
 import { evaluateReceiptGate } from "../_shared/payment-gateways/receipt-gate.ts";
+import { extractClavesRastreo, matchReceiptToPayment } from "../_shared/payment-gateways/receipt-match.ts";
 import { reconcileCharge } from "../_shared/payment-gateways/reconcile.ts";
 import { startTyping } from "../_shared/presence.ts";
 import { waitKeyOf } from "../_shared/funnel-resume.ts";
@@ -9107,6 +9108,27 @@ Mensagem do lead:
                 let _chargeLinked = false;
                 {
                   const _gwLink = (flowVariables as any)["__gateway"];
+                  // SPEI de CLABE fixa: a clave de rastreo do comprovante é cruzada (igualdade exata) com `data.reference` de um
+                  // `payment.paid` JÁ validado pela LeonaPay. Se o evento já chegou, vincula aqui (sem retomar: já estamos dentro da
+                  // execução) e o gate abaixo entrega pela cobrança paga do pedido; se ainda não chegou, a clave fica guardada e o
+                  // payments-webhook vincula (com retomada única) quando o evento chegar. Falha aqui nunca derruba o bloco.
+                  if (_gwLink?.charge_id) {
+                    try {
+                      const _claves = extractClavesRastreo([processedContent, norm.content].filter((x) => typeof x === "string").join("\n"));
+                      if (_claves.length > 0) {
+                        const _m = await matchReceiptToPayment({ supabase, resume: async () => {} }, {
+                          conversationId, claves: _claves, messageId: (norm as any)?.messageId ?? null,
+                        });
+                        console.log("[payments] receipt_clave_match", { block_id: b.id, status: _m.status, reason: (_m as any).reason });
+                        await supabase.from("ai_receipt_audits").insert({
+                          conversation_id: conversationId, lead_id: (conv as any).lead_id || null, organization_id: (conv as any).organization_id || null,
+                          funnel_id: (conv as any).current_flow_id || null, block_id: b.id, message_id: (norm as any)?.messageId || null,
+                          source: "payment_clave", decision: `payment_clave_${_m.status}`, error: (_m as any).reason ?? null,
+                          metadata: { claves_count: _claves.length, tails: _claves.map((c) => c.slice(-4)) },
+                        });
+                      }
+                    } catch (_e) { console.warn("[payments] receipt_clave_match_failed", String((_e as any)?.message ?? _e).slice(0, 120)); }
+                  }
                   const _gateDecision = await evaluateReceiptGate({
                     loadCharge: async (id) => {
                       const { data } = await supabase.from("payment_charges").select("id, status, amount, paid_amount, consumed_at, consumed_block_id").eq("id", id).maybeSingle();
