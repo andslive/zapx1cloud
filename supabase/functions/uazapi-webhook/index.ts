@@ -11128,7 +11128,10 @@ FORMATO JSON:
                 const evalRule = (rule: any) => {
                   if (!rule || !rule.variable || !rule.operator) return false;
 
-                  const lhsRaw = flowVariables[rule.variable] || "";
+                  // `gateway.<campo>` (ex.: gateway.value, valor pago) vive em __gateway, não em chave plana.
+                  const lhsRaw = String(rule.variable).startsWith("gateway.")
+                    ? ((flowVariables as any).__gateway?.[String(rule.variable).slice(8)] ?? "")
+                    : flowVariables[rule.variable] || "";
                   const lhs = normalize(lhsRaw);
                   const rhs = normalize(rule.value);
 
