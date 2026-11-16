@@ -1,0 +1,49 @@
+// Reconciliação por consulta autenticada (cron/serviço): confirma cobranças pendentes quando o
+// webhook atrasa ou falha. Autenticação: somente service_role (verify_jwt + checagem do token).
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import { reconcileCharge } from "../_shared/payment-gateways/reconcile.ts";
+import { bindUnmatchedEvent } from "../_shared/payment-gateways/bind-event.ts";
+import { resumeLinkedExecution } from "../_shared/payment-gateways/resume.ts";
+
+const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "Content-Type": "application/json" } });
+
+function jwtRole(tok: string): string | null {
+  try {
+    const p = tok.split(".")[1];
+    if (!p) return null;
+    const j = JSON.parse(atob(p.replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof j?.role === "string" ? j.role : null;
+  } catch { return null; }
+}
+
+Deno.serve(async (req) => {
+  const url = Deno.env.get("SUPABASE_URL")!;
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  // service_role: igualdade com a chave do ambiente OU JWT com role=service_role (assinatura já validada pelo
+  // gateway com verify_jwt=true; o ambiente pode injetar uma chave de formato diferente da legada).
+  const bearer = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (!(bearer === key || jwtRole(bearer) === "service_role")) return json({ error: "unauthorized" }, 401);
+  const sb: any = createClient(url, key);
+  const deps = { supabase: sb, fetch, resume: (c: any, why: "paid" | "instructions") => resumeLinkedExecution(sb, c, why).then(() => {}) };
+  const body = await req.json().catch(() => ({}));
+  // Vínculo manual de pagamento sem cobrança (`unknown_charge`) a um pedido: exige o sufixo da clave de rastreo.
+  if (body.action === "bind_event") {
+    if (!body.eventId || !body.conversationId || !body.referenceSuffix) return json({ error: "missing_fields" }, 400);
+    const r = await bindUnmatchedEvent(deps, {
+      eventRowId: String(body.eventId), conversationId: String(body.conversationId),
+      referenceSuffix: String(body.referenceSuffix), operator: String(body.operator ?? "operator"),
+    });
+    return json(r, r.ok ? 200 : 422);
+  }
+  // Janela curta e limite fixo: nunca varre o histórico.
+  const since = new Date(Date.now() - 48 * 3600_000).toISOString();
+  const { data: rows } = body.chargeId
+    ? { data: [{ id: body.chargeId }] }
+    : await sb.from("payment_charges").select("id").in("status", ["awaiting_instructions", "pending"]).gte("created_at", since).limit(50);
+  const out: Record<string, number> = {};
+  for (const r of rows ?? []) {
+    const res = await reconcileCharge(deps, r.id);
+    out[res.outcome] = (out[res.outcome] ?? 0) + 1;
+  }
+  return json({ ok: true, processed: rows?.length ?? 0, outcomes: out });
+});
