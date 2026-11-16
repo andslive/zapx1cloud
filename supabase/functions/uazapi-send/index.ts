@@ -1,5 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneBR } from "../_shared/phone.ts";
+import { buildCopyButtonMenuPayload } from "../_shared/copy-button.ts";
+import { buildQuickButtonsMenuPayload, numberedMenuText } from "../_shared/quick-buttons.ts";
 import { dispatchMetaCloudSend, type MetaCloudSendType } from "../_shared/meta-cloud-dispatch.ts";
 
 const corsHeaders = {
@@ -424,6 +426,50 @@ export async function handleUazapiSendRequest(req: Request): Promise<Response> {
              // If the button failed, use the text response as the main result
              if (!res.ok) res = textRes;
           }
+          break;
+        }
+        case "quick_buttons": {
+          // Botões de resposta reais (≤3) ou lista (4–10) via /send/menu; se a UazAPI recusar,
+          // reserva em texto numerado para o funil não travar.
+          const options = Array.isArray(payload.options) ? payload.options : [];
+          const menuPayload = buildQuickButtonsMenuPayload({
+            number: uazNumber, text: String(payload.text ?? ""), options, footer: payload.footer ?? null,
+          });
+          if (!menuPayload) {
+            return new Response(JSON.stringify({
+              success: false, error_code: "UAZAPI_SEND_FAILED", step_failed: "QUICK_BUTTONS_INVALID_PAYLOAD",
+              message: "quick_buttons requer ao menos uma opção com texto",
+            }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+          }
+          res = await uazFetch(url, apiKey, "/send/menu", menuPayload);
+          if (!res.ok) {
+            console.warn("[uazapi-send] quick_buttons recusado; reserva em texto numerado", { status: res.status });
+            res = await uazFetch(url, apiKey, "/message/text", {
+              number: uazNumber, instance: instance.name,
+              text: numberedMenuText(String(payload.text ?? ""), options), delay: sendDelay,
+            });
+          }
+          break;
+        }
+        case "copy_button": {
+          // POST /send/menu type=button: imagem opcional em `file`, legenda em `text` (sem legenda: U+200B; "" dá 400).
+          // Sem fallback de texto/legenda: se a UazAPI rejeitar, o erro é devolvido como está.
+          const menuPayload = buildCopyButtonMenuPayload({
+            number: uazNumber,
+            label: String(payload.label ?? ""),
+            value: String(payload.value ?? ""),
+            imageUrl: payload.url ?? payload.file ?? null,
+            caption: payload.caption ?? payload.text ?? null,
+          });
+          if (!menuPayload) {
+            return new Response(JSON.stringify({
+              success: false,
+              error_code: "UAZAPI_SEND_FAILED",
+              step_failed: "COPY_BUTTON_INVALID_PAYLOAD",
+              message: "copy_button requer rótulo e valor a copiar",
+            }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+          }
+          res = await uazFetch(url, apiKey, "/send/menu", menuPayload);
           break;
         }
         default:
