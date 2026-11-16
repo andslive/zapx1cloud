@@ -13,9 +13,7 @@ import {
   normalizeKind,
   genBlockId,
   sha256Hex,
-  selectEligibleLeadMessages,
   type FlowBlockLike,
-  type RawMessageLike,
 } from "./clone-funnel-core.ts";
 import { assert, assertEquals, assertNotEquals, assertThrows } from "https://deno.land/std@0.208.0/assert/mod.ts";
 
@@ -307,66 +305,4 @@ Deno.test('sha256Hex: determinístico para a mesma entrada', async () => {
   assertEquals(h1, h2);
   const h3 = await sha256Hex('outra coisa');
   assertNotEquals(h1, h3);
-});
-
-// ── selectEligibleLeadMessages (Fase 4B — extração pura, cobertura dos ────
-//    2 comportamentos antes só validados por leitura de código) ───────────
-
-function msg(over: Partial<RawMessageLike> & { id: string }): RawMessageLike {
-  return { direction: 'inbound', sender_type: 'visitor', is_deleted: false, ...over };
-}
-
-Deno.test('selectEligibleLeadMessages: mantém a ordem cronológica original de entrada (não reordena)', () => {
-  const input = [msg({ id: 'm1' }), msg({ id: 'm2' }), msg({ id: 'm3' })];
-  const { eligible } = selectEligibleLeadMessages(input);
-  assertEquals(eligible.map((m) => m.id), ['m1', 'm2', 'm3']);
-});
-
-Deno.test('selectEligibleLeadMessages: mantém a ordem mesmo com mensagens excluídas intercaladas', () => {
-  const input = [
-    msg({ id: 'lead-1' }),
-    msg({ id: 'agent-1', direction: 'outbound', sender_type: 'agent' }),
-    msg({ id: 'lead-2' }),
-    msg({ id: 'bot-1', direction: 'outbound', sender_type: 'bot' }),
-    msg({ id: 'lead-3' }),
-  ];
-  const { eligible } = selectEligibleLeadMessages(input);
-  assertEquals(eligible.map((m) => m.id), ['lead-1', 'lead-2', 'lead-3']);
-});
-
-Deno.test('selectEligibleLeadMessages: exclui mensagem enviada pela instância/atendente (direction=outbound)', () => {
-  const input = [msg({ id: 'm1', direction: 'outbound' })];
-  const { eligible } = selectEligibleLeadMessages(input);
-  assertEquals(eligible.length, 0);
-});
-
-Deno.test('selectEligibleLeadMessages: exclui mensagem de agente humano (sender_type=agent)', () => {
-  const input = [msg({ id: 'm1', sender_type: 'agent' })];
-  const { eligible } = selectEligibleLeadMessages(input);
-  assertEquals(eligible.length, 0);
-});
-
-Deno.test('selectEligibleLeadMessages: exclui mensagem do bot (sender_type=bot)', () => {
-  const input = [msg({ id: 'm1', sender_type: 'bot' })];
-  const { eligible } = selectEligibleLeadMessages(input);
-  assertEquals(eligible.length, 0);
-});
-
-Deno.test('selectEligibleLeadMessages: exclui mensagem marcada como deletada', () => {
-  const input = [msg({ id: 'm1', is_deleted: true })];
-  const { eligible } = selectEligibleLeadMessages(input);
-  assertEquals(eligible.length, 0);
-});
-
-Deno.test('selectEligibleLeadMessages: sinais ambíguos (direction e sender_type contraditórios) nunca entram em eligible, e são reportados em ambiguous', () => {
-  const input = [msg({ id: 'm1', direction: 'inbound', sender_type: 'agent' })];
-  const { eligible, ambiguous } = selectEligibleLeadMessages(input);
-  assertEquals(eligible.length, 0, 'ambíguo nunca entra silenciosamente em eligible');
-  assertEquals(ambiguous.map((m) => m.id), ['m1']);
-});
-
-Deno.test('selectEligibleLeadMessages: mensagem genuinamente do lead nunca aparece em ambiguous', () => {
-  const input = [msg({ id: 'lead-1' })];
-  const { ambiguous } = selectEligibleLeadMessages(input);
-  assertEquals(ambiguous.length, 0);
 });
