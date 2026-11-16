@@ -7,10 +7,22 @@ import { resumeLinkedExecution } from "../_shared/payment-gateways/resume.ts";
 
 const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "Content-Type": "application/json" } });
 
+function jwtRole(tok: string): string | null {
+  try {
+    const p = tok.split(".")[1];
+    if (!p) return null;
+    const j = JSON.parse(atob(p.replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof j?.role === "string" ? j.role : null;
+  } catch { return null; }
+}
+
 Deno.serve(async (req) => {
   const url = Deno.env.get("SUPABASE_URL")!;
   const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  if (req.headers.get("Authorization") !== `Bearer ${key}`) return json({ error: "unauthorized" }, 401);
+  // service_role: igualdade com a chave do ambiente OU JWT com role=service_role (assinatura já validada pelo
+  // gateway com verify_jwt=true; o ambiente pode injetar uma chave de formato diferente da legada).
+  const bearer = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (!(bearer === key || jwtRole(bearer) === "service_role")) return json({ error: "unauthorized" }, 401);
   const sb: any = createClient(url, key);
   const deps = { supabase: sb, fetch, resume: (c: any, why: "paid" | "instructions") => resumeLinkedExecution(sb, c, why).then(() => {}) };
   const body = await req.json().catch(() => ({}));
