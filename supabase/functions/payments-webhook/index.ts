@@ -72,7 +72,7 @@ Deno.serve(async (req) => {
         const { data: row } = await sb.from("payment_gateway_events").select("id, organization_id, gateway_account_id, payload")
           .eq("gateway_account_id", account.id).eq("event_id", req.headers.get("x-leonapay-event-id") ?? String(body.id)).maybeSingle();
         if (row) {
-          const m = await matchEventToClaims(deps, row);
+          const m = await matchEventToClaims(deps, row, { expectedDestinationTail: Deno.env.get("SPEI_DESTINATION_TAIL") || null });
           console.log("[payments-webhook] clave_match", m.status, (m as any).reason ?? "");
         }
       } catch (e) { console.warn("[payments-webhook] clave_match_failed", String((e as any)?.message ?? e).slice(0, 120)); }
