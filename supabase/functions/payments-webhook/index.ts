@@ -5,6 +5,7 @@ import { interpretColocaEvent, isColocaPing, verifyColocaDelivery } from "../_sh
 import { interpretLeonaEvent, verifyLeonaDelivery } from "../_shared/payment-gateways/leonapay.ts";
 import { resumeLinkedExecution } from "../_shared/payment-gateways/resume.ts";
 import { settleChargeState } from "../_shared/payment-gateways/settle.ts";
+import { matchEventToClaims } from "../_shared/payment-gateways/receipt-match.ts";
 import { isProvider } from "../_shared/payment-gateways/catalog.ts";
 
 const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "Content-Type": "application/json" } });
@@ -64,6 +65,18 @@ Deno.serve(async (req) => {
       account, eventId: req.headers.get("x-leonapay-event-id") ?? String(body.id), eventType: String(body.event ?? body.type),
       payload: body, state: ev.state, lookup: { reference: ev.reference }, source: "webhook",
     });
+    // SPEI de CLABE fixa sem cobrança: se a lead JÁ mandou o comprovante com a mesma clave de rastreo, vincula e retoma (1x).
+    // Qualquer falha aqui é só log: o evento já está persistido como unknown_charge e o 2xx não pode depender disso.
+    if (r.outcome === "unknown_charge" && ev.state.status === "paid") {
+      try {
+        const { data: row } = await sb.from("payment_gateway_events").select("id, organization_id, gateway_account_id, payload")
+          .eq("gateway_account_id", account.id).eq("event_id", req.headers.get("x-leonapay-event-id") ?? String(body.id)).maybeSingle();
+        if (row) {
+          const m = await matchEventToClaims(deps, row);
+          console.log("[payments-webhook] clave_match", m.status, (m as any).reason ?? "");
+        }
+      } catch (e) { console.warn("[payments-webhook] clave_match_failed", String((e as any)?.message ?? e).slice(0, 120)); }
+    }
     return json({ ok: true, outcome: r.outcome });
   } catch (_e) {
     // Evento já persistido sem processed_at: o provedor reenvia e o reprocessamento é seguro.
