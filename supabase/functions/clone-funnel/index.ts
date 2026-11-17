@@ -8,7 +8,6 @@ import {
   extractMedia,
   cloneTemplateBlocks,
   computeTopologicalRoot,
-  selectEligibleLeadMessages,
   type MediaKind,
   type ExtractedMedia,
 } from "../_shared/clone-funnel-core.ts";
@@ -197,11 +196,20 @@ serve(async (req) => {
       throw new Error(`Falha ao buscar mensagens: ${msgError.message}`);
     }
 
-    // Fase 4B — extraído para selectEligibleLeadMessages() (clone-funnel-core.ts),
-    // mesma lógica exata, agora testável sem client Supabase/rede. Autoria/
-    // direção ambígua (registros legados divergentes): não incluir
+    const eligible = (allMessages || []).filter((m: any) => {
+      if (m.direction !== 'inbound') return false;
+      if (m.sender_type !== 'visitor') return false;
+      if (m.is_deleted === true) return false;
+      return true;
+    });
+
+    // Autoria/direção ambígua (registros legados divergentes): não incluir
     // silenciosamente, apenas registrar para o relatório.
-    const { eligible, ambiguous } = selectEligibleLeadMessages(allMessages || []);
+    const ambiguous = (allMessages || []).filter((m: any) => {
+      const looksInbound = m.direction === 'inbound' || m.sender_type === 'visitor';
+      const looksOutbound = m.direction === 'outbound' || m.sender_type === 'agent' || m.sender_type === 'bot';
+      return looksInbound && looksOutbound;
+    });
     if (ambiguous.length > 0) {
       console.warn(`[clone-funnel] ${ambiguous.length} mensagem(ns) com direção/autoria ambígua na conversa ${conversation_id} — excluídas por segurança.`);
     }
