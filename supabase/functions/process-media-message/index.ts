@@ -152,6 +152,7 @@ async function describeImage(
         "3. Data e Hora. " +
         "Seja extremamente preciso. Se houver múltiplos valores, use o valor total pago. " +
         "Se o comprovante trouxer \"Clave de rastreo\" (SPEI, México), transcreva-a EXATAMENTE, caractere por caractere, em uma linha própria: \"Clave de rastreo: <valor>\". Nunca invente nem complete a clave." +
+        " Se o comprovante mostrar a conta ou CLABE de DESTINO (\"Cuenta destino\", \"Envío a\", \"Cuenta de destino\"), transcreva em uma linha própria: \"Cuenta destino: <últimos 4 dígitos>\" (apenas os dígitos visíveis; não invente) e o valor em \"Monto: <valor>\"." +
         "Responda de forma direta e objetiva, começando pelos dados extraídos se for um comprovante. " +
         "Se não for um comprovante, descreva brevemente o conteúdo da imagem. " +
         "Se a imagem estiver ilegível, descreva o que é possível ver.",
@@ -244,6 +245,7 @@ async function analyzeText(
             "3. Data e Hora. " +
             "Se for um comprovante, sua resposta deve começar com 'COMPROVANTE IDENTIFICADO' e listar os dados. " +
             "Se o comprovante trouxer \"Clave de rastreo\" (SPEI, México), transcreva-a EXATAMENTE, caractere por caractere, em uma linha própria: \"Clave de rastreo: <valor>\". Nunca invente nem complete a clave." +
+        " Se o comprovante mostrar a conta ou CLABE de DESTINO (\"Cuenta destino\", \"Envío a\", \"Cuenta de destino\"), transcreva em uma linha própria: \"Cuenta destino: <últimos 4 dígitos>\" (apenas os dígitos visíveis; não invente) e o valor em \"Monto: <valor>\"." +
             "Se não for um comprovante, resuma brevemente o conteúdo do texto.",
         },
         { role: "user", content: `Texto extraído do PDF:\n\n${text}` },

@@ -9118,13 +9118,15 @@ Mensagem do lead:
                       if (_claves.length > 0) {
                         const _m = await matchReceiptToPayment({ supabase, resume: async () => {} }, {
                           conversationId, claves: _claves, messageId: (norm as any)?.messageId ?? null,
+                          receiptText: [processedContent, norm.content].filter((x) => typeof x === "string").join("\n"),
+                          expectedDestinationTail: Deno.env.get("SPEI_DESTINATION_TAIL") || null,
                         });
                         console.log("[payments] receipt_clave_match", { block_id: b.id, status: _m.status, reason: (_m as any).reason });
                         await supabase.from("ai_receipt_audits").insert({
                           conversation_id: conversationId, lead_id: (conv as any).lead_id || null, organization_id: (conv as any).organization_id || null,
                           funnel_id: (conv as any).current_flow_id || null, block_id: b.id, message_id: (norm as any)?.messageId || null,
                           source: "payment_clave", decision: `payment_clave_${_m.status}`, error: (_m as any).reason ?? null,
-                          metadata: { claves_count: _claves.length, tails: _claves.map((c) => c.slice(-4)) },
+                          metadata: { claves_count: _claves.length, tails: _claves.map((c) => c.slice(-4)), partial: (_m as any).partial ?? null },
                         });
                       }
                     } catch (_e) { console.warn("[payments] receipt_clave_match_failed", String((_e as any)?.message ?? _e).slice(0, 120)); }
