@@ -97,3 +97,14 @@ Deno.test("timeDeltaMinutes", () => {
   assertEquals(timeDeltaMinutes("2026-11-16T19:26:00Z", "2026-11-16T19:27:11Z"), -1);
   assertEquals(timeDeltaMinutes(null, "x"), null);
 });
+
+Deno.test("parcial: trecho genérico (banco+data, 15 chars de 24) NÃO identifica a transação → manual (comprovante forjado/outro pagamento)", () => {
+  const cand = [{ id: "e1", reference: "spei-MBAN01002611170086026877", amount: 100, currency: "MXN", paidAt: "2026-11-17T22:54:04Z" }];
+  const generic = decidePartialMatch({ legible: "MBAN01002611170", candidates: cand, boundWithSameFragment: 0, evidence: { amount: 100, destinationTail: "715" }, expectedDestinationTail: "2715" });
+  assertEquals(generic.decision, "manual"); assertEquals((generic as any).reason, "fragment_not_specific");
+  // quase toda a clave (faltam 4) → aprova; faltam 6 → manual
+  const ok = decidePartialMatch({ legible: "MBAN010026111700860", candidates: cand, boundWithSameFragment: 0, evidence: { amount: 100, destinationTail: "715" }, expectedDestinationTail: "2715" });
+  assertEquals(ok.decision, "approve");
+  const six = decidePartialMatch({ legible: "MBAN0100261117008", candidates: cand, boundWithSameFragment: 0, evidence: { amount: 100, destinationTail: "715" }, expectedDestinationTail: "2715" });
+  assertEquals((six as any).reason, "fragment_not_specific");
+});

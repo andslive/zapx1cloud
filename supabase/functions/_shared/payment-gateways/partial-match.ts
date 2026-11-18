@@ -2,7 +2,8 @@
 // Complementa a igualdade exata de `receipt-match.ts`; é função pura (sem banco) para ser testável.
 //
 // Aprova automaticamente SOMENTE quando TODAS as condições valem:
-//  - o trecho legível tem ao menos MIN_PARTIAL_LEN caracteres e é prefixo (ou sufixo) da referência;
+//  - o trecho legível tem ao menos MIN_PARTIAL_LEN caracteres, é prefixo (ou sufixo) da referência e faltam no máximo
+//    MAX_MISSING_CHARS caracteres (o trecho genérico banco+data não identifica a transação);
 //  - corresponde a UM único `payment.paid` SPEI confirmado e ainda sem vínculo (mesma conta de gateway),
 //    e a nenhum evento já vinculado (senão o trecho não identifica a transação);
 //  - o evento é em MXN e o valor lido no comprovante é IGUAL ao valor confirmado pela LeonaPay (doação de valor livre:
@@ -13,6 +14,10 @@
 // Dois candidatos, divergência de valor/moeda/destino, destino sem verificação ou nenhum pagamento confirmado → manual (ou espera).
 
 export const MIN_PARTIAL_LEN = 15;
+/** Quantos caracteres da clave completa podem faltar. Os primeiros caracteres da clave (banco, data) são genéricos e
+ *  iguais entre pagamentos do mesmo dia; sem o trecho sequencial, um comprovante forjado ou de outro pagamento
+ *  "casaria". Faltando mais que isso, o trecho não identifica a transação → revisão manual. */
+export const MAX_MISSING_CHARS = 5;
 
 export type PartialCandidate = { id: string; reference: string; amount: number | null; currency: string | null; paidAt: string | null };
 export type PartialEvidence = {
@@ -91,6 +96,10 @@ export function decidePartialMatch(i: {
   const c = matches[0];
   ev.event_id = c.id;
   ev.relation = partialRelation(legible, refClave(c.reference));
+  // Especificidade: o trecho precisa cobrir quase toda a clave (inclui parte da sequência única do banco).
+  const missing = refClave(c.reference).length - legible.length;
+  ev.missing_chars = missing;
+  if (missing > MAX_MISSING_CHARS) return { decision: "manual", reason: "fragment_not_specific", evidence: ev };
   const cur = String(c.currency ?? "").toUpperCase();
   if (cur !== String(i.expectedCurrency ?? "MXN").toUpperCase()) return { decision: "manual", reason: "currency_mismatch", evidence: ev };
   // Valor livre: o comprovante precisa informar o valor e ele tem que ser o do pagamento confirmado.
