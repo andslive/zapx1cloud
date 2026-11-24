@@ -19,8 +19,8 @@ Projeto Supabase: `ydunpoqdhijhnrarohiz`. Leituras de 2026-11-24 (somente leitur
 ## 2. Fontes do que será publicado
 
 - `uazapi-webhook`: `main` `69484ce` (idêntico ao publicado) **+ só** a mudança em `handleAdminStatusAlert`. Diff contra o publicado: 9 linhas inseridas / 69 removidas, todas nessa função. Pagamentos, SPEI e funis ficam idênticos.
-- `uazapi-heartbeat`: **versão publicada (`5bed688`) + minha mudança + filtro 20H da `main`** (merge de 3 vias). Preserva presence e logs sem token. Traz `_shared/uazapi-presence-policy.ts` e `uazapi-safe-log.ts` (já em produção; hash igual ao publicado) e seus testes.
-  - **Comportamento novo além do alerta:** a FASE 20H (conexão arquivada fora do cron e do remetente), que a `main` já tem e a produção não tem no heartbeat. Decisão de manter registrada; remover é trivial se preferirem.
+- `uazapi-heartbeat`: **versão publicada (`5bed688`) + minha mudança** (merge de 3 vias; sem filtro 20H). Preserva presence e logs sem token. Traz `_shared/uazapi-presence-policy.ts` e `uazapi-safe-log.ts` (já em produção; hash igual ao publicado) e seus testes.
+  - O filtro de arquivadas (FASE 20H) **não** faz parte desta entrega, por decisão do aprovador: o cron continua selecionando as instâncias como o heartbeat publicado. (O processador de episódios, novo, já ignora/encerra conexões arquivadas.)
   - Atenção ao integrar na `main`: a linhagem `agent/uazapi-presence-policy-heartbeat-20260827` ainda não está na `main`. Esta branch carrega os dois módulos `_shared` dela.
 
 ## 3. Alertas `pending` antigos — como impedir que disparem

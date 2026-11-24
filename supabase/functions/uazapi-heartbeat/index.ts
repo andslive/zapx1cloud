@@ -790,8 +790,7 @@ Deno.serve(async (req) => {
     }
 
     // 2. Health Monitoring
-    // FASE 20H (já na main) — o cron de health monitoring nunca processa conexão arquivada como se fosse ativa.
-    let query = supabase.from("evolution_instances").select("*").is("archived_at", null);
+    let query = supabase.from("evolution_instances").select("*");
     
     if (payload.organization_id) {
         query = query.eq("organization_id", payload.organization_id);
