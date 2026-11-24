@@ -3,6 +3,16 @@ import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
 import { classifyStatus, probeInstance } from "../_shared/connection-alerts/status.ts";
 import { processDueEpisodes, type ConnectionInfo, type Deps, type SendOutcome } from "../_shared/connection-alerts/episode.ts";
 import { alertLog, createSupabaseEpisodeStore, reportSuspectedDisconnect } from "../_shared/connection-alerts/store.ts";
+import {
+  decidePresenceReconciliation,
+  loadEnabledPresencePolicies,
+  reconcileInstancePresence,
+  type DesiredPresence,
+} from "../_shared/uazapi-presence-policy.ts";
+import {
+  buildSafeStatusSummary,
+  buildSafeProfileSyncSummary,
+} from "../_shared/uazapi-safe-log.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -42,8 +52,19 @@ async function checkGhostConnection(supabase: any, inst: any, statusData: any, p
     // Normalize state to handle object responses (ghost detected fix)
     let realState: any = "UNKNOWN";
     
-    // [UAZAPI_RAW_STATUS_GHOST]
-    console.log(`[UAZAPI_RAW_STATUS_GHOST] instance=${inst.name}`, JSON.stringify(statusData));
+    // [UAZAPI_RAW_STATUS_GHOST] — achado de segurança corrigido: o corpo
+    // bruto de GET /instance/status inclui o token em texto puro; logamos
+    // só um resumo permitido (nunca o objeto inteiro).
+    console.log(
+      "[UAZAPI_RAW_STATUS_GHOST]",
+      JSON.stringify(buildSafeStatusSummary(statusData, {
+        instanceId: inst.id,
+        instanceName: inst.name,
+        organizationId: inst.organization_id,
+        provider: inst.provider,
+        operation: "ghost_check",
+      })),
+    );
 
     if (statusData.status && typeof statusData.status === 'object' && statusData.status.connected !== undefined) {
         realState = statusData.status.connected ? "CONNECTED" : "DISCONNECTED";
@@ -415,7 +436,7 @@ async function processWebhookHealth(supabase: any, inst: any, platformSettings: 
     }
 }
 
-async function processInstanceHealth(supabase: any, inst: any, platformSettings: any, source: string = 'cron') {
+async function processInstanceHealth(supabase: any, inst: any, platformSettings: any, source: string = 'cron', presencePolicies: Map<string, DesiredPresence> = new Map()) {
 
     const uazapiUrl = String(platformSettings?.uazapi_url || "").replace(/\/$/, "");
     const token = inst.instance_token || platformSettings?.uazapi_admin_token;
@@ -430,8 +451,20 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
 
         const data = await res.json().catch(() => ({}));
         
-        // [UAZAPI_RAW_STATUS] CRITICAL LOG
-        console.log(`[UAZAPI_RAW_STATUS] instance=${inst.name}`, JSON.stringify(data));
+        // [UAZAPI_RAW_STATUS] — achado de segurança corrigido: o corpo
+        // bruto de GET /instance/status inclui o token em texto puro;
+        // logamos só um resumo permitido (nunca o objeto inteiro).
+        console.log(
+          "[UAZAPI_RAW_STATUS]",
+          JSON.stringify(buildSafeStatusSummary(data, {
+            instanceId: inst.id,
+            instanceName: inst.name,
+            organizationId: inst.organization_id,
+            provider: inst.provider,
+            operation: "health_check",
+            httpStatus: res.status,
+          })),
+        );
         
         // Extract real state string from various possible UazAPI response shapes
         let realState: any = "UNKNOWN";
@@ -459,6 +492,47 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
 
         const isConnected = res.ok && (stateStr === "CONNECTED" || stateStr === "OPEN" || stateStr === "ONLINE");
 
+        // Reconciliação de presence (available/unavailable) por organização
+        // — usa exclusivamente o GET /instance/status já feito acima, sem
+        // consulta nova. Decisão pura, testável isoladamente; execução
+        // fail-open (nunca desconecta, nunca bloqueia o restante do
+        // heartbeat, nunca loga token).
+        //
+        // Guard explícito de `res.ok`: em 401/erro, `data` é o corpo de
+        // erro da UazAPI (ex.: {"code":401,"message":"Invalid token."}),
+        // sem `.status`/`.instance` — ou seja, `sessionConnected`/`loggedIn`/
+        // `currentPresence` já ficariam undefined e o gate normal da função
+        // pura já bloquearia o POST. Mesmo assim, tornamos a garantia
+        // EXPLÍCITA aqui (não incidental) para nunca depender só do shape
+        // do corpo de erro permanecer estável.
+        if (res.ok) {
+          try {
+            const presenceDecision = decidePresenceReconciliation({
+              provider: inst.provider,
+              archivedAt: inst.archived_at,
+              organizationId: inst.organization_id,
+              hasToken: !!inst.instance_token,
+              desiredPresenceByOrg: presencePolicies,
+              sessionConnected: (data as any)?.status?.connected,
+              loggedIn: (data as any)?.status?.loggedIn,
+              currentPresence: (data as any)?.instance?.current_presence,
+            });
+            if (presenceDecision.action === "post") {
+              await reconcileInstancePresence(
+                String(platformSettings?.uazapi_url || "").replace(/\/$/, ""),
+                inst.instance_token,
+                presenceDecision.desiredPresence,
+                { id: inst.id, name: inst.name },
+              );
+            }
+          } catch (presenceErr: any) {
+            console.error(
+              "[UAZAPI_PRESENCE_RECONCILE]",
+              JSON.stringify({ instance_id: inst.id, name: inst.name, result: "unexpected_exception", message: presenceErr?.message || String(presenceErr) }),
+            );
+          }
+        }
+
         // Logic for alerting and status sync
         const oldRealState = inst.last_real_whatsapp_state;
         const healthNow = new Date().toISOString();
@@ -466,7 +540,14 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
         // [PROFILE_SYNC_START]
         let metadataUpdates: any = {};
         if (isConnected) {
-            console.log(`[PROFILE_SYNC_RAW] instance=${inst.name}`, JSON.stringify(data));
+            // [PROFILE_SYNC_RAW] — achado de segurança corrigido: o corpo
+            // bruto de GET /instance/status inclui o token em texto puro;
+            // logamos só presença/ausência de campos de perfil e telefone
+            // mascarado, nunca os valores brutos (nome, avatar, telefone).
+            console.log(
+              "[PROFILE_SYNC_RAW]",
+              JSON.stringify(buildSafeProfileSyncSummary(data, { instanceId: inst.id, instanceName: inst.name })),
+            );
             const instanceInfo = data.instance || {};
             
             const raw_whatsapp_name = 
@@ -709,11 +790,9 @@ Deno.serve(async (req) => {
     }
 
     // 2. Health Monitoring
-    // FASE 20H — o cron de health monitoring nunca processa conexão
-    // arquivada como se fosse ativa (nenhum ping/reparo/sync automático
-    // para uma conexão retirada da operação).
+    // FASE 20H (já na main) — o cron de health monitoring nunca processa conexão arquivada como se fosse ativa.
     let query = supabase.from("evolution_instances").select("*").is("archived_at", null);
-
+    
     if (payload.organization_id) {
         query = query.eq("organization_id", payload.organization_id);
     }
@@ -722,7 +801,15 @@ Deno.serve(async (req) => {
 
     if (instances && instances.length > 0) {
         console.log(`[uazapi-heartbeat] processing ${instances.length} instances for sync...`);
-        await Promise.all(instances.map(inst => processInstanceHealth(supabase, inst, platformSettings, source)));
+        // Uma única consulta de políticas de presence por execução do
+        // heartbeat — nunca por instância (custo constante independente da
+        // quantidade de conexões).
+        // `as any`: mesma instanciação genérica excessivamente profunda de
+        // @supabase/supabase-js já contornada em outros pontos desta base
+        // (duas instanciações distintas resolvidas via esm.sh) — não é
+        // mudança de comportamento.
+        const presencePolicies = await loadEnabledPresencePolicies(supabase as any);
+        await Promise.all(instances.map(inst => processInstanceHealth(supabase, inst, platformSettings, source, presencePolicies)));
     }
 
     // 2b. Episódios de desconexão vencidos (confirmação direta na UazAPI + alerta único). Persistente no banco.
