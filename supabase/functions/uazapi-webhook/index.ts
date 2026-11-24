@@ -4,6 +4,7 @@
  * It normalizes payloads from UazAPI and processes them into the CRM.
  */
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { reportSuspectedDisconnect } from "../_shared/connection-alerts/store.ts";
 import { encodeBase64 } from "https://deno.land/std@0.207.0/encoding/base64.ts";
 import { normalizePhoneBR, phoneVariantsBR } from "../_shared/phone.ts";
 import {
@@ -763,16 +764,6 @@ async function handleAdminStatusAlert(
       last_real_whatsapp_state: newState 
     }).eq("id", instance.id);
 
-    // Get organization settings for notifications
-    const { data: org, error: orgError } = await supabase
-      .from("organizations")
-      .select("admin_status_notify_phone")
-      .eq("id", orgId)
-      .single();
-
-    if (orgError || !org?.admin_status_notify_phone) return;
-
-    const notifyPhone = org.admin_status_notify_phone;
     const criticalStatuses = ["offline", "disconnected", "error", "waiting_qr", "logged_out", "close", "restricted", "ghost", "ack_stale"];
     const isCritical = criticalStatuses.includes(newState.toLowerCase());
 
@@ -781,67 +772,16 @@ async function handleAdminStatusAlert(
        await supabase.from("evolution_instances").update({ status: "disconnected" }).eq("id", instance.id);
     }
 
-
-    // Rate limit check: max 1 alert per 30 mins for same instance + status
-    const cooldownMins = 30;
-    const cooldownAgo = new Date(Date.now() - cooldownMins * 60 * 1000).toISOString();
-
-    const { data: recentAlert } = await supabase
-      .from("admin_status_alerts")
-      .select("id")
-      .eq("connection_id", instance.id)
-      .eq("new_status", newState)
-      .gte("created_at", cooldownAgo)
-
-      .limit(1)
-      .maybeSingle();
-
-    if (recentAlert) {
-      await supabase.from("admin_status_alerts").insert({
-        organization_id: orgId,
-        connection_id: instance.id,
-        connection_name: instance.name,
-        connection_phone: instance.phone_number,
-        old_status: oldStatus,
-        new_status: newState,
-        notify_phone: notifyPhone,
-        message: "Status change detected but skipped due to rate limit.",
-        status: "skipped_rate_limit"
+    // Mudança de status NÃO envia mais WhatsApp nem grava alerta pendente (isso gerava ruído a cada oscilação da
+    // UazAPI). Uma queda explícita apenas REGISTRA a suspeita (idempotente, uma por conexão); o aviso só sai se o
+    // heartbeat confirmar a desconexão por 2 consultas diretas, após 5 min (_shared/connection-alerts/episode.ts).
+    const suspectStates = ["close", "disconnected", "logged_out", "offline"];
+    const wasConnected = oldStatus === "connected" || oldStatus === "open";
+    if (wasConnected && suspectStates.includes(newState.toLowerCase())) {
+      await reportSuspectedDisconnect(supabase, {
+        organization_id: orgId, connection_id: instance.id, connection_name: instance.name, source: "webhook",
       });
-      return;
     }
-
-    const timestamp = format(new Date(), "dd/MM/yyyy HH:mm");
-    const emoji = isCritical ? "⚠️" : "ℹ️";
-    const title = isCritical ? "ALERTA CRM - Conexão Caiu" : "INFO CRM - Status de Conexão";
-    
-    const message = `${emoji} ${title}\n\nConexão: ${instance.name}\nNúmero: +${instance.phone_number || "Desconhecido"}\nStatus anterior: ${oldStatus}\nStatus atual: ${newState}\nHorário: ${timestamp}\n\nAção sugerida: Verifique a instância na tela Conexões.`;
-
-    // Create alert record as pending
-    const { data: alert, error: alertError } = await supabase
-      .from("admin_status_alerts")
-      .insert({
-        organization_id: orgId,
-        connection_id: instance.id,
-        connection_name: instance.name,
-        connection_phone: instance.phone_number,
-        old_status: oldStatus,
-        new_status: newState,
-        notify_phone: notifyPhone,
-        message: message,
-        status: "pending"
-      })
-      .select()
-      .single();
-
-    if (alertError) throw alertError;
-
-    // Trigger processing of pending alerts (best effort)
-    // We don't await this to keep the webhook response fast
-    supabase.functions.invoke("whatsapp-proxy", {
-      body: { action: "process_pending_alerts", organization_id: orgId }
-    }).catch(console.error);
-
   } catch (err) {
     console.error("[admin-alert] Error handling status change:", err);
   }

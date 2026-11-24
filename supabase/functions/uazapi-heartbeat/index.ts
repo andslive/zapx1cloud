@@ -1,5 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { format } from "https://deno.land/std@0.207.0/datetime/mod.ts";
+import { classifyStatus, probeInstance } from "../_shared/connection-alerts/status.ts";
+import { processDueEpisodes, type ConnectionInfo, type Deps, type SendOutcome } from "../_shared/connection-alerts/episode.ts";
+import { alertLog, createSupabaseEpisodeStore, reportSuspectedDisconnect } from "../_shared/connection-alerts/store.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -71,9 +74,10 @@ async function checkGhostConnection(supabase: any, inst: any, statusData: any, p
             details: { status: "logged_out" }
         });
         
-        // Critical status update to trigger alert if not already logged_out
+        // Atualiza o status do painel como antes, mas NÃO notifica: a queda só gera alerta depois de confirmada
+        // (episódio de desconexão: 5 min + 2 consultas válidas). Ver _shared/connection-alerts/episode.ts.
         if (inst.status !== "logged_out") {
-            await handleAdminStatusAlert(supabase, inst, "logged_out", "Session disconnected/Logged out");
+            await applyInstanceStatus(supabase, inst, "logged_out");
         }
         return false;
     }
@@ -156,11 +160,10 @@ async function checkGhostConnection(supabase: any, inst: any, statusData: any, p
             one_tick_count: oneTickCount
         }).eq("id", inst.id);
         
-        // If not already in a failing state, trigger an alert for Ghost Connection
-        // Impedir alerta se o motivo for wa_state e estiver em modo debounce/retry (implementado via rate limit de 30min já existente)
-        // E NÃO disparar se for um falso positivo de estado
+        // Ghost mantém a recuperação e o status do painel como antes, mas deixa de enviar WhatsApp: socket
+        // instável não é desconexão confirmada.
         if (inst.last_real_whatsapp_state === "CONNECTED" || inst.status === "connected") {
-             await handleAdminStatusAlert(supabase, inst, "ghost", `Ghost detected: ${reasons.join(", ")}`);
+             await applyInstanceStatus(supabase, inst, "ghost");
         }
 
         return false; 
@@ -180,154 +183,149 @@ async function checkGhostConnection(supabase: any, inst: any, statusData: any, p
 }
 
 /**
- * Admin Notification Logic for Connection Status Changes
+ * Atualiza o status da instância no CRM (painel) a partir do estado real observado.
+ * É a parte de BANCO do antigo `handleAdminStatusAlert`, mantida igual: crítico → "disconnected"; conectado → "connected".
+ * NÃO notifica ninguém. A notificação agora é só o alerta de desconexão confirmada (ver mais abaixo).
  */
-async function handleAdminStatusAlert(supabase: any, instance: any, newState: string, reason: string) {
+async function applyInstanceStatus(supabase: any, instance: any, newState: string) {
   try {
-    const oldStatus = instance.status;
-    const oldRealState = instance.last_real_whatsapp_state;
-    const orgId = instance.organization_id;
-
-    // Normalizing states for comparison
     const normalizedNew = newState.toLowerCase();
-    const normalizedOld = (oldRealState || oldStatus || "").toLowerCase();
-
-    // Critical statuses that MUST drop the "API Principal" and trigger alerts
     const criticalStatuses = ["offline", "disconnected", "error", "waiting_qr", "logged_out", "close", "restricted", "ghost"];
     const isCritical = criticalStatuses.includes(normalizedNew);
-
-    // Update DB status immediately
     const now = new Date().toISOString();
     const updates: any = {
       last_health_at: now,
       last_real_whatsapp_ping: now,
       last_real_whatsapp_state: newState.toUpperCase(),
-      updated_at: now
+      updated_at: now,
     };
-
-    // If critical, force status to disconnected to drop "UazAPI Online" in UI
-    if (isCritical) {
-       updates.status = "disconnected";
-    } else if (normalizedNew === "connected" || normalizedNew === "open") {
-       updates.status = "connected";
-    }
-
+    if (isCritical) updates.status = "disconnected";
+    else if (normalizedNew === "connected" || normalizedNew === "open") updates.status = "connected";
     await supabase.from("evolution_instances").update(updates).eq("id", instance.id);
-
-    // 1. Get organization settings for notifications
-    const { data: org, error: orgError } = await supabase
-      .from("organizations")
-      .select("admin_status_notify_phone")
-      .eq("id", orgId)
-      .single();
-
-    if (orgError || !org?.admin_status_notify_phone) return;
-
-    const notifyPhone = org.admin_status_notify_phone;
-
-    // 2. Rate limit check: max 1 alert per 30 mins for same instance + status (as requested)
-    const cooldownMins = 30;
-    const cooldownAgo = new Date(Date.now() - cooldownMins * 60 * 1000).toISOString();
-    
-    const { data: recentAlert } = await supabase
-      .from("admin_status_alerts")
-      .select("id")
-      .eq("connection_id", instance.id)
-      .eq("new_status", newState)
-      .gte("created_at", cooldownAgo)
-      .limit(1)
-      .maybeSingle();
-
-    if (recentAlert) {
-      console.log(`[uazapi-heartbeat] Skip alert for ${instance.name} (${newState}) - Rate limited`);
-      return;
-    }
-
-    // 3. Send Notification via WhatsApp (using a fallback instance or system instance)
-    const timestamp = format(new Date(), "dd/MM/yyyy HH:mm");
-    const emoji = isCritical ? "⚠️" : "ℹ️";
-    const title = isCritical ? "ALERTA CRM - Conexão Problema" : "INFO CRM - Status de Conexão";
-    
-    const message = `${emoji} *${title}*\n\n*Instância:* ${instance.name}\n*Número:* +${instance.phone_number || "Desconhecido"}\n*Estado Anterior:* ${oldRealState || oldStatus}\n*Estado Atual:* ${newState}\n*Motivo:* ${reason}\n*Horário:* ${timestamp}\n\n_Ação sugerida: Verifique a instância no painel de Conexões._`;
-
-    // Find a healthy instance to send the alert.
-    // FASE 20H — uma conexão arquivada nunca pode ser escolhida como
-    // remetente do alerta administrativo.
-    const { data: sender } = await supabase
-        .from("evolution_instances")
-        .select("*")
-        .eq("status", "connected")
-        .eq("organization_id", orgId)
-        .is("archived_at", null)
-        .limit(1)
-        .maybeSingle();
-
-    if (!sender) {
-        console.warn(`[uazapi-heartbeat] No healthy instance to send alert for org ${orgId}`);
-        return;
-    }
-
-
-    // 4. Log to admin_notification_logs
-    const logData = {
-        organization_id: orgId,
-        connection_id: instance.id,
-        instance_name: instance.name,
-        old_status: oldRealState || oldStatus,
-        new_status: newState,
-        reason: reason,
-        sent_to: notifyPhone,
-        payload: { message },
-        created_at: now
-    };
-
-    // Trigger WhatsApp send using uazapi-send (the official channel used by CRM)
-    const sendRes = await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/uazapi-send`, {
-        method: "POST",
-        headers: {
-            "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-            organization_id: orgId,
-            instance_id: sender.id, // ID of the connected instance
-            type: "text",
-            to: notifyPhone,
-            payload: { 
-                text: message,
-                skip_warmup: true 
-            }
-        })
-    });
-
-    const sendResult = await sendRes.json().catch(() => ({ error: "Failed to parse response" }));
-    const success = sendRes.ok && sendResult.success === true;
-
-    await supabase.from("admin_notification_logs").insert({
-        ...logData,
-        success: success,
-        send_response: sendResult,
-        error: success ? null : JSON.stringify(sendResult)
-    });
-
-
-    // Also record in legacy admin_status_alerts for compatibility
-    await supabase.from("admin_status_alerts").insert({
-        organization_id: orgId,
-        connection_id: instance.id,
-        connection_name: instance.name,
-        connection_phone: instance.phone_number,
-        old_status: oldRealState || oldStatus,
-        new_status: newState,
-        notify_phone: notifyPhone,
-        message: message,
-        status: success ? "sent" : "error",
-        error_message: success ? null : JSON.stringify(sendResult)
-
-    });
-
   } catch (err) {
-    console.error("[uazapi-heartbeat] Error in handleAdminStatusAlert:", err);
+    console.error("[uazapi-heartbeat] applyInstanceStatus failed:", (err as Error)?.message);
+  }
+}
+
+/**
+ * Envio da mensagem administrativa pelo canal oficial do CRM (uazapi-send), por uma instância saudável da própria
+ * organização (nunca uma arquivada). Mantém o registro em admin_notification_logs/admin_status_alerts.
+ * Classifica o resultado para o episódio: só "sent" confirma; "unknown" (timeout/5xx) NUNCA deve ser reenviado.
+ */
+async function deliverAdminMessage(
+  supabase: any,
+  instance: { id: string; name: string; phone_number?: string | null; organization_id: string },
+  notifyPhone: string,
+  message: string,
+  meta: { oldStatus: string; newStatus: string; reason: string },
+): Promise<SendOutcome> {
+  const orgId = instance.organization_id;
+  const now = new Date().toISOString();
+  const { data: sender } = await supabase
+    .from("evolution_instances")
+    .select("id")
+    .eq("status", "connected")
+    .eq("organization_id", orgId)
+    .neq("id", instance.id)
+    .is("archived_at", null)
+    .limit(1)
+    .maybeSingle();
+  if (!sender) {
+    console.warn(`[uazapi-heartbeat] No healthy instance to send alert for org ${orgId}`);
+    return { outcome: "no_sender" };
+  }
+
+  let sendRes: Response;
+  let sendResult: any;
+  try {
+    sendRes = await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/uazapi-send`, {
+      method: "POST",
+      signal: AbortSignal.timeout(25_000),
+      headers: { "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        organization_id: orgId,
+        instance_id: sender.id,
+        type: "text",
+        to: notifyPhone, // mesmo valor configurado; a normalização continua sendo a do uazapi-send
+        payload: { text: message, skip_warmup: true },
+      }),
+    });
+    sendResult = await sendRes.json().catch(() => ({ error: "Failed to parse response" }));
+  } catch (e) {
+    return { outcome: "unknown", detail: (e as Error)?.name === "TimeoutError" ? "timeout" : "network_error" };
+  }
+  const success = sendRes.ok && sendResult?.success === true;
+
+  try {
+    await supabase.from("admin_notification_logs").insert({
+      organization_id: orgId, connection_id: instance.id, instance_name: instance.name,
+      old_status: meta.oldStatus, new_status: meta.newStatus, reason: meta.reason, sent_to: notifyPhone,
+      payload: { message }, created_at: now, success, send_response: sendResult,
+      error: success ? null : JSON.stringify(sendResult),
+    });
+    await supabase.from("admin_status_alerts").insert({
+      organization_id: orgId, connection_id: instance.id, connection_name: instance.name, connection_phone: instance.phone_number,
+      old_status: meta.oldStatus, new_status: meta.newStatus, notify_phone: notifyPhone, message,
+      status: success ? "sent" : "error", error_message: success ? null : JSON.stringify(sendResult),
+    });
+  } catch (e) {
+    console.error("[uazapi-heartbeat] alert log insert failed:", (e as Error)?.message);
+  }
+
+  if (success) return { outcome: "sent" };
+  // 5xx do uazapi-send pode ter entregue mesmo assim: tratar como desconhecido (nunca reenviar)
+  return sendRes.status >= 500 ? { outcome: "unknown", detail: `http_${sendRes.status}` } : { outcome: "rejected", detail: `http_${sendRes.status}` };
+}
+
+/** Botão "Testar alerta" do painel: mensagem explícita, sem alterar estado nem usar o episódio. */
+async function sendManualTestAlert(supabase: any, instance: any) {
+  const { data: org } = await supabase.from("organizations").select("admin_status_notify_phone").eq("id", instance.organization_id).single();
+  if (!org?.admin_status_notify_phone) return;
+  const timestamp = format(new Date(), "dd/MM/yyyy HH:mm");
+  const message = `ℹ️ *TESTE CRM - Alerta de Conexão*\n\n*Instância:* ${instance.name}\n*Número:* +${instance.phone_number || "Desconhecido"}\n*Horário:* ${timestamp}\n\n_Mensagem de teste: nenhuma queda foi detectada._`;
+  await deliverAdminMessage(supabase, instance, org.admin_status_notify_phone, message, { oldStatus: instance.status, newStatus: "TEST", reason: "Manual trigger via Test Alert button" });
+}
+
+/** Mensagem do ÚNICO alerta por episódio: queda confirmada por 2 consultas diretas à UazAPI. */
+function buildDisconnectMessage(connection: ConnectionInfo, suspectedAt: string): string {
+  const fmt = (iso: string) => format(new Date(new Date(iso).getTime() - 3 * 3600_000), "dd/MM/yyyy HH:mm"); // horário de Brasília
+  return `⚠️ *ALERTA CRM - Conexão desconectada (confirmada)*\n\n*Instância:* ${connection.name}\n*Número:* +${connection.phone_number || "Desconhecido"}\n*Queda detectada em:* ${fmt(suspectedAt)} (Brasília)\n*Confirmação:* 2 consultas diretas à UazAPI, 1 min de intervalo, após 5 min de espera\n\n_Ação sugerida: verifique a instância no painel de Conexões. Você não receberá outro aviso desta queda._`;
+}
+
+/**
+ * Processa os episódios de desconexão vencidos (agendamento persistente: a fila é a tabela, o gatilho é o tick do
+ * heartbeat). Consulta DIRETA à UazAPI com o token real da conexão; sem requisição aberta aguardando.
+ */
+async function processDisconnectEpisodes(supabase: any, platformSettings: any) {
+  const uazapiUrl = String(platformSettings?.uazapi_url || "").replace(/\/$/, "");
+  const tokens = new Map<string, string>();
+  const deps: Deps = {
+    store: createSupabaseEpisodeStore(supabase),
+    now: () => new Date(),
+    loadConnection: async (id) => {
+      const { data } = await supabase.from("evolution_instances")
+        .select("id,name,organization_id,phone_number,archived_at,status,last_real_whatsapp_state,last_health_at,last_connected_at,instance_token")
+        .eq("id", id).maybeSingle();
+      if (!data) return null;
+      const { instance_token, ...info } = data;
+      tokens.set(id, instance_token || platformSettings?.uazapi_admin_token || "");
+      return info as ConnectionInfo;
+    },
+    probe: (conn) => probeInstance(uazapiUrl, tokens.get(conn.id) || "", { timeoutMs: 10_000 }),
+    getRecipient: async (orgId) => {
+      const { data } = await supabase.from("organizations").select("admin_status_notify_phone, admin_status_alerts_enabled").eq("id", orgId).maybeSingle();
+      return { phone: data?.admin_status_notify_phone || null, enabled: data?.admin_status_alerts_enabled !== false };
+    },
+    sendAlert: ({ episode, connection, phone }) =>
+      deliverAdminMessage(supabase, connection, phone, buildDisconnectMessage(connection, episode.suspected_at), {
+        oldStatus: "connected", newStatus: "DISCONNECTED", reason: "Disconnect confirmed by 2 direct UazAPI checks",
+      }),
+    log: alertLog,
+  };
+  try { return await processDueEpisodes(deps, 20); }
+  catch (e) {
+    alertLog("operational_error", { op: "process_due_episodes", code: "episodes_unexpected", error: (e as Error)?.message });
+    return { ok: false, due: 0, processed: 0, errors: 1, error_code: "episodes_unexpected" };
   }
 }
 
@@ -517,17 +515,27 @@ async function processInstanceHealth(supabase: any, inst: any, platformSettings:
             console.log(`[PROFILE_SYNC_PARSED] instance=${inst.name}`, JSON.stringify(metadataUpdates));
         }
 
+        // Classificação estrita: só um estado explícito de desconexão (HTTP ok) comprova queda.
+        const probeResult = classifyStatus(res.ok, res.status, data);
+
         if (oldRealState === "CONNECTED" && !isConnected) {
-            // Queda detectada!
-            if (source !== 'manual_sync') {
-                await handleAdminStatusAlert(supabase, inst, stateStr, "Heartbeat detected disconnect");
+            if (probeResult.kind === "disconnected") {
+                // Possível queda: atualiza o status do painel (como antes) e REGISTRA a suspeita. Não alerta agora:
+                // o alerta só sai após 5 min + 2 consultas diretas válidas (episódio de desconexão).
+                await applyInstanceStatus(supabase, inst, stateStr);
+                if (source !== 'manual_sync') {
+                    await reportSuspectedDisconnect(supabase, {
+                        organization_id: inst.organization_id, connection_id: inst.id, connection_name: inst.name, source: "heartbeat",
+                    });
+                }
+            } else {
+                // Erro HTTP/timeout/resposta vazia/estado transitório NÃO comprovam queda: não grava o estado, não abre
+                // suspeita; a próxima consulta reavalia.
+                alertLog("probe_inconclusive_no_state_change", { connection_id: inst.id, connection: inst.name, state: stateStr, http: res.status });
             }
         } else if (oldRealState !== "CONNECTED" && isConnected) {
-            // RECUPERAÇÃO DETECTADA!
-            if (source !== 'manual_sync') {
-                await handleAdminStatusAlert(supabase, inst, stateStr, "Heartbeat detected recovery/reconnection");
-            }
-            
+            // Recuperação detectada: só sincroniza o estado (sem mensagem de reconexão). O episódio, se houver,
+            // acompanha a recuperação estável por conta própria.
             await supabase.from("evolution_instances").update({ 
                 status: "connected",
                 last_health_at: healthNow,
@@ -693,7 +701,7 @@ Deno.serve(async (req) => {
     if (payload.action === "test_alert" && payload.instance_id) {
         const { data: inst } = await supabase.from("evolution_instances").select("*").eq("id", payload.instance_id).single();
         if (inst) {
-            await handleAdminStatusAlert(supabase, inst, "TEST", "Manual trigger via Test Alert button");
+            await sendManualTestAlert(supabase, inst);
             return new Response(JSON.stringify({ ok: true, message: "Alert sent" }), {
                 headers: { ...corsHeaders, "Content-Type": "application/json" },
             });
@@ -717,10 +725,14 @@ Deno.serve(async (req) => {
         await Promise.all(instances.map(inst => processInstanceHealth(supabase, inst, platformSettings, source)));
     }
 
+    // 2b. Episódios de desconexão vencidos (confirmação direta na UazAPI + alerta único). Persistente no banco.
+    const episodesResult = await processDisconnectEpisodes(supabase, platformSettings);
+
     // 3. ACK Verification
     await processAckRetries(supabase, platformSettings);
 
-    return new Response(JSON.stringify({ ok: true }), {
+    // `disconnect_episodes.ok=false` (+ error_code) expõe, na própria resposta do cron, que o alerta confirmado está inoperante
+    return new Response(JSON.stringify({ ok: true, disconnect_episodes: episodesResult }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
