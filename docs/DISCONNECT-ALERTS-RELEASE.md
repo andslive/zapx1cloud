@@ -1,6 +1,6 @@
 # Alerta de desconexão confirmada — plano de publicação e rollback
 
-Estado: **código na branch `agent/heartbeat-disconnect-alerts-20261124`; nada aplicado em produção.**
+Estado: **P1 (migration), P2 (heartbeat v230) e P3 (webhook v269) publicados a partir de `fe4e84d` em 2026-11-24.**
 Projeto Supabase: `ydunpoqdhijhnrarohiz`. Leituras de 2026-11-24 (somente leitura).
 
 ## 1. O que a produção tem hoje (verificado)
@@ -56,7 +56,12 @@ Ordem (inversa):
 3. **Tabela** — pode ficar (aditiva, sem efeito sem as funções novas). Episódios ativos ficam parados; ao republicar, são reprocessados com consultas novas (alerta exige 2 consultas válidas), sem envio automático por estado antigo.
 4. Verificar: versões/hash, trigger existente, cron `succeeded`.
 
-## 6. Isolamento e permissões da tabela (testado)
+## 6. Isolamento e permissões da tabela
 
-Contra Postgres + PostgREST reais com JWTs `authenticated` e RLS de `profiles` equivalente ao de produção: usuário da org A vê só A (nunca B, nem por id/org/conexão); B simétrico; sem perfil e `anon`: nada; nenhum `authenticated` escreve; só `service_role` escreve; ninguém apaga (histórico preservado).
-Observação existente (fora do escopo): a policy atual de `admin_status_alerts` é `ALL` para membros da organização.
+Testado contra Postgres + PostgREST reais com JWTs `authenticated` e RLS de `profiles` equivalente ao de produção: usuário da org A vê só A (nunca B, nem por id/org/conexão); B simétrico; sem perfil e `anon`: nada; nenhum `authenticated` escreve.
+
+**Limites — não há garantia de histórico imutável:**
+- Em produção o `service_role` tem `DELETE` e `TRUNCATE` (e demais privilégios) na tabela — ACL padrão do Supabase aplicada pelo schema; a migration não os revoga. Qualquer código ou operador com a service key pode apagar episódios.
+- As FKs (`organization_id`, `connection_id`) são `ON DELETE CASCADE`: apagar uma organização ou uma conexão apaga seus episódios.
+- Portanto a tabela é um **registro operacional**, não uma trilha de auditoria imutável. Se for necessária imutabilidade, será outra mudança (revogar privilégios, trocar CASCADE), fora desta entrega.
+- Observação existente (fora do escopo): a policy atual de `admin_status_alerts` é `ALL` para membros da organização.
